@@ -1,0 +1,8 @@
+<map id="_PulseConferenceClassificationInfo" name="_PulseConferenceClassificationInfo">
+<area shape="rect" id="Node000001" title=" " alt="" coords="38,211,289,236"/>
+<area shape="rect" id="Node000002" href="$struct__PulseConferenceClassificationLevelList.html" title=" " alt="" coords="211,108,436,148"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="281,157,184,213,182,208,278,152"/>
+<area shape="rect" id="Node000003" href="$struct__PulseConferenceClassificationLevel.html" title=" " alt="" coords="5,5,231,45"/>
+<area shape="poly" id="edge3_Node000001_Node000003" title=" " alt="" coords="112,59,107,102,108,125,113,147,131,182,153,209,149,212,127,185,107,149,103,126,102,102,107,58"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="170,49,286,106,284,110,168,54"/>
+</map>

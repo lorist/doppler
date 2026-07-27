@@ -1,0 +1,132 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "com.pexip.pulse",
+    "module": "pulse-core",
+    "version": "1.0.17709+ba0acfce6d73",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.4.0"
+    }
+  },
+  "variants": [
+    {
+      "name": "releaseVariantReleaseApiPublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "androidx.compose.foundation",
+          "module": "foundation",
+          "version": {
+            "requires": "1.10.5"
+          }
+        },
+        {
+          "group": "androidx.compose.ui",
+          "module": "ui",
+          "version": {
+            "requires": "1.10.5"
+          }
+        },
+        {
+          "group": "androidx.media",
+          "module": "media",
+          "version": {
+            "requires": "1.7.1"
+          }
+        },
+        {
+          "group": "androidx.activity",
+          "module": "activity",
+          "version": {
+            "requires": "1.13.0"
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.2.10"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "pulse-core-1.0.17709+ba0acfce6d73.aar",
+          "url": "pulse-core-1.0.17709+ba0acfce6d73.aar",
+          "size": 86603553,
+          "sha512": "26ec919b2ef919c3614209bafbee155386be0611a16a9408e588dd642ca5619442b2df98fdb26345327f9d018f9c383b2f53ee693defea4a3936fa6575afc643",
+          "sha256": "1128d11d5a6da3d0de45a90ff7dab9f7a9d50f16731c58f4c7c2e875ffcde845",
+          "sha1": "a16deae8fa798245cab40cbbf477bb0454717772",
+          "md5": "9d06860e85d046ec8e30aba4b0b26ee5"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseRuntimePublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "androidx.compose.foundation",
+          "module": "foundation",
+          "version": {
+            "requires": "1.10.5"
+          }
+        },
+        {
+          "group": "androidx.compose.ui",
+          "module": "ui",
+          "version": {
+            "requires": "1.10.5"
+          }
+        },
+        {
+          "group": "androidx.media",
+          "module": "media",
+          "version": {
+            "requires": "1.7.1"
+          }
+        },
+        {
+          "group": "androidx.activity",
+          "module": "activity",
+          "version": {
+            "requires": "1.13.0"
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.2.10"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "pulse-core-1.0.17709+ba0acfce6d73.aar",
+          "url": "pulse-core-1.0.17709+ba0acfce6d73.aar",
+          "size": 86603553,
+          "sha512": "26ec919b2ef919c3614209bafbee155386be0611a16a9408e588dd642ca5619442b2df98fdb26345327f9d018f9c383b2f53ee693defea4a3936fa6575afc643",
+          "sha256": "1128d11d5a6da3d0de45a90ff7dab9f7a9d50f16731c58f4c7c2e875ffcde845",
+          "sha1": "a16deae8fa798245cab40cbbf477bb0454717772",
+          "md5": "9d06860e85d046ec8e30aba4b0b26ee5"
+        }
+      ]
+    }
+  ]
+}

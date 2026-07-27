@@ -1,0 +1,38 @@
+var pulse__conference__event_8h =
+[
+    [ "PulseConferenceEventType", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872", [
+      [ "PULSE_CONFERENCE_EVENT_TYPE_HELLO", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872ac65955a84113600259909fcde04aa3e6", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_BYE", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a27909940e41cc1da17521225aaa057e6", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PRESENTATION_START", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a6ec4479d23235499463e2146aebf905e", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PRESENTATION_STOP", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a091108c2df47d1b8ee0d1c6f6a55cb7c", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PRESENTATION_FRAME", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872accd78ad601a79cfd60bfe2e087949b8d", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PRESENTATION_FRAME_RESET", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a8ec28305a655a7473925941beea7fc13", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PARTICIPANT_CREATE", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872ac1393614f07bdf65c8b2838a08236958", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PARTICIPANT_UPDATE", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872ad2897eb6b0b195ae54b7c5e0ee34a07f", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PARTICIPANT_DELETE", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872ad198a305a598ba5de499e0ca5d71bf98", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PARTICIPANT_SYNC_BEGIN", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a3d6d1add9a8d1914e19d45dffeac76a1", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PARTICIPANT_SYNC_END", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a555254905a95fc3507fa86a319fe82dd", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_CONFERENCE_UPDATE", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a6d41c28b3cef944eeb5e296b9f98c0db", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_LAYOUT", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a0b8634379f9ebf48096160883eea03f6", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_MESSAGE_RECEIVED", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a8ebad36413fcdf6d02a0ff1977074763", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_STAGE", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a260cd0266267060b5df6e980cd5d11fe", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_CALL_DISCONNECTED", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a8e32abf0fc67115b4d0be07a42c2207f", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_DISCONNECT", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a1648a147d838b92040200cf224eba41a", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_FECC", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872af1bd0a0e4b77feebc6305f81997996cd", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_UPDATE_SDP", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872ae980d392e8e9f4916f2ae83d8e68e3cd", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_NEW_OFFER", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a07704a02af4df16637483d7bc4a060a8", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_NEW_CANDIDATE", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a518a4cece40dbd2c1bc751ed182bd56c", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_REFER", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872aaf6f5b1d82143453e467578e10e120ff", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_REFER_CANCEL", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a511c750938efc7f6254b44573821063b", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_SPLASH_SCREEN", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a810396fdf417db8d6bb5f1c268cb99ab", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_PEER_DISCONNECT", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a20798408cca8b42f2b5a9942755b490c", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_LIVE_CAPTIONS", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872aeb8e599fbcea92b0d161859a2913db2e", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_BREAKOUT_BEGIN", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872abf0d802c1a540076317b833be259f83d", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_BREAKOUT_EVENT", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872ad324535c1f8f754b9366c910981a4582", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_BREAKOUT_END", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872ac8c18ac673f0e48c72dd2bec930de305", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_BREAKOUT_REFER", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a88be2848cfa96d66dd1b0637a27356e0", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_BREAKOUT_REFER_CANCEL", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872abdb3c515185584a45ff49333f33fbd51", null ],
+      [ "PULSE_CONFERENCE_EVENT_TYPE_REFRESH_TOKEN", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a91ba6ff32337a2f869ed78712e30d389", null ],
+      [ "__PULSE_CONFERENCE_EVENT_TYPE_SIZE__", "pulse__conference__event_8h.html#a3023ff32fc83749907cb5a2f5e5c9872a82e2bbec98cd5c17a08b75d442a930b1", null ]
+    ] ]
+];

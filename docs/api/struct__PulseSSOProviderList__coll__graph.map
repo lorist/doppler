@@ -1,0 +1,5 @@
+<map id="_PulseSSOProviderList" name="_PulseSSOProviderList">
+<area shape="rect" id="Node000001" title="_PulseSSOProviderList _PulseSSOProviderList holds the list of allowed SSO providers." alt="" coords="5,93,172,119"/>
+<area shape="rect" id="Node000002" href="$struct__PulseSSOProvider.html" title="PulseSSOProvider PulseSSOProvider holds the information about a PulseSSOProviderList list member." alt="" coords="17,5,161,31"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="91,45,91,93,86,93,86,45"/>
+</map>

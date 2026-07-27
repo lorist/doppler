@@ -1,0 +1,7 @@
+<map id="PulseRtspInputConfig" name="PulseRtspInputConfig">
+<area shape="rect" id="Node000001" title="RTSP input (camera&#45;dial&#45;out) session configuration." alt="" coords="139,93,299,119"/>
+<area shape="rect" id="Node000002" href="$structPulseRtspInputCallbackConfig.html" title="RTSP input session callback configuration." alt="" coords="5,5,221,31"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="140,37,206,91,203,95,136,41"/>
+<area shape="rect" id="Node000003" href="$structPulseRtspAuthConfig.html" title="RTSP authentication credentials." alt="" coords="245,5,403,31"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="301,41,235,95,231,91,298,37"/>
+</map>

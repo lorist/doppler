@@ -1,0 +1,7 @@
+<map id="_PulseConferenceEventLayout" name="_PulseConferenceEventLayout">
+<area shape="rect" id="Node000001" title=" " alt="" coords="5,255,224,280"/>
+<area shape="rect" id="Node000002" href="$struct__PulseConferenceEventLayoutPresSlotCoords.html" title=" " alt="" coords="5,152,224,192"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="117,206,117,254,112,254,112,206"/>
+<area shape="rect" id="Node000003" href="$struct__PulseConferenceEventLayoutCoordinates.html" title=" " alt="" coords="5,5,224,45"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="117,59,117,152,112,152,112,59"/>
+</map>

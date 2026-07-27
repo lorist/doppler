@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- Lets the project be restored / compiled from a non-Windows machine too
+         (e.g. CI). Harmless on Windows. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- Pexip.Pulse ships native (pexpulse.dll & friends) only for win-x64. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>doppler-win</AssemblyName>
+    <RootNamespace>DopplerWin</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The version that lives in ../../nuget (see nuget.config). -->
+    <PackageReference Include="Pexip.Pulse" Version="1.0.17855-main" />
+  </ItemGroup>
+
+</Project>

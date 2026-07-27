@@ -1,0 +1,9 @@
+<map id="PulseRtmpOutputConfig" name="PulseRtmpOutputConfig">
+<area shape="rect" id="Node000001" title="RTMP output (client) session configuration." alt="" coords="256,93,433,119"/>
+<area shape="rect" id="Node000002" href="$structPulseRtmpOutputCallbackConfig.html" title="RTMP output session callback configuration." alt="" coords="5,5,239,31"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="166,33,316,91,314,96,164,38"/>
+<area shape="rect" id="Node000003" href="$structPulseRtmpAuthConfig.html" title="RTMP authentication credentials." alt="" coords="263,5,426,31"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="347,45,347,93,342,93,342,45"/>
+<area shape="rect" id="Node000004" href="$structPulseRtmpTlsOutputConfig.html" title="RTMP TLS configuration for output (client) sessions." alt="" coords="451,5,647,31"/>
+<area shape="poly" id="edge3_Node000001_Node000004" title=" " alt="" coords="510,39,431,72,373,96,371,91,429,67,508,34"/>
+</map>

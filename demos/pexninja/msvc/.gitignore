@@ -1,0 +1,11 @@
+# Fetched by fetch-deps.ps1 — not committed.
+/third_party/
+
+# NuGet restore output and MSBuild artifacts.
+# With PackageReference there is no unwrapped /packages/ folder; NuGet writes
+# its restore artifacts (project.assets.json, *.nuget.g.props/targets) under
+# /obj/ instead. /packages/ is kept for older checkouts / safety.
+/packages/
+/obj/
+/build/
+*.user

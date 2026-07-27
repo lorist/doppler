@@ -1,0 +1,10 @@
+<map id="media/pmx/pulse/api/pulse_media.h" name="media/pmx/pulse/api/pulse_media.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="14,5,173,45"/>
+<area shape="rect" id="Node000002" title=" " alt="" coords="5,167,88,192"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="90,47,75,94,56,154,51,153,69,93,85,45"/>
+<area shape="rect" id="Node000003" href="$pulse__config_8h.html" title=" " alt="" coords="84,93,199,119"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="107,44,129,80,125,83,103,47"/>
+<area shape="poly" id="edge4_Node000003_Node000002" title=" " alt="" coords="128,121,75,160,72,156,125,117"/>
+<area shape="rect" id="Node000004" title=" " alt="" coords="113,167,183,192"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="145,119,148,153,143,153,140,119"/>
+</map>

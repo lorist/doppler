@@ -1,0 +1,7 @@
+<map id="_PulseMediaStats" name="_PulseMediaStats">
+<area shape="rect" id="Node000001" title=" " alt="" coords="103,123,241,148"/>
+<area shape="rect" id="Node000002" href="$struct__PulseMediaRxStats.html" title=" " alt="" coords="5,5,160,31"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="102,40,165,121,161,124,98,43"/>
+<area shape="rect" id="Node000003" href="$struct__PulseMediaTxStats.html" title=" " alt="" coords="185,5,338,31"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="251,44,213,100,188,124,185,120,209,97,247,41"/>
+</map>

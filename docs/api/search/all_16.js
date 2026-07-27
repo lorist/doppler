@@ -1,0 +1,24 @@
+var searchData=
+[
+  ['w_0',['w',['../structPulseRoI.html#afdc47aa824168c741fa0fa089d901486',1,'PulseRoI']]],
+  ['waiting_5froom_5fon_5ftop_1',['waiting_room_on_top',['../struct__PulseParticipantListSortingConfig.html#a1831511ae5b3f3176e600fd1027549e4',1,'_PulseParticipantListSortingConfig']]],
+  ['waiting_5fscreen_5fenabled_2',['waiting_screen_enabled',['../struct__PulseConferenceControlTransformLayoutRequestSectionStreaming.html#a58e9211ea917d784e2b28da171fcbf7d',1,'_PulseConferenceControlTransformLayoutRequestSectionStreaming']]],
+  ['width_3',['width',['../structPulseDimensions.html#a989272d9a6e78449d2258dc6bdd1d28d',1,'PulseDimensions::width'],['../structPulseVideoInfo.html#aa5d03fb17a659bf2393873538578f0e8',1,'PulseVideoInfo::width'],['../struct__PulseMediaTxStats.html#a1af6fa70b500001c614ab99f754e9c43',1,'_PulseMediaTxStats::width'],['../struct__PulseMediaRxStats.html#aad3599afbc0c8ce08a39880830576a61',1,'_PulseMediaRxStats::width']]],
+  ['width_5fratio_4',['width_ratio',['../structPulseVideoMixInput.html#ab705b2d857190556ce070240154cf0ae',1,'PulseVideoMixInput']]],
+  ['window_5fsize_5',['window_size',['../struct__PulseMediaTxStats.html#a55cd92c64f5f24d3ae19d3a073c91c1e',1,'_PulseMediaTxStats::window_size'],['../struct__PulseMediaRxStats.html#ad39d7796f416642700c2c07457433250',1,'_PulseMediaRxStats::window_size']]],
+  ['windowed_5fbitrate_6',['windowed_bitrate',['../struct__PulseMediaTxStats.html#ae8fe578be89e454c4d6c5da6ae9dd498',1,'_PulseMediaTxStats::windowed_bitrate'],['../struct__PulseMediaRxStats.html#a31b8591f6fd2581af7fb8ff0552c1dd1',1,'_PulseMediaRxStats::windowed_bitrate']]],
+  ['windowed_5fbytes_7',['windowed_bytes',['../struct__PulseMediaTxStats.html#a9cf4a17d5ab461d135cbdbfdacf9a864',1,'_PulseMediaTxStats::windowed_bytes'],['../struct__PulseMediaRxStats.html#a5730688cabf2d9079379d2734607d87b',1,'_PulseMediaRxStats::windowed_bytes']]],
+  ['windowed_5fjitter_5fms_8',['windowed_jitter_ms',['../struct__PulseMediaRxStats.html#ae5f4c3920f364f28fde7bd7a715ec8ed',1,'_PulseMediaRxStats::windowed_jitter_ms'],['../struct__PulseMediaTxStats.html#a7bc43b5847becd0a111de0543a3358e0',1,'_PulseMediaTxStats::windowed_jitter_ms']]],
+  ['windowed_5fpackets_5factual_5flost_9',['windowed_packets_actual_lost',['../struct__PulseMediaRxStats.html#ade160258753a7b1fdb91b73d9818b981',1,'_PulseMediaRxStats']]],
+  ['windowed_5fpackets_5factual_5flost_5fpct_10',['windowed_packets_actual_lost_pct',['../struct__PulseMediaRxStats.html#a69180a593d7257a6a2f39752c44b9a6c',1,'_PulseMediaRxStats']]],
+  ['windowed_5fpackets_5fduplicates_11',['windowed_packets_duplicates',['../struct__PulseMediaRxStats.html#a2cac5566ecd8a3e044611378155de43a',1,'_PulseMediaRxStats']]],
+  ['windowed_5fpackets_5flate_12',['windowed_packets_late',['../struct__PulseMediaRxStats.html#a05ffaa0790b6cd79f23bfa111e29a226',1,'_PulseMediaRxStats']]],
+  ['windowed_5fpackets_5flost_13',['windowed_packets_lost',['../struct__PulseMediaTxStats.html#af949d2658ce76d49af8cdd1a2cc30f76',1,'_PulseMediaTxStats::windowed_packets_lost'],['../struct__PulseMediaRxStats.html#abf0d7c19b21942eb1ffa8a5a221f2be4',1,'_PulseMediaRxStats::windowed_packets_lost']]],
+  ['windowed_5fpackets_5flost_5fpct_14',['windowed_packets_lost_pct',['../struct__PulseMediaTxStats.html#a3773f2a38ed620fbcb9df7c2bd9ccfaa',1,'_PulseMediaTxStats::windowed_packets_lost_pct'],['../struct__PulseMediaRxStats.html#a4627986908e0bc072185dda0201ef6f3',1,'_PulseMediaRxStats::windowed_packets_lost_pct']]],
+  ['windowed_5fpackets_5fpushed_15',['windowed_packets_pushed',['../struct__PulseMediaRxStats.html#a543ea4ebb7af868a87132b5730cfc419',1,'_PulseMediaRxStats']]],
+  ['windowed_5fpackets_5freceived_16',['windowed_packets_received',['../struct__PulseMediaRxStats.html#a5170dccc49b0160da3dc9dfbd18a6147',1,'_PulseMediaRxStats']]],
+  ['windowed_5fpackets_5fsent_17',['windowed_packets_sent',['../struct__PulseMediaTxStats.html#aea3154ac6ffcbf98ebf14fa99222e44d',1,'_PulseMediaTxStats']]],
+  ['windowed_5frtx_5freceived_18',['windowed_rtx_received',['../struct__PulseMediaRxStats.html#aa8c59e2a49e4e1e4a697e7b1d80f6f18',1,'_PulseMediaRxStats']]],
+  ['windowed_5frtx_5frtt_5fms_19',['windowed_rtx_rtt_ms',['../struct__PulseMediaRxStats.html#a373c1186ffffc13d710d31ee2ff35b10',1,'_PulseMediaRxStats']]],
+  ['windowed_5frtx_5fsuccess_20',['windowed_rtx_success',['../struct__PulseMediaRxStats.html#a91c3d4cd7592f65381cdf2ff2b007883',1,'_PulseMediaRxStats']]]
+];

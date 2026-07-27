@@ -1,0 +1,5 @@
+<map id="PulseDataSessionFrame" name="PulseDataSessionFrame">
+<area shape="rect" id="Node000001" title="PulseDataSessionFrame The PulseDataSessionFrame is used for pushing raw data frames to Pulse." alt="" coords="21,108,200,133"/>
+<area shape="rect" id="Node000002" href="$structPulseDataSessionFrameData.html" title="PulseDataSessionFrameData The PulseDataSessionFrameData structure allows you to specify a data pointe..." alt="" coords="5,5,216,31"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="113,45,113,108,108,108,108,45"/>
+</map>

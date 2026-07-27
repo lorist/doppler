@@ -1,0 +1,26 @@
+var searchData=
+[
+  ['reactivate_5fafter_0',['reactivate_after',['../struct__PulseConferenceControlSilentVideoDetectionRequest.html#a8d1183166c033b94aba0aa72e3f80fd8',1,'_PulseConferenceControlSilentVideoDetectionRequest']]],
+  ['receive_5ffrom_5faudio_5fmix_1',['receive_from_audio_mix',['../struct__PulseConferenceControlParticipantEntry.html#a8cce298489f486d80da3a0dd0d8a0ce7',1,'_PulseConferenceControlParticipantEntry']]],
+  ['receive_5ffrom_5fvideo_5fmix_2',['receive_from_video_mix',['../struct__PulseConferenceControlParticipantEntry.html#a6b3264b46aaf8661d73dd45520b44462',1,'_PulseConferenceControlParticipantEntry']]],
+  ['recording_5findicator_3',['recording_indicator',['../struct__PulseConferenceControlTransformLayoutRequest.html#afe23d3ebe6313eb58eb45ea674c15a1d',1,'_PulseConferenceControlTransformLayoutRequest']]],
+  ['registrations_5fevent_5fincoming_5fcallback_4',['registrations_event_incoming_callback',['../struct__PulseRegistrationsEventCallbackConfig.html#a46573546cf94eca22d1f57dd19b8d0d9',1,'_PulseRegistrationsEventCallbackConfig']]],
+  ['registrations_5fevent_5fincoming_5fcallback_5fuser_5fcontext_5',['registrations_event_incoming_callback_user_context',['../struct__PulseRegistrationsEventCallbackConfig.html#a00ddc18d4b9fe8f9fd7b95c042fbbeea',1,'_PulseRegistrationsEventCallbackConfig']]],
+  ['registrations_5fevent_5fincoming_5fcancelled_5fcallback_6',['registrations_event_incoming_cancelled_callback',['../struct__PulseRegistrationsEventCallbackConfig.html#a6652eb822b11c9734ea35d8f0323c05e',1,'_PulseRegistrationsEventCallbackConfig']]],
+  ['registrations_5fevent_5fincoming_5fcancelled_5fcallback_5fuser_5fcontext_7',['registrations_event_incoming_cancelled_callback_user_context',['../struct__PulseRegistrationsEventCallbackConfig.html#a2621157697ed1dc9affd4a23edff00ea',1,'_PulseRegistrationsEventCallbackConfig']]],
+  ['remote_5falias_8',['remote_alias',['../struct__PulseRegistrationsEventIncoming.html#abcedf4a1a715834f20dfe44abc923a3b',1,'_PulseRegistrationsEventIncoming::remote_alias'],['../struct__PulseRegistrationsEventIncomingCancelled.html#aec852a61d866312836ee9ca586b1b30f',1,'_PulseRegistrationsEventIncomingCancelled::remote_alias']]],
+  ['remote_5fdisplay_5fname_9',['remote_display_name',['../struct__PulseConferenceControlDialRequest.html#aa06412a6e581f83a54adbd9cad2eeefd',1,'_PulseConferenceControlDialRequest::remote_display_name'],['../struct__PulseRegistrationsEventIncoming.html#ab9a2fcf7ba11cfa3bfe2ef9fadf75a2d',1,'_PulseRegistrationsEventIncoming::remote_display_name'],['../struct__PulseRegistrationsEventIncomingCancelled.html#acfe011ca01b8c2971819c5bddfdb0e23',1,'_PulseRegistrationsEventIncomingCancelled::remote_display_name']]],
+  ['remote_5fsdp_10',['remote_sdp',['../struct__PulseSetupStage2Config.html#a616c2bf76f6941839318c92e33a9e6e9',1,'_PulseSetupStage2Config']]],
+  ['request_5fcallback_11',['request_callback',['../struct__PulseSSOProviderCallbackConfig.html#a710a098413e9f50ee9bc7657ae842052',1,'_PulseSSOProviderCallbackConfig']]],
+  ['request_5fcallback_5fuser_5fcontext_12',['request_callback_user_context',['../struct__PulseSSOProviderCallbackConfig.html#a1e621e85150934b820ab3f50895aeec9',1,'_PulseSSOProviderCallbackConfig']]],
+  ['request_5ftype_13',['request_type',['../struct__PulseSSOProviderList.html#a186bf79d7bf76b30c1a6af30493273df',1,'_PulseSSOProviderList::request_type'],['../struct__PulseSSOProviderRequest.html#ab3ba99992b04aaeb5d34b05226eccc84',1,'_PulseSSOProviderRequest::request_type']]],
+  ['requested_5flayout_14',['requested_layout',['../struct__PulseConferenceEventLayout.html#a299d003a7d33e3d81c5e466218e2e9f9',1,'_PulseConferenceEventLayout']]],
+  ['require_5fno_5ffaces_15',['require_no_faces',['../struct__PulseConferenceControlSilentVideoDetectionRequest.html#a1ce4bc3c1a097f17c14956a8bb76d8fe',1,'_PulseConferenceControlSilentVideoDetectionRequest']]],
+  ['reverse_5forder_16',['reverse_order',['../struct__PulseParticipantListSortingConfig.html#ab2a6f7d2fd92e9823fe00440d9858648',1,'_PulseParticipantListSortingConfig']]],
+  ['role_17',['role',['../struct__PulseConferenceControlDialRequest.html#a734de5181609fd5189e2286f56c74558',1,'_PulseConferenceControlDialRequest::role'],['../struct__PulseConferenceControlParticipantEntry.html#a71806447f585c2d17f4be982f08fb7d9',1,'_PulseConferenceControlParticipantEntry::role']]],
+  ['room_5fid_18',['room_id',['../struct__PulseConferenceControlParticipantEntry.html#a31062a2db0faaad38fe4e4bfc0ca406e',1,'_PulseConferenceControlParticipantEntry::room_id'],['../struct__PulseConferenceControlBreakoutsParticipantEntry.html#afc0e0d3aab5b4185a041c1c4899e5bfd',1,'_PulseConferenceControlBreakoutsParticipantEntry::room_id']]],
+  ['routing_5falive_19',['routing_alive',['../struct__PulseNetworkStatusInfo.html#a5dd9fce372538a687c754bdf019906bf',1,'_PulseNetworkStatusInfo']]],
+  ['routing_5fprobes_5fenabled_20',['routing_probes_enabled',['../struct__PulseNetworkStatusInfo.html#a2648841d5660523eeeb25eda31469a8b',1,'_PulseNetworkStatusInfo']]],
+  ['rtt_5fms_21',['rtt_ms',['../struct__PulseMediaTxStats.html#ac3ce83fb66e7eed1d2e26229c34c86e8',1,'_PulseMediaTxStats']]],
+  ['rx_5fpresentation_5fpolicy_22',['rx_presentation_policy',['../struct__PulseConferenceControlParticipantEntry.html#aa4892bae771453c3d35831913896be9d',1,'_PulseConferenceControlParticipantEntry']]]
+];

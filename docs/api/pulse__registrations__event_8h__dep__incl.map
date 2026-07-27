@@ -1,0 +1,28 @@
+<map id="media/pmx/pulse/api/pulse_registrations_event.h" name="media/pmx/pulse/api/pulse_registrations_event.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="463,5,622,60"/>
+<area shape="rect" id="Node000002" href="$pulse__types_8h.html" title=" " alt="" coords="463,108,622,148"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="545,74,545,108,540,108,540,74"/>
+<area shape="rect" id="Node000003" href="$pulse_8h.html" title=" " alt="" coords="367,372,526,412"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="450,140,318,161,246,177,175,199,82,226,47,247,31,263,16,285,8,305,10,313,15,322,38,339,72,353,116,365,165,373,271,384,367,388,367,393,270,389,164,378,115,370,71,359,35,344,11,326,5,315,3,304,11,283,27,259,44,242,80,221,174,193,245,172,317,156,449,135"/>
+<area shape="rect" id="Node000004" href="$pulse__annotation_8h.html" title=" " alt="" coords="26,284,185,324"/>
+<area shape="poly" id="edge3_Node000002_Node000004" title=" " alt="" coords="450,141,346,161,291,177,238,198,205,218,173,241,125,286,121,282,170,237,202,213,236,194,289,172,344,156,449,136"/>
+<area shape="rect" id="Node000005" href="$pulse__conference__control_8h.html" title=" " alt="" coords="249,196,453,236"/>
+<area shape="poly" id="edge5_Node000002_Node000005" title=" " alt="" coords="489,156,394,198,392,194,487,151"/>
+<area shape="rect" id="Node000007" href="$pulse__ipc_8h.html" title=" " alt="" coords="465,284,623,324"/>
+<area shape="poly" id="edge9_Node000002_Node000007" title=" " alt="" coords="545,162,546,284,541,284,540,162"/>
+<area shape="rect" id="Node000008" href="$pulse__media__stats_8h.html" title=" " alt="" coords="648,284,808,324"/>
+<area shape="poly" id="edge11_Node000002_Node000008" title=" " alt="" coords="562,158,588,196,622,234,656,260,691,281,688,286,653,265,618,238,584,200,558,161"/>
+<area shape="rect" id="Node000009" href="$pulse__options_8h.html" title=" " alt="" coords="631,196,790,236"/>
+<area shape="poly" id="edge13_Node000002_Node000009" title=" " alt="" coords="593,152,675,194,673,198,590,157"/>
+<area shape="rect" id="Node000010" href="$pulse__registrations_8h.html" title=" " alt="" coords="815,196,977,236"/>
+<area shape="poly" id="edge15_Node000002_Node000010" title=" " alt="" coords="634,149,819,193,818,199,633,154"/>
+<area shape="poly" id="edge4_Node000004_Node000003" title=" " alt="" coords="194,325,372,369,371,375,192,330"/>
+<area shape="poly" id="edge6_Node000005_Node000003" title=" " alt="" coords="293,245,269,263,252,285,245,304,251,323,275,346,304,364,335,375,368,383,367,388,334,380,301,368,271,350,247,325,240,304,247,283,266,259,290,241"/>
+<area shape="rect" id="Node000006" href="$pulse__type__mappings_8h.html" title=" " alt="" coords="261,284,441,324"/>
+<area shape="poly" id="edge7_Node000005_Node000006" title=" " alt="" coords="353,250,353,284,348,284,348,250"/>
+<area shape="poly" id="edge8_Node000006_Node000003" title=" " alt="" coords="384,331,427,370,424,374,380,335"/>
+<area shape="poly" id="edge10_Node000007_Node000003" title=" " alt="" coords="514,335,470,374,466,370,511,331"/>
+<area shape="poly" id="edge12_Node000008_Node000003" title=" " alt="" coords="654,331,509,375,507,369,652,325"/>
+<area shape="poly" id="edge14_Node000009_Node000003" title=" " alt="" coords="767,240,796,257,819,278,830,301,829,313,822,326,802,341,773,354,697,373,609,385,526,391,526,385,608,379,696,368,771,349,799,337,818,322,824,312,825,302,815,281,793,262,764,244"/>
+<area shape="poly" id="edge16_Node000010_Node000003" title=" " alt="" coords="890,250,873,290,860,310,843,326,819,339,786,350,704,368,611,380,526,388,526,383,611,375,703,363,785,345,817,334,840,322,856,306,869,288,886,248"/>
+</map>

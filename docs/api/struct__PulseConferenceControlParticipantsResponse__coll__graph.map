@@ -1,0 +1,11 @@
+<map id="_PulseConferenceControlParticipantsResponse" name="_PulseConferenceControlParticipantsResponse">
+<area shape="rect" id="Node000001" title=" " alt="" coords="1229,47,1491,87"/>
+<area shape="rect" id="Node000002" href="$struct__PulseConferenceControlParticipantEntry.html" title=" " alt="" coords="825,47,1080,87"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="1094,64,1229,64,1229,69,1094,69"/>
+<area shape="rect" id="Node000003" href="$struct__PulseConferenceControlParticipantAudioMixList.html" title=" " alt="" coords="357,5,612,45"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="626,35,825,53,825,58,626,40"/>
+<area shape="rect" id="Node000004" href="$struct__PulseConferenceControlParticipantAudioMixEntry.html" title=" " alt="" coords="5,5,260,45"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="274,23,357,23,357,28,274,28"/>
+<area shape="rect" id="Node000005" href="$struct__PulseConferenceControlParticipantVideoMixEntry.html" title=" " alt="" coords="357,69,612,109"/>
+<area shape="poly" id="edge4_Node000002_Node000005" title=" " alt="" coords="626,83,801,76,825,75,825,80,801,81,626,89"/>
+</map>

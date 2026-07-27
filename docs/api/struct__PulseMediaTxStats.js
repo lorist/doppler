@@ -1,0 +1,25 @@
+var struct__PulseMediaTxStats =
+[
+    [ "encoding_name", "struct__PulseMediaTxStats.html#aebfa0446cc1f693b88ea9db65c6d0eb7", null ],
+    [ "first_rtp_activity", "struct__PulseMediaTxStats.html#a271fbaa1498bb261bdb7e9c130576687", null ],
+    [ "framerate", "struct__PulseMediaTxStats.html#a23124cc565e0c6e9e9ca642523bd4f66", null ],
+    [ "height", "struct__PulseMediaTxStats.html#a8a06c3f139d4d577733b9d6bafd2fc32", null ],
+    [ "instant_bitrate", "struct__PulseMediaTxStats.html#a25c4da92ee8028f3861c0cf4423ae3be", null ],
+    [ "last_rtp_activity", "struct__PulseMediaTxStats.html#a1774ce03a3f16c440355ec19b0242f55", null ],
+    [ "rtt_ms", "struct__PulseMediaTxStats.html#ac3ce83fb66e7eed1d2e26229c34c86e8", null ],
+    [ "total_bitrate", "struct__PulseMediaTxStats.html#a7ddceaa829f5a9bc46fe2f2c33059fb9", null ],
+    [ "total_bytes", "struct__PulseMediaTxStats.html#af0d701ffa8bb40cd62e0ca8cf8785285", null ],
+    [ "total_jitter_ms", "struct__PulseMediaTxStats.html#a7fd8727fc79723927294ea1ecb2ba2a5", null ],
+    [ "total_packets_lost", "struct__PulseMediaTxStats.html#a752082096e7c480eecfda24be08f51b3", null ],
+    [ "total_packets_lost_pct", "struct__PulseMediaTxStats.html#a6750f80fb02646398f19c5fd00698754", null ],
+    [ "total_packets_sent", "struct__PulseMediaTxStats.html#a171dca7f984edd55b68a5e35a44c4b2c", null ],
+    [ "ts_s", "struct__PulseMediaTxStats.html#a1539acc7ebeb1b2f030ee26466ef01cf", null ],
+    [ "width", "struct__PulseMediaTxStats.html#a1af6fa70b500001c614ab99f754e9c43", null ],
+    [ "window_size", "struct__PulseMediaTxStats.html#a55cd92c64f5f24d3ae19d3a073c91c1e", null ],
+    [ "windowed_bitrate", "struct__PulseMediaTxStats.html#ae8fe578be89e454c4d6c5da6ae9dd498", null ],
+    [ "windowed_bytes", "struct__PulseMediaTxStats.html#a9cf4a17d5ab461d135cbdbfdacf9a864", null ],
+    [ "windowed_jitter_ms", "struct__PulseMediaTxStats.html#a7bc43b5847becd0a111de0543a3358e0", null ],
+    [ "windowed_packets_lost", "struct__PulseMediaTxStats.html#af949d2658ce76d49af8cdd1a2cc30f76", null ],
+    [ "windowed_packets_lost_pct", "struct__PulseMediaTxStats.html#a3773f2a38ed620fbcb9df7c2bd9ccfaa", null ],
+    [ "windowed_packets_sent", "struct__PulseMediaTxStats.html#aea3154ac6ffcbf98ebf14fa99222e44d", null ]
+];

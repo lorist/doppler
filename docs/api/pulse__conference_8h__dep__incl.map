@@ -1,0 +1,31 @@
+<map id="media/pmx/pulse/api/pulse_conference.h" name="media/pmx/pulse/api/pulse_conference.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="23,5,181,45"/>
+<area shape="rect" id="Node000002" href="$pulse_8h.html" title=" " alt="" coords="425,357,584,397"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="75,57,61,75,51,94,26,156,10,208,8,233,12,257,23,282,41,307,66,326,104,341,152,353,206,361,322,371,425,374,425,379,321,376,206,366,151,358,103,346,64,331,38,311,18,284,7,258,3,233,5,207,21,154,46,92,57,72,70,54"/>
+<area shape="rect" id="Node000003" href="$pulse__conference__control_8h.html" title=" " alt="" coords="71,181,275,221"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="117,57,168,180,163,182,112,59"/>
+<area shape="rect" id="Node000004" href="$pulse__type__mappings_8h.html" title=" " alt="" coords="52,269,232,309"/>
+<area shape="poly" id="edge6_Node000001_Node000004" title=" " alt="" coords="85,59,69,93,55,135,51,178,53,200,60,220,81,247,107,267,104,271,77,251,56,223,48,201,45,179,50,133,64,91,81,56"/>
+<area shape="rect" id="Node000005" href="$pulse__types_8h.html" title=" " alt="" coords="443,93,601,133"/>
+<area shape="poly" id="edge7_Node000001_Node000005" title=" " alt="" coords="196,43,443,93,442,98,195,48"/>
+<area shape="poly" id="edge3_Node000003_Node000002" title=" " alt="" coords="204,229,254,274,297,307,361,336,426,356,424,361,359,341,294,312,251,278,200,233"/>
+<area shape="poly" id="edge4_Node000003_Node000004" title=" " alt="" coords="164,235,151,270,146,268,159,234"/>
+<area shape="poly" id="edge5_Node000004_Node000002" title=" " alt="" coords="235,310,426,355,425,360,234,315"/>
+<area shape="poly" id="edge8_Node000005_Node000002" title=" " alt="" coords="616,123,668,143,692,159,711,180,718,201,711,222,697,247,679,269,637,308,592,338,550,360,548,355,589,333,633,303,675,266,692,244,706,220,713,201,706,183,688,163,666,148,614,128"/>
+<area shape="poly" id="edge11_Node000005_Node000003" title=" " alt="" coords="433,139,250,184,249,179,431,134"/>
+<area shape="rect" id="Node000006" href="$pulse__annotation_8h.html" title=" " alt="" coords="705,269,864,309"/>
+<area shape="poly" id="edge9_Node000005_Node000006" title=" " alt="" coords="616,118,652,126,689,138,724,156,755,179,770,200,779,224,787,269,782,270,774,226,765,203,751,183,721,160,687,143,651,131,615,123"/>
+<area shape="rect" id="Node000007" href="$pulse__ipc_8h.html" title=" " alt="" coords="888,269,1047,309"/>
+<area shape="poly" id="edge12_Node000005_Node000007" title=" " alt="" coords="616,129,699,150,784,179,872,223,942,267,939,272,870,228,782,184,697,155,614,134"/>
+<area shape="rect" id="Node000008" href="$pulse__media__stats_8h.html" title=" " alt="" coords="307,269,467,309"/>
+<area shape="poly" id="edge14_Node000005_Node000008" title=" " alt="" coords="431,128,380,148,358,163,340,183,335,193,334,204,340,226,353,249,369,267,365,271,349,252,335,229,329,204,330,192,336,180,355,159,377,143,429,123"/>
+<area shape="rect" id="Node000009" href="$pulse__options_8h.html" title=" " alt="" coords="351,181,509,221"/>
+<area shape="poly" id="edge16_Node000005_Node000009" title=" " alt="" coords="494,145,452,183,449,179,490,141"/>
+<area shape="rect" id="Node000010" href="$pulse__registrations_8h.html" title=" " alt="" coords="534,181,697,221"/>
+<area shape="poly" id="edge18_Node000005_Node000010" title=" " alt="" coords="555,141,597,179,593,183,551,145"/>
+<area shape="poly" id="edge10_Node000006_Node000002" title=" " alt="" coords="711,316,567,360,565,355,710,311"/>
+<area shape="poly" id="edge13_Node000007_Node000002" title=" " alt="" coords="875,312,585,365,584,360,874,307"/>
+<area shape="poly" id="edge15_Node000008_Node000002" title=" " alt="" coords="426,316,480,355,477,359,423,320"/>
+<area shape="poly" id="edge17_Node000009_Node000002" title=" " alt="" coords="458,231,482,268,498,315,505,357,500,358,492,317,477,270,454,234"/>
+<area shape="poly" id="edge19_Node000010_Node000002" title=" " alt="" coords="598,235,519,359,515,356,594,232"/>
+</map>

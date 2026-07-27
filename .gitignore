@@ -1,0 +1,17 @@
+build/
+*.o
+*.a
+.cache/
+compile_commands.json
+demos/pexninja/msvc/.vs
+
+# Dev scratch / run logs
+run.log
+run_*.txt
+
+# ImGui per-user window layout state
+imgui.ini
+
+# Local client configuration — contains registration credentials, never commit
+pexninja-config.txt
+pexclient-config.txt

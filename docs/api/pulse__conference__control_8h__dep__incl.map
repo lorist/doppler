@@ -1,0 +1,8 @@
+<map id="media/pmx/pulse/api/pulse_conference_control.h" name="media/pmx/pulse/api/pulse_conference_control.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="5,5,209,45"/>
+<area shape="rect" id="Node000002" href="$pulse_8h.html" title=" " alt="" coords="28,181,187,221"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="88,58,71,94,68,113,71,133,81,158,95,179,90,182,77,160,66,134,63,113,66,93,83,56"/>
+<area shape="rect" id="Node000003" href="$pulse__type__mappings_8h.html" title=" " alt="" coords="81,93,261,133"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="132,55,159,92,155,95,128,58"/>
+<area shape="poly" id="edge3_Node000003_Node000002" title=" " alt="" coords="151,146,124,183,119,180,147,143"/>
+</map>

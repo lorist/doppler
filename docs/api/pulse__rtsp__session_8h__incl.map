@@ -1,0 +1,12 @@
+<map id="media/pmx/pulse/api/pulse_rtsp_session.h" name="media/pmx/pulse/api/pulse_rtsp_session.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="5,5,167,45"/>
+<area shape="rect" id="Node000002" title=" " alt="" coords="5,240,76,265"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="83,46,70,94,47,227,41,226,65,93,77,45"/>
+<area shape="rect" id="Node000003" href="$pulse__error_8h.html" title=" " alt="" coords="79,93,186,119"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="100,44,121,80,116,83,95,47"/>
+<area shape="rect" id="Node000004" href="$pulse__config_8h.html" title=" " alt="" coords="78,167,193,192"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="136,119,137,153,132,153,130,119"/>
+<area shape="poly" id="edge4_Node000004_Node000002" title=" " alt="" coords="122,194,69,234,66,229,119,190"/>
+<area shape="rect" id="Node000005" title=" " alt="" coords="101,240,183,265"/>
+<area shape="poly" id="edge5_Node000004_Node000005" title=" " alt="" coords="139,192,142,226,137,227,134,193"/>
+</map>

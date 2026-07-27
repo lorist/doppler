@@ -1,0 +1,16 @@
+<map id="media/pmx/pulse/api/pulse_participant_control.h" name="media/pmx/pulse/api/pulse_participant_control.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="15,5,217,45"/>
+<area shape="rect" id="Node000002" title=" " alt="" coords="5,240,88,265"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="95,48,75,69,60,94,50,129,45,164,46,226,41,226,40,164,44,127,55,92,71,66,91,44"/>
+<area shape="rect" id="Node000003" title=" " alt="" coords="167,240,238,265"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="219,39,263,59,282,74,298,92,307,111,308,131,302,151,292,170,263,205,232,233,228,229,259,202,287,167,297,149,302,130,302,112,294,95,278,77,260,63,217,44"/>
+<area shape="rect" id="Node000004" title=" " alt="" coords="79,93,153,119"/>
+<area shape="poly" id="edge3_Node000001_Node000004" title=" " alt="" coords="119,46,119,79,113,79,113,46"/>
+<area shape="rect" id="Node000005" href="$pulse__config_8h.html" title=" " alt="" coords="99,167,213,192"/>
+<area shape="poly" id="edge4_Node000001_Node000005" title=" " alt="" coords="96,47,82,63,71,81,65,99,69,118,89,141,115,158,112,163,85,145,64,120,60,99,66,78,78,59,92,44"/>
+<area shape="rect" id="Node000006" href="$pulse__error_8h.html" title=" " alt="" coords="177,93,284,119"/>
+<area shape="poly" id="edge7_Node000001_Node000006" title=" " alt="" coords="145,43,204,83,201,88,142,48"/>
+<area shape="poly" id="edge6_Node000005_Node000002" title=" " alt="" coords="140,194,78,235,75,230,137,190"/>
+<area shape="poly" id="edge5_Node000005_Node000003" title=" " alt="" coords="166,191,190,227,185,230,161,194"/>
+<area shape="poly" id="edge8_Node000006_Node000005" title=" " alt="" coords="221,121,180,159,176,155,217,117"/>
+</map>
