@@ -66,7 +66,9 @@
       "Bash(awk '{print $2}')",
       "Bash(grep -A30 \"^struct _PulseConferenceControlTransformLayoutRequest$\" sdk/linux/opt/pexip/include/pexpulse/pulse_conference_control.h)",
       "Bash(grep -B2 -A24 \"struct _PulseConferenceEventConferenceUpdate$\" sdk/linux/opt/pexip/include/pexpulse/pulse_types.h)",
-      "Bash(grep -A28 \"^struct _PulseConferenceControlConferenceStatus$\" sdk/linux/opt/pexip/include/pexpulse/pulse_conference_control.h)"
+      "Bash(grep -A28 \"^struct _PulseConferenceControlConferenceStatus$\" sdk/linux/opt/pexip/include/pexpulse/pulse_conference_control.h)",
+      "Bash(awk -F/ '{print $1}')",
+      "Bash(git count-objects *)"
     ]
   }
 }

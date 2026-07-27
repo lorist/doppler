@@ -15,3 +15,5 @@ imgui.ini
 # Local client configuration — contains registration credentials, never commit
 pexninja-config.txt
 pexclient-config.txt
+.claude/
+.DS_Store
