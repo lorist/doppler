@@ -20,6 +20,21 @@
 namespace theme
 {
 
+/* Global UI scale. The handoff's type scale and metrics are specified for its
+ * 820x580 artboard; at larger window sizes that reads small, so everything
+ * text-related is multiplied by this. Set from the `ui_scale` config key
+ * before LoadFonts() — 1.0 is the design's literal sizing. */
+inline float scale = 1.2f;
+
+/* Font size for the draw-list text calls. ImDrawList::AddText() takes a size
+ * in screen pixels and ignores io.FontGlobalScale, so every explicit size in
+ * the UI goes through here to pick up the UI scale. */
+static inline float
+fs (float design_size)
+{
+  return design_size * scale;
+}
+
 static inline ImVec4
 Hex (unsigned int rgb, float a = 1.0f)
 {
@@ -108,7 +123,10 @@ LoadFonts (ImGuiIO & io, const char * font_dir, float content_scale)
   snprintf (med, sizeof (med), "%s/DMSans-Medium.ttf", font_dir);
   snprintf (bold, sizeof (bold), "%s/DMSans-Bold.ttf", font_dir);
 
-  const float s = content_scale;
+  /* Rasterise at content_scale (Retina crispness, undone by FontGlobalScale)
+   * AND at the UI scale (which must survive, so it is folded in here and not
+   * divided back out below). */
+  const float s = content_scale * scale;
 
   f.body = io.Fonts->AddFontFromFileTTF (reg, 13.5f * s);
   if (f.body == nullptr) {
@@ -132,7 +150,7 @@ LoadFonts (ImGuiIO & io, const char * font_dir, float content_scale)
   title_cfg.GlyphExtraSpacing.x = 0.3f * s;
   f.title = io.Fonts->AddFontFromFileTTF (med, 12.0f * s, &title_cfg);
 
-  io.FontGlobalScale = 1.0f / s;
+  io.FontGlobalScale = 1.0f / content_scale;
   io.FontDefault = f.body;
   return f;
 }
@@ -176,6 +194,20 @@ Apply ()
   c[ImGuiCol_FrameBg] = Hex (0xFFFFFF, PanelFillRaised);
   c[ImGuiCol_FrameBgHovered] = Hex (0xFFFFFF, PanelFillRaised + 0.02f);
   c[ImGuiCol_FrameBgActive] = Hex (0xFFFFFF, PanelFillRaised + 0.03f);
+
+  /* Title bars — without these, windows with a title (Settings, Devices,
+   * Share, Conference controls) render ImGui's stock blue. */
+  c[ImGuiCol_TitleBg] = Hex (0xFFFFFF, 0.06f);
+  c[ImGuiCol_TitleBgActive] = Hex (0xFFFFFF, 0.10f);
+  c[ImGuiCol_TitleBgCollapsed] = Hex (0xFFFFFF, 0.04f);
+
+  /* Resize grips + tabs, likewise stock-blue by default. */
+  c[ImGuiCol_ResizeGrip] = Hex (0xFFFFFF, 0.12f);
+  c[ImGuiCol_ResizeGripHovered] = Hex (AccentPrimary, 0.55f);
+  c[ImGuiCol_ResizeGripActive] = Hex (AccentPrimary);
+  c[ImGuiCol_Tab] = Hex (0xFFFFFF, 0.05f);
+  c[ImGuiCol_TabHovered] = Hex (0xFFFFFF, 0.12f);
+  c[ImGuiCol_TabActive] = Hex (AccentPrimary, 0.28f);
 
   c[ImGuiCol_ScrollbarBg] = Hex (0xFFFFFF, 0.0f);
   c[ImGuiCol_ScrollbarGrab] = Hex (0xFFFFFF, 0.12f);

@@ -83,6 +83,7 @@ written automatically by the in-app Settings (gear icon) and Devices panels.
 You can also create it by hand:
 
 ```ini
+ui_scale=1.2                       # UI/text size; 1.0 = the design's own sizing
 display_name=Alice                 # shown to other participants
 reg_host=example.com               # registration domain (_pexapp SRV) — or blank
 reg_alias=alice.desk@example.com   # this device's alias on Infinity

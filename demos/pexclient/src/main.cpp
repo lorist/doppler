@@ -106,6 +106,7 @@ struct Config
   char reg_pass[256] = "";
   bool reg_auto = false;
   bool reg_sso = false; // authenticate registration via SSO instead of password
+  float ui_scale = 1.2f;  // 1.0 = the design handoff's literal type scale
   char default_server[256] = ""; // used for bare aliases when not registered
 
   std::vector<Contact> favorites;
@@ -303,6 +304,8 @@ load_config (Config & cfg)
       cfg.reg_auto = (value == "true");
     else if (key == "reg_sso")
       cfg.reg_sso = (value == "true");
+    else if (key == "ui_scale")
+      cfg.ui_scale = std::min (2.0f, std::max (0.8f, (float) atof (value.c_str ())));
     else if (key == "default_server")
       copy_field (cfg.default_server, sizeof (cfg.default_server), value);
     else if (key == "dev_camera")
@@ -339,6 +342,7 @@ save_config (const Config & cfg)
   ofs << "reg_pass=" << cfg.reg_pass << "\n";
   ofs << "reg_auto=" << (cfg.reg_auto ? "true" : "false") << "\n";
   ofs << "reg_sso=" << (cfg.reg_sso ? "true" : "false") << "\n";
+  ofs << "ui_scale=" << cfg.ui_scale << "\n";
   ofs << "default_server=" << cfg.default_server << "\n";
   ofs << "dev_camera=" << cfg.dev_camera << "\n";
   ofs << "dev_mic=" << cfg.dev_mic << "\n";
@@ -1368,8 +1372,8 @@ ui_search_row (App & app, float width)
   ImDrawList * dl = ImGui::GetWindowDrawList ();
   ImVec2 origin = ImGui::GetCursorScreenPos ();
 
-  const float h = 40.0f;
-  const float call_w = 86.0f;
+  const float h = 40.0f * theme::scale;
+  const float call_w = 86.0f * theme::scale;
   const float toggles_w = (h + 8.0f) * 3; // mic + camera + devices, gap 8 each
   const float field_w = width - toggles_w - call_w - 10.0f;
 
@@ -1442,7 +1446,7 @@ ui_search_row (App & app, float width)
 
     const char * lbl = "Call";
     ImVec2 ts = app.fonts.bodyBold->CalcTextSizeA (13.5f, FLT_MAX, 0, lbl);
-    dl->AddText (app.fonts.bodyBold, 13.5f, ImVec2 ((b0.x + b1.x - ts.x) / 2, (b0.y + b1.y - ts.y) / 2),
+    dl->AddText (app.fonts.bodyBold, theme::fs (13.5f), ImVec2 ((b0.x + b1.x - ts.x) / 2, (b0.y + b1.y - ts.y) / 2),
                  theme::WhiteU32 (enabled ? 1.0f : theme::TextTertiary), lbl);
 
     if (hovered && enabled)
@@ -1481,11 +1485,11 @@ ui_favorites (App & app, float width)
   ImDrawList * dl = ImGui::GetWindowDrawList ();
   ImVec2 origin = ImGui::GetCursorScreenPos ();
 
-  dl->AddText (app.fonts.label, 10.5f, origin, theme::WhiteU32 (theme::TextLabel), "FAVORITES");
+  dl->AddText (app.fonts.label, theme::fs (10.5f), origin, theme::WhiteU32 (theme::TextLabel), "FAVORITES");
 
   float y = origin.y + 22;
   float x = origin.x;
-  const float av = 44.0f, item_w = 64.0f;
+  const float av = 44.0f * theme::scale, item_w = 64.0f * theme::scale;
 
   if (app.cfg.favorites.empty ()) {
     // Empty state: dashed circle + "Add favorite" hint (star a recent call).
@@ -1496,9 +1500,9 @@ ui_favorites (App & app, float width)
       dl->PathStroke (theme::WhiteU32 (theme::PanelStroke), 0, 1.2f);
     }
     ImVec2 ts = app.fonts.body->CalcTextSizeA (13.5f, FLT_MAX, 0, "+");
-    dl->AddText (app.fonts.body, 13.5f, ImVec2 (c.x - ts.x / 2, c.y - ts.y / 2), theme::WhiteU32 (theme::IconMuted),
+    dl->AddText (app.fonts.body, theme::fs (13.5f), ImVec2 (c.x - ts.x / 2, c.y - ts.y / 2), theme::WhiteU32 (theme::IconMuted),
                  "+");
-    dl->AddText (app.fonts.smallMed, 11.0f, ImVec2 (x, y + av + 6), theme::WhiteU32 (theme::TextTertiary),
+    dl->AddText (app.fonts.smallMed, theme::fs (11.0f), ImVec2 (x, y + av + 6), theme::WhiteU32 (theme::TextTertiary),
                  "Star a call");
   }
 
@@ -1516,7 +1520,7 @@ ui_favorites (App & app, float width)
 
     ImVec2 ts = app.fonts.smallMed->CalcTextSizeA (11.0f, FLT_MAX, 0, f.name.c_str ());
     float tx = c.x - std::min (ts.x, item_w) / 2;
-    dl->AddText (app.fonts.smallMed, 11.0f, ImVec2 (tx, y + av + 6), theme::WhiteU32 (theme::TextSecondary),
+    dl->AddText (app.fonts.smallMed, theme::fs (11.0f), ImVec2 (tx, y + av + 6), theme::WhiteU32 (theme::TextSecondary),
                  f.name.c_str ());
 
     if (hovered)
@@ -1540,12 +1544,12 @@ ui_recents_panel (App & app, ImVec2 size)
   ImVec2 p = ImGui::GetWindowPos ();
   ImVec2 sz = ImGui::GetWindowSize ();
 
-  dl->AddText (app.fonts.bodyBold, 13.5f, ImVec2 (p.x + 18, p.y + 16), theme::WhiteU32 (theme::TextPrimary),
+  dl->AddText (app.fonts.bodyBold, theme::fs (13.5f), ImVec2 (p.x + 18, p.y + 16), theme::WhiteU32 (theme::TextPrimary),
                "Recent calls");
 
   ImGui::SetCursorPos (ImVec2 (8, 46));
 
-  const float row_h = 54.0f;
+  const float row_h = 54.0f * theme::scale;
   for (size_t i = 0; i < app.cfg.recents.size (); i++) {
     RecentCall & r = app.cfg.recents[i];
 
@@ -1564,21 +1568,23 @@ ui_recents_panel (App & app, ImVec2 size)
                          theme::RadiusRow);
 
     // Avatar 34.
-    draw_avatar (app, dl, ImVec2 (row0.x + 10 + 17, row0.y + row_h / 2), 34.0f, r.name);
+    draw_avatar (app, dl, ImVec2 (row0.x + (10 + 17) * theme::scale, row0.y + row_h / 2), 34.0f * theme::scale,
+                 r.name);
 
     // Name + address.
-    dl->AddText (app.fonts.bodyBold, 13.0f, ImVec2 (row0.x + 54, row0.y + 9), theme::WhiteU32 (0.88f),
+    dl->AddText (app.fonts.bodyBold, theme::fs (13.0f), ImVec2 (row0.x + 54 * theme::scale, row0.y + 9 * theme::scale), theme::WhiteU32 (0.88f),
                  r.name.c_str ());
-    dl->AddText (app.fonts.small_, 11.0f, ImVec2 (row0.x + 54, row0.y + 28), theme::WhiteU32 (theme::TextTertiary),
+    dl->AddText (app.fonts.small_, theme::fs (11.0f), ImVec2 (row0.x + 54 * theme::scale, row0.y + 28 * theme::scale),
+                 theme::WhiteU32 (theme::TextTertiary),
                  r.address.c_str ());
 
     // Right cluster: ↗ + timestamp, then duration + star beneath.
     float rx = row0.x + row_w - 12;
-    glyph_arrow_out (dl, ImVec2 (rx - 78, row0.y + 15), 4.5f, theme::HexU32 (theme::StatusOnline, 0.75f));
-    dl->AddText (app.fonts.small_, 10.5f, ImVec2 (rx - 66, row0.y + 9), theme::WhiteU32 (0.30f), r.timestamp.c_str ());
-    dl->AddText (app.fonts.small_, 11.0f, ImVec2 (rx - 66, row0.y + 27), theme::WhiteU32 (0.28f), r.duration.c_str ());
+    glyph_arrow_out (dl, ImVec2 (rx - 78 * theme::scale, row0.y + 15 * theme::scale), 4.5f * theme::scale, theme::HexU32 (theme::StatusOnline, 0.75f));
+    dl->AddText (app.fonts.small_, theme::fs (10.5f), ImVec2 (rx - 66 * theme::scale, row0.y + 9 * theme::scale), theme::WhiteU32 (0.30f), r.timestamp.c_str ());
+    dl->AddText (app.fonts.small_, theme::fs (11.0f), ImVec2 (rx - 66 * theme::scale, row0.y + 27 * theme::scale), theme::WhiteU32 (0.28f), r.duration.c_str ());
 
-    ImVec2 star_c (rx - 10, row0.y + 32);
+    ImVec2 star_c (rx - 10 * theme::scale, row0.y + 32 * theme::scale);
     ImGui::SetCursorScreenPos (ImVec2 (star_c.x - 9, star_c.y - 9));
     bool star_clicked = ImGui::InvisibleButton ("##star", ImVec2 (18, 18));
     bool star_hovered = ImGui::IsItemHovered ();
@@ -1604,7 +1610,7 @@ ui_recents_panel (App & app, ImVec2 size)
   if (app.cfg.recents.empty ()) {
     const char * msg = "No calls yet";
     ImVec2 ts = app.fonts.small_->CalcTextSizeA (12.5f, FLT_MAX, 0, msg);
-    dl->AddText (app.fonts.small_, 12.5f, ImVec2 (p.x + (sz.x - ts.x) / 2, p.y + sz.y / 2),
+    dl->AddText (app.fonts.small_, theme::fs (12.5f), ImVec2 (p.x + (sz.x - ts.x) / 2, p.y + sz.y / 2),
                  theme::WhiteU32 (theme::TextSecondary), msg);
   }
 
@@ -1644,7 +1650,7 @@ ui_footer (App & app, float width, float height)
     dl->AddCircleFilled (ImVec2 (x_dot, y), 6.0f, theme::HexU32 (dot, 0.25f));
   dl->AddCircleFilled (ImVec2 (x_dot, y), 3.5f, theme::HexU32 (dot));
 
-  dl->AddText (app.fonts.small_, 11.5f, ImVec2 (x_text, y - ts.y / 2),
+  dl->AddText (app.fonts.small_, theme::fs (11.5f), ImVec2 (x_text, y - ts.y / 2),
                app.status_is_error.load () && !status.empty () ? theme::HexU32 (theme::StatusError, 0.9f)
                                                                : theme::WhiteU32 (theme::TextTertiary),
                text.c_str ());
@@ -1831,7 +1837,7 @@ ui_roster_drawer (App & app, ImVec2 win_size)
   if (app.roster_slide <= 0.001f)
     return;
 
-  const float w = 300.0f;
+  const float w = 300.0f * theme::scale;
   ImVec2 vp = ImGui::GetMainViewport ()->Pos;
   float x = vp.x + (app.roster_slide - 1.0f) * w;
 
@@ -1872,7 +1878,7 @@ ui_roster_drawer (App & app, ImVec2 win_size)
 
   ImGui::BeginChild ("##rosterlist", ImVec2 (0, 0), ImGuiChildFlags_None);
 
-  const float row_h = 52.0f;
+  const float row_h = 52.0f * theme::scale;
   for (size_t i = 0; app.roster && i < app.roster->participant_list_size; i++) {
     PulseConferenceControlParticipantEntry * e = app.roster->participant_list[i];
     if (!e->is_active_participant)
@@ -1901,18 +1907,18 @@ ui_roster_drawer (App & app, ImVec2 win_size)
     const char * name = e->active_display_name    ? e->active_display_name
                         : e->display_name         ? e->display_name
                                                   : "?";
-    draw_avatar (app, dl, ImVec2 (row0.x + 6 + 16, row0.y + row_h / 2), 32.0f, name);
+    draw_avatar (app, dl, ImVec2 (row0.x + (6 + 16) * theme::scale, row0.y + row_h / 2), 32.0f * theme::scale, name);
 
     // Speaking ring around the avatar.
     if (e->is_speaking)
-      dl->AddCircle (ImVec2 (row0.x + 6 + 16, row0.y + row_h / 2), 18.5f, theme::HexU32 (theme::StatusOnline, 0.9f),
+      dl->AddCircle (ImVec2 (row0.x + (6 + 16) * theme::scale, row0.y + row_h / 2), 18.5f * theme::scale, theme::HexU32 (theme::StatusOnline, 0.9f),
                      0, 2.0f);
 
     // Name (+you), role/state line.
     std::string label = name;
     if (e->is_local_participant)
       label += "  (you)";
-    dl->AddText (app.fonts.bodyBold, 13.0f, ImVec2 (row0.x + 46, row0.y + 8), theme::WhiteU32 (0.88f),
+    dl->AddText (app.fonts.bodyBold, theme::fs (13.0f), ImVec2 (row0.x + 46 * theme::scale, row0.y + 8 * theme::scale), theme::WhiteU32 (0.88f),
                  label.c_str ());
 
     std::string sub = e->role == PULSE_CONFERENCE_ROLE_HOST ? "Host" : "Guest";
@@ -1922,7 +1928,7 @@ ui_roster_drawer (App & app, ImVec2 win_size)
       sub += "  ·  muted";
     if (e->is_video_muted)
       sub += "  ·  camera off";
-    dl->AddText (app.fonts.small_, 10.5f, ImVec2 (row0.x + 46, row0.y + 27),
+    dl->AddText (app.fonts.small_, theme::fs (10.5f), ImVec2 (row0.x + 46 * theme::scale, row0.y + 27 * theme::scale),
                  e->is_muted ? theme::HexU32 (theme::StatusError, 0.75f) : theme::WhiteU32 (theme::TextTertiary),
                  sub.c_str ());
 
@@ -2221,7 +2227,7 @@ ui_chat_drawer (App & app, ImVec2 win_size)
   if (app.show_chat)
     app.chat_unread.store (0);
 
-  const float w = 300.0f;
+  const float w = 300.0f * theme::scale;
   ImVec2 vp = ImGui::GetMainViewport ()->Pos;
   float x = vp.x + win_size.x - app.chat_slide * w;
 
@@ -2576,7 +2582,7 @@ ui_in_call (App & app, ImVec2 win_size)
       ImVec2 c0 (p.x + (win_size.x - ts.x) / 2 - 14, p.y + win_size.y - 80 - ts.y - 18);
       ImVec2 c1 (c0.x + ts.x + 28, c0.y + ts.y + 16);
       dl->AddRectFilled (c0, c1, theme::HexU32 (theme::WindowBgStart, 0.80f), 10.0f);
-      dl->AddText (app.fonts.body, 14.5f, ImVec2 (c0.x + 14, c0.y + 8), theme::WhiteU32 (0.95f), text.c_str (),
+      dl->AddText (app.fonts.body, theme::fs (14.5f), ImVec2 (c0.x + 14, c0.y + 8), theme::WhiteU32 (0.95f), text.c_str (),
                    nullptr, wrap_w);
     }
   }
@@ -2592,7 +2598,7 @@ ui_in_call (App & app, ImVec2 win_size)
     ImVec2 h0 (p.x + (win_size.x - ts.x) / 2 - 12, p.y + 16);
     ImVec2 h1 (p.x + (win_size.x + ts.x) / 2 + 12, p.y + 16 + ts.y + 10);
     dl->AddRectFilled (h0, h1, theme::HexU32 (theme::WindowBgStart, 0.55f), (h1.y - h0.y) / 2);
-    dl->AddText (app.fonts.small_, 11.5f, ImVec2 (h0.x + 12, h0.y + 5), theme::WhiteU32 (0.85f), hud);
+    dl->AddText (app.fonts.small_, theme::fs (11.5f), ImVec2 (h0.x + 12, h0.y + 5), theme::WhiteU32 (0.85f), hud);
   }
 
   // Control bar: share + mic on the left, End call centre, camera + devices
@@ -2617,7 +2623,7 @@ ui_in_call (App & app, ImVec2 win_size)
       ImVec2 bc (x + bh - 4, y + 4);
       dl->AddCircleFilled (bc, 8.0f, theme::HexU32 (theme::StatusError));
       ImVec2 ts = app.fonts.small_->CalcTextSizeA (10.0f, FLT_MAX, 0, n);
-      dl->AddText (app.fonts.small_, 10.0f, ImVec2 (bc.x - ts.x / 2, bc.y - ts.y / 2), theme::WhiteU32 (1.0f), n);
+      dl->AddText (app.fonts.small_, theme::fs (10.0f), ImVec2 (bc.x - ts.x / 2, bc.y - ts.y / 2), theme::WhiteU32 (1.0f), n);
     }
     x += bh + gap;
 
@@ -2637,7 +2643,7 @@ ui_in_call (App & app, ImVec2 win_size)
     dl->AddRectFilled (b0, b1, theme::HexU32 (theme::StatusError, hovered ? 1.0f : 0.92f), bh / 2);
     const char * lbl = "End call";
     ImVec2 ts = app.fonts.bodyBold->CalcTextSizeA (13.0f, FLT_MAX, 0, lbl);
-    dl->AddText (app.fonts.bodyBold, 13.0f, ImVec2 ((b0.x + b1.x - ts.x) / 2, (b0.y + b1.y - ts.y) / 2),
+    dl->AddText (app.fonts.bodyBold, theme::fs (13.0f), ImVec2 ((b0.x + b1.x - ts.x) / 2, (b0.y + b1.y - ts.y) / 2),
                  theme::WhiteU32 (1.0f), lbl);
     if (hovered)
       ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
@@ -2789,14 +2795,17 @@ int
 main (int argc, char ** argv)
 {
 #ifdef PEXCLIENT_DEFAULT_CWD
-  // Launched via Finder/LaunchServices (the .app bundle), the working
-  // directory is "/" — hop to the repo root so pexclient-config.txt and
-  // relative paths behave the same as a terminal launch.
-  {
-    char cwd[16] = "";
-    if (getcwd (cwd, sizeof (cwd)) && strcmp (cwd, "/") == 0)
-      (void) chdir (PEXCLIENT_DEFAULT_CWD);
-  }
+  // When launched from the .app bundle, LaunchServices sets the working
+  // directory to Contents/Resources *inside the bundle* — where a written
+  // config would be destroyed by the next make-bundle.sh run (it rebuilds the
+  // bundle from scratch). Hop to the source tree so the bundle and the
+  // terminal launcher share one pexclient-config.txt.
+  // GLFW's Cocoa backend chdirs into Contents/Resources during glfwInit()
+  // unless this hint is cleared — it would undo the chdir below.
+  glfwInitHint (GLFW_COCOA_CHDIR_RESOURCES, GLFW_FALSE);
+
+  if (argc > 0 && strstr (argv[0], ".app/Contents/MacOS/") != nullptr)
+    (void) chdir (PEXCLIENT_DEFAULT_CWD);
 #endif
 
   if (!glfwInit ()) {
@@ -2828,6 +2837,7 @@ main (int argc, char ** argv)
 
   float xscale = 1.0f, yscale = 1.0f;
   glfwGetWindowContentScale (window, &xscale, &yscale);
+  theme::scale = app.cfg.ui_scale; // must be set before fonts/metrics are sized
   app.fonts = theme::LoadFonts (io, PEXCLIENT_ASSET_DIR "/fonts", xscale);
   theme::Apply ();
 
@@ -2967,7 +2977,7 @@ main (int argc, char ** argv)
     } else {
       const float pad = theme::WindowPad;
       const float content_w = vp->Size.x - pad * 2;
-      const float footer_h = 34.0f;
+      const float footer_h = 34.0f * theme::scale;
 
       ImGui::SetCursorScreenPos (ImVec2 (vp->Pos.x + pad, vp->Pos.y + 16));
       ui_search_row (app, content_w);
