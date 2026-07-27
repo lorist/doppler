@@ -39,6 +39,8 @@
 #include <CoreGraphics/CoreGraphics.h>
 #endif
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -103,6 +105,7 @@ struct Config
   char reg_user[256] = "";
   char reg_pass[256] = "";
   bool reg_auto = false;
+  bool reg_sso = false; // authenticate registration via SSO instead of password
   char default_server[256] = ""; // used for bare aliases when not registered
 
   std::vector<Contact> favorites;
@@ -237,6 +240,13 @@ struct App
   bool selfview_hidden = false;
   ImVec2 selfview_pos = ImVec2 (1.0f, 1.0f); // default: bottom-right
   bool selfview_drag_active = false;
+
+  // SSO provider selection — parked-callback handshake, like PIN/incoming.
+  // sso_answer: -2 undecided, -1 cancel, >=0 chosen provider index.
+  std::atomic<bool> sso_pending{false};
+  std::atomic<int> sso_answer{-2};
+  std::mutex sso_mutex;
+  std::vector<std::string> sso_providers;
 };
 
 static void
@@ -291,6 +301,8 @@ load_config (Config & cfg)
       copy_field (cfg.reg_pass, sizeof (cfg.reg_pass), value);
     else if (key == "reg_auto")
       cfg.reg_auto = (value == "true");
+    else if (key == "reg_sso")
+      cfg.reg_sso = (value == "true");
     else if (key == "default_server")
       copy_field (cfg.default_server, sizeof (cfg.default_server), value);
     else if (key == "dev_camera")
@@ -326,6 +338,7 @@ save_config (const Config & cfg)
   ofs << "reg_user=" << cfg.reg_user << "\n";
   ofs << "reg_pass=" << cfg.reg_pass << "\n";
   ofs << "reg_auto=" << (cfg.reg_auto ? "true" : "false") << "\n";
+  ofs << "reg_sso=" << (cfg.reg_sso ? "true" : "false") << "\n";
   ofs << "default_server=" << cfg.default_server << "\n";
   ofs << "dev_camera=" << cfg.dev_camera << "\n";
   ofs << "dev_mic=" << cfg.dev_mic << "\n";
@@ -533,9 +546,9 @@ start_register (App & app)
   PulseRegistrationRequest req{};
   req.host = app.cfg.reg_host;
   req.alias = app.cfg.reg_alias;
-  req.username = app.cfg.reg_user[0] ? app.cfg.reg_user : nullptr;
-  req.password = app.cfg.reg_pass[0] ? app.cfg.reg_pass : nullptr;
-  req.use_sso = false;
+  req.username = !app.cfg.reg_sso && app.cfg.reg_user[0] ? app.cfg.reg_user : nullptr;
+  req.password = !app.cfg.reg_sso && app.cfg.reg_pass[0] ? app.cfg.reg_pass : nullptr;
+  req.use_sso = app.cfg.reg_sso;
 
   // The registrations event callbacks must be installed before registering —
   // they are how Pulse delivers (and lets us answer) incoming calls.
@@ -1664,8 +1677,11 @@ ui_settings (App & app)
   ImGui::TextDisabled ("REGISTRATION");
   ImGui::InputText ("Host / domain", app.cfg.reg_host, sizeof (app.cfg.reg_host));
   ImGui::InputText ("Device alias", app.cfg.reg_alias, sizeof (app.cfg.reg_alias));
-  ImGui::InputText ("Username", app.cfg.reg_user, sizeof (app.cfg.reg_user));
-  ImGui::InputText ("Password", app.cfg.reg_pass, sizeof (app.cfg.reg_pass), ImGuiInputTextFlags_Password);
+  ImGui::Checkbox ("Authenticate with SSO", &app.cfg.reg_sso);
+  if (!app.cfg.reg_sso) {
+    ImGui::InputText ("Username", app.cfg.reg_user, sizeof (app.cfg.reg_user));
+    ImGui::InputText ("Password", app.cfg.reg_pass, sizeof (app.cfg.reg_pass), ImGuiInputTextFlags_Password);
+  }
   ImGui::Checkbox ("Register automatically on startup", &app.cfg.reg_auto);
 
   int reg = app.reg_status.load ();
@@ -1979,6 +1995,66 @@ ui_roster_drawer (App & app, ImVec2 win_size)
   ImGui::EndChild ();
   ImGui::End ();
   ImGui::PopStyleVar (3);
+  ImGui::PopStyleColor (2);
+}
+
+// SSO provider chooser, shown while a registration/join is parked on
+// on_sso_select. Picking a provider hands control back to Pulse, which opens
+// the system browser for the IdP flow.
+static void
+ui_sso_card (App & app)
+{
+  bool pending = app.sso_pending.load ();
+
+  if (pending && !ImGui::IsPopupOpen ("##ssomodal"))
+    ImGui::OpenPopup ("##ssomodal");
+  if (!ImGui::IsPopupOpen ("##ssomodal"))
+    return;
+
+  ImGui::SetNextWindowPos (ImGui::GetMainViewport ()->GetCenter (), ImGuiCond_Appearing, ImVec2 (0.5f, 0.5f));
+  ImGui::SetNextWindowSize (ImVec2 (340, 0));
+  ImGui::PushStyleColor (ImGuiCol_PopupBg, theme::Hex (theme::WindowBgMid, 0.98f));
+  ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (theme::AccentPrimary, 0.45f));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (16, 14));
+  ImGui::PushStyleVar (ImGuiStyleVar_PopupRounding, theme::RadiusPanel);
+
+  if (ImGui::BeginPopupModal ("##ssomodal", nullptr,
+                              ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::PushFont (app.fonts.bodyBold);
+    ImGui::TextUnformatted ("Sign in required");
+    ImGui::PopFont ();
+    ImGui::TextDisabled ("Choose an identity provider — your browser will open to sign in.");
+    ImGui::Dummy (ImVec2 (0, 4));
+
+    std::vector<std::string> providers;
+    {
+      std::lock_guard<std::mutex> lock (app.sso_mutex);
+      providers = app.sso_providers;
+    }
+    for (size_t i = 0; i < providers.size (); i++) {
+      ImGui::PushID ((int) i);
+      if (pending && accent_button (app, providers[i].c_str (), theme::AccentPrimary,
+                                    ImVec2 (ImGui::GetContentRegionAvail ().x, 28))) {
+        app.sso_answer.store ((int) i);
+        ImGui::CloseCurrentPopup ();
+      }
+      ImGui::PopID ();
+      ImGui::Dummy (ImVec2 (0, 2));
+    }
+
+    ImGui::Dummy (ImVec2 (0, 2));
+    if (pending && accent_button (app, "Cancel", theme::StatusError, ImVec2 (92, 26))) {
+      app.sso_answer.store (-1);
+      ImGui::CloseCurrentPopup ();
+    }
+    if (!pending)
+      ImGui::CloseCurrentPopup (); // aborted elsewhere
+
+    ImGui::EndPopup ();
+  }
+
+  ImGui::PopStyleVar (2);
   ImGui::PopStyleColor (2);
 }
 
@@ -2676,20 +2752,53 @@ on_pulse_log (void *, PulseDebugLevel level, const char * category, int64_t, int
   std::fprintf (stderr, "[pulse:%s] %s\n", category ? category : "?", message ? message : "");
 }
 
-// SSO provider selection. pexclient only does password registrations, so if
-// this ever fires we abort the SSO flow by returning -1 (no provider chosen).
-// The callback must exist regardless: on macOS/Linux, pulse_register requires
-// a handle created by pulse_new_with_internal_sso_handling() — plain
-// pulse_new() makes it fail with "Invalid pulse handle, missing sso callbacks".
+// SSO provider selection. Pulse hands us the deployment's IdP list and parks
+// this worker thread until the UI answers with an index (or -1 to abort);
+// Pulse then runs the browser authentication flow itself. On reconnects with
+// a single provider there is nothing to choose — answer immediately.
+// (This callback existing is also why registration works at all on macOS:
+// pulse_register requires a pulse_new_with_internal_sso_handling() handle.)
 static int
-on_sso_select (PulseSSOProviderList *, void *)
+on_sso_select (PulseSSOProviderList * list, void * user_context)
 {
-  return -1;
+  auto * app = static_cast<App *> (user_context);
+  if (list == nullptr || list->num <= 0)
+    return -1;
+  if (list->num == 1 && list->is_reconnect)
+    return 0;
+
+  {
+    std::lock_guard<std::mutex> lock (app->sso_mutex);
+    app->sso_providers.clear ();
+    for (int i = 0; i < list->num; i++)
+      app->sso_providers.push_back (list->providers[i].name ? list->providers[i].name : "?");
+  }
+  app->sso_answer.store (-2);
+  app->sso_pending.store (true);
+
+  while (app->sso_answer.load () == -2)
+    std::this_thread::sleep_for (std::chrono::milliseconds (100));
+
+  app->sso_pending.store (false);
+  int choice = app->sso_answer.load ();
+  std::fprintf (stderr, "[pexclient] sso provider selection: %d of %d\n", choice, list->num);
+  return choice;
 }
 
 int
 main (int argc, char ** argv)
 {
+#ifdef PEXCLIENT_DEFAULT_CWD
+  // Launched via Finder/LaunchServices (the .app bundle), the working
+  // directory is "/" — hop to the repo root so pexclient-config.txt and
+  // relative paths behave the same as a terminal launch.
+  {
+    char cwd[16] = "";
+    if (getcwd (cwd, sizeof (cwd)) && strcmp (cwd, "/") == 0)
+      (void) chdir (PEXCLIENT_DEFAULT_CWD);
+  }
+#endif
+
   if (!glfwInit ()) {
     std::fprintf (stderr, "glfwInit failed\n");
     return 1;
@@ -2882,6 +2991,7 @@ main (int argc, char ** argv)
 
     ui_incoming_banner (app, vp->Size);
     ui_pin_card (app, vp->Size);
+    ui_sso_card (app);
     ui_devices_window (app);
     ui_share_window (app);
 

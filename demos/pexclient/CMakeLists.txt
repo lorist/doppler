@@ -12,7 +12,8 @@ add_executable(pexclient
 # Where the DM Sans TTFs and the Pulse background image live. Absolute so the
 # binary works regardless of the directory it is launched from.
 target_compile_definitions(pexclient PRIVATE
-    "PEXCLIENT_ASSET_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/assets\"")
+    "PEXCLIENT_ASSET_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/assets\""
+    "PEXCLIENT_DEFAULT_CWD=\"${CMAKE_SOURCE_DIR}\"")
 
 target_link_libraries(pexclient PRIVATE
     imgui
