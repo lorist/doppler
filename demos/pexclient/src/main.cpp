@@ -35,6 +35,7 @@
 #include <pexpulse/pulse_video_mix_session.h>
 
 #if defined(__APPLE__)
+#include <AudioToolbox/AudioToolbox.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #endif
@@ -241,6 +242,32 @@ struct App
   bool selfview_hidden = false;
   ImVec2 selfview_pos = ImVec2 (1.0f, 1.0f); // default: bottom-right
   bool selfview_drag_active = false;
+
+  // Set when a call is starting and the capture devices must be (re)attached.
+  // Always actioned on the UI thread — Pulse's blocking callbacks run on
+  // worker threads, and attaching a camera from there races the media setup.
+  std::atomic<bool> want_devices{false};
+
+  // A registration is in flight. reg_status only moves once Pulse's state
+  // callback fires, which is too late to stop a second Register click from
+  // hitting the handle while the first is still running.
+  std::atomic<bool> reg_in_flight{false};
+
+  // Incoming-call alerting: ring tone + window attention, driven from the
+  // UI thread (GLFW window calls must not come from a Pulse worker).
+  bool ringing = false;
+  double ring_next_at = 0.0;
+
+  // Virtual reception (IVR): Infinity asks for the conference extension to
+  // route to. Parked-callback handshake, like PIN/incoming/SSO.
+  std::atomic<bool> ext_pending{false};
+  std::atomic<int> ext_answer{-1}; // -1 undecided, 0 cancel, 1 submit
+  std::mutex ext_mutex;
+  std::string ext_value;
+
+  // DTMF keypad.
+  bool show_keypad = false;
+  std::string dtmf_sent; // local echo of what we've sent this call
 
   // SSO provider selection — parked-callback handshake, like PIN/incoming.
   // sso_answer: -2 undecided, -1 cancel, >=0 chosen provider index.
@@ -452,6 +479,24 @@ on_async_result (const PulseError err, void * user_context)
   set_status (*app, err == PULSE_SUCCESS ? "" : pulse_strerror (err), err != PULSE_SUCCESS);
 }
 
+// Registration results: clear the in-flight guard and translate the one error
+// whose wording explains nothing to a user.
+static void
+on_register_result (const PulseError err, void * user_context)
+{
+  auto * app = static_cast<App *> (user_context);
+  app->reg_in_flight.store (false);
+  if (err == PULSE_SUCCESS) {
+    set_status (*app, "");
+    return;
+  }
+  std::fprintf (stderr, "[pexclient] registration failed: %s\n", pulse_strerror (err));
+  if (err == PULSE_ERROR_HANDLE_IN_USE)
+    set_status (*app, "Registration busy — is another pexclient already running?", true);
+  else
+    set_status (*app, pulse_strerror (err), true);
+}
+
 static void
 on_progress (const PulseOperationProgressInfo * info, void * user_context)
 {
@@ -460,6 +505,85 @@ on_progress (const PulseOperationProgressInfo * info, void * user_context)
 }
 
 static void connect_default_devices (App & app);
+
+// --- Incoming-call alerting -------------------------------------------------
+//
+// Pulse has no ringtone of its own, so play a macOS system sound. It is
+// fire-and-forget and short, so "ringing" is a replay on a timer rather than a
+// loop we stop — which also means an in-flight ring never outlives the call.
+
+#if defined(__APPLE__)
+static SystemSoundID
+ring_sound ()
+{
+  static SystemSoundID sound = 0;
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    CFURLRef url = CFURLCreateWithFileSystemPath (kCFAllocatorDefault, CFSTR ("/System/Library/Sounds/Funk.aiff"),
+                                                  kCFURLPOSIXPathStyle, false);
+    if (url) {
+      if (AudioServicesCreateSystemSoundID (url, &sound) != kAudioServicesNoError)
+        sound = 0;
+      CFRelease (url);
+    }
+  }
+  return sound;
+}
+
+static void
+play_ring ()
+{
+  SystemSoundID s = ring_sound ();
+  if (s != 0)
+    AudioServicesPlaySystemSound (s);
+  else
+    AudioServicesPlayAlertSound (kSystemSoundID_UserPreferredAlert);
+}
+#else
+static void
+play_ring ()
+{
+}
+#endif
+
+// Ring, bounce the Dock icon and raise the window while a call is pending.
+// Called every frame from the UI thread.
+// Attach capture devices when a call asked for them (incoming accept), on the
+// UI thread.
+static void
+update_devices_request (App & app)
+{
+  if (app.want_devices.exchange (false))
+    connect_default_devices (app);
+}
+
+static void
+update_ringing (App & app)
+{
+  bool pending = app.incoming_pending.load ();
+  double now = ImGui::GetTime ();
+
+  if (pending && !app.ringing) {
+    app.ringing = true;
+    app.ring_next_at = 0.0; // ring immediately
+
+    // Bring the client forward so the banner is actually seen. Dock-bounce
+    // (persistent) plus a raise; GLFW routes both to the Cocoa equivalents.
+    glfwRequestWindowAttention (app.window);
+    if (glfwGetWindowAttrib (app.window, GLFW_ICONIFIED))
+      glfwRestoreWindow (app.window);
+    glfwShowWindow (app.window);
+    glfwFocusWindow (app.window);
+  } else if (!pending && app.ringing) {
+    app.ringing = false;
+  }
+
+  if (app.ringing && now >= app.ring_next_at) {
+    play_ring ();
+    app.ring_next_at = now + 2.6; // roughly a telephone cadence
+  }
+}
 
 // Incoming call: park this Pulse worker thread on the UI's answer. Returning
 // true accepts the call (Pulse then runs the normal connect flow using the
@@ -484,7 +608,7 @@ on_incoming (const PulseRegistrationsEventIncoming * event, void * user_context,
   app->incoming_pending.store (false);
   bool accept = app->incoming_answer.load () == 1;
   if (accept) {
-    connect_default_devices (*app);
+    app->want_devices.store (true); // UI thread attaches them; see update_devices_request
     result_cb->func = on_async_result;
     result_cb->user_context = app;
     progress_cb->func = on_progress;
@@ -502,6 +626,33 @@ on_incoming_cancelled (const PulseRegistrationsEventIncomingCancelled *, void * 
   auto * app = static_cast<App *> (user_context);
   if (app->incoming_pending.load ())
     app->incoming_answer.store (0); // releases the parked callback as a decline
+}
+
+// Virtual reception: Infinity is asking which conference to route us to. Park
+// the worker until the UI collects an extension. Like the PIN callback, the
+// setter MUST be invoked before returning.
+static bool
+on_conference_extension (const PulseSetConferenceExtension * set_ext, void * user_context)
+{
+  auto * app = static_cast<App *> (user_context);
+  {
+    std::lock_guard<std::mutex> lock (app->ext_mutex);
+    app->ext_value.clear ();
+  }
+  app->ext_answer.store (-1);
+  app->ext_pending.store (true);
+
+  while (app->ext_answer.load () == -1)
+    std::this_thread::sleep_for (std::chrono::milliseconds (100));
+
+  app->ext_pending.store (false);
+  bool submit = app->ext_answer.load () == 1;
+  if (submit) {
+    std::lock_guard<std::mutex> lock (app->ext_mutex);
+    set_ext->func (set_ext->context, app->ext_value.c_str ());
+  }
+  std::fprintf (stderr, "[pexclient] conference extension: %s\n", submit ? "submitted" : "cancelled");
+  return submit;
 }
 
 // PIN request: park the Pulse worker until the UI collects a PIN. The
@@ -563,11 +714,18 @@ start_register (App & app)
   ev_cb.registrations_event_incoming_cancelled_callback_user_context = &app;
   pulse_options_set_registrations_events_callbacks (app.pulse, &ev_cb);
 
-  PulseAsyncOperationResultCallbackConfig result_cb{on_async_result, &app};
+  if (app.reg_in_flight.exchange (true)) {
+    set_status (app, "Registration already in progress…");
+    return;
+  }
+
+  PulseAsyncOperationResultCallbackConfig result_cb{on_register_result, &app};
   PulseOperationProgressCallbackConfig progress_cb{on_progress, &app};
   PulseError err = pulse_register_async (app.pulse, &req, &result_cb, &progress_cb);
-  if (err != PULSE_SUCCESS)
-    set_status (app, std::string ("register: ") + pulse_strerror (err));
+  if (err != PULSE_SUCCESS) {
+    app.reg_in_flight.store (false);
+    on_register_result (err, &app);
+  }
 }
 
 static void
@@ -602,6 +760,10 @@ refresh_device_lists (App & app)
   app.mics = enumerate_devices (app.pulse, PULSE_MEDIA_AUDIO, PULSE_MEDIA_INPUT);
   app.speakers = enumerate_devices (app.pulse, PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT);
   app.device_list_dirty.store (false);
+  std::fprintf (stderr, "[pexclient] devices: %zu cameras, %zu mics, %zu speakers\n", app.cameras.size (),
+                app.mics.size (), app.speakers.size ());
+  for (const DevEntry & d : app.cameras)
+    std::fprintf (stderr, "[pexclient]   camera: '%s'%s\n", d.name.c_str (), d.is_default ? " (default)" : "");
 }
 
 // Connect the preferred device for one class — by saved name if it is still
@@ -627,6 +789,13 @@ connect_default_devices (App & app)
 {
   if (app.device_list_dirty.load ())
     refresh_device_lists (app);
+
+  // Releasing the devices between calls (so the camera light goes out) can
+  // leave the previous session half torn down; re-attaching the *same* device
+  // then yields a frozen capture. An explicit disconnect first makes the
+  // attach below unconditional and idempotent.
+  pulse_device_session_disconnect_main_video (app.pulse, PULSE_MEDIA_CONTENT_MAIN, PULSE_MEDIA_INPUT);
+  pulse_device_session_disconnect_main_audio (app.pulse);
   apply_device (app, app.cameras, app.cfg.dev_camera, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT);
   apply_device (app, app.mics, app.cfg.dev_mic, PULSE_MEDIA_AUDIO, PULSE_MEDIA_INPUT);
   apply_device (app, app.speakers, app.cfg.dev_speaker, PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT);
@@ -1274,6 +1443,15 @@ glyph_cc (ImDrawList * dl, ImVec2 center, float r, ImU32 col)
 }
 
 static void
+glyph_keypad (ImDrawList * dl, ImVec2 center, float r, ImU32 col)
+{
+  // 3x3 dot grid — the dial-pad affordance.
+  for (int gy = -1; gy <= 1; gy++)
+    for (int gx = -1; gx <= 1; gx++)
+      dl->AddCircleFilled (ImVec2 (center.x + gx * r * 0.62f, center.y + gy * r * 0.62f), 1.7f, col);
+}
+
+static void
 glyph_dots (ImDrawList * dl, ImVec2 center, float r, ImU32 col)
 {
   for (int i = -1; i <= 1; i++)
@@ -1692,7 +1870,8 @@ ui_settings (App & app)
 
   int reg = app.reg_status.load ();
   bool registered = reg == PULSE_CONNECTION_STATUS_CONNECTED;
-  bool busy = reg == PULSE_CONNECTION_STATUS_CONNECTING || reg == PULSE_CONNECTION_STATUS_DISCONNECTING;
+  bool busy = reg == PULSE_CONNECTION_STATUS_CONNECTING || reg == PULSE_CONNECTION_STATUS_DISCONNECTING ||
+              app.reg_in_flight.load ();
 
   ImGui::BeginDisabled (busy);
   if (registered) {
@@ -2002,6 +2181,142 @@ ui_roster_drawer (App & app, ImVec2 win_size)
   ImGui::End ();
   ImGui::PopStyleVar (3);
   ImGui::PopStyleColor (2);
+}
+
+// Virtual-reception extension entry, shown while a connect is parked on
+// on_conference_extension. Same modal shape as the PIN card.
+static void
+ui_extension_card (App & app)
+{
+  bool pending = app.ext_pending.load ();
+
+  if (pending && !ImGui::IsPopupOpen ("##extmodal"))
+    ImGui::OpenPopup ("##extmodal");
+  if (!ImGui::IsPopupOpen ("##extmodal"))
+    return;
+
+  ImGui::SetNextWindowPos (ImGui::GetMainViewport ()->GetCenter (), ImGuiCond_Appearing, ImVec2 (0.5f, 0.5f));
+  ImGui::SetNextWindowSize (ImVec2 (340, 0));
+  ImGui::PushStyleColor (ImGuiCol_PopupBg, theme::Hex (theme::WindowBgMid, 0.98f));
+  ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (theme::AccentPrimary, 0.45f));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (16, 14));
+  ImGui::PushStyleVar (ImGuiStyleVar_PopupRounding, theme::RadiusPanel);
+
+  if (ImGui::BeginPopupModal ("##extmodal", nullptr,
+                              ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    static char ext_buf[64] = "";
+
+    ImGui::PushFont (app.fonts.bodyBold);
+    ImGui::TextUnformatted ("Virtual reception");
+    ImGui::PopFont ();
+    ImGui::TextDisabled ("Enter the extension or alias to be connected to.");
+    ImGui::Dummy (ImVec2 (0, 2));
+
+    if (ImGui::IsWindowAppearing ())
+      ImGui::SetKeyboardFocusHere ();
+    ImGui::SetNextItemWidth (-FLT_MIN);
+    bool entered = ImGui::InputTextWithHint ("##ext", "extension", ext_buf, sizeof (ext_buf),
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::Dummy (ImVec2 (0, 4));
+
+    bool go = accent_button (app, "Connect", theme::AccentPrimary, ImVec2 (92, 27)) || entered;
+    ImGui::SameLine (ImGui::GetWindowWidth () - 92 - 16);
+    bool cancel = accent_button (app, "Cancel", theme::StatusError, ImVec2 (92, 27));
+
+    if (pending && go && ext_buf[0]) {
+      {
+        std::lock_guard<std::mutex> lock (app.ext_mutex);
+        app.ext_value = ext_buf;
+      }
+      ext_buf[0] = '\0';
+      app.ext_answer.store (1);
+      ImGui::CloseCurrentPopup ();
+    } else if (pending && cancel) {
+      ext_buf[0] = '\0';
+      app.ext_answer.store (0);
+      ImGui::CloseCurrentPopup ();
+    } else if (!pending) {
+      ImGui::CloseCurrentPopup ();
+    }
+
+    ImGui::EndPopup ();
+  }
+
+  ImGui::PopStyleVar (2);
+  ImGui::PopStyleColor (2);
+}
+
+// DTMF keypad. Digits go to the far end via the conference (target NULL —
+// "ignored for gateway calls", which is the IVR/PSTN case this is for).
+static void
+ui_keypad_window (App & app)
+{
+  if (!app.show_keypad)
+    return;
+
+  ImGui::SetNextWindowSize (ImVec2 (250, 0));
+  ImGui::SetNextWindowPos (ImGui::GetMainViewport ()->GetCenter (), ImGuiCond_Appearing, ImVec2 (0.5f, 0.5f));
+  ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.98f));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (16, 14));
+  ImGui::Begin ("Keypad", &app.show_keypad,
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking |
+                  ImGuiWindowFlags_NoSavedSettings);
+
+  // Echo of what has been sent, so multi-digit entry is visible.
+  ImGui::PushFont (app.fonts.bodyBold);
+  ImGui::TextUnformatted (app.dtmf_sent.empty () ? " " : app.dtmf_sent.c_str ());
+  ImGui::PopFont ();
+  ImGui::Separator ();
+  ImGui::Dummy (ImVec2 (0, 4));
+
+  static const char * rows[] = {"123", "456", "789", "*0#"};
+  const float bw = 66.0f * theme::scale, bh = 40.0f * theme::scale;
+
+  auto send_digit = [&] (char d) {
+    char digit[2] = {d, '\0'};
+    PulseError err = pulse_participant_control_dtmf (app.pulse, nullptr, digit);
+    std::fprintf (stderr, "[pexclient] dtmf '%c' -> %s\n", d, pulse_strerror (err));
+    if (err == PULSE_SUCCESS) {
+      app.dtmf_sent += d;
+      if (app.dtmf_sent.size () > 24)
+        app.dtmf_sent.erase (0, app.dtmf_sent.size () - 24);
+    } else {
+      set_status (app, std::string ("DTMF: ") + pulse_strerror (err), true);
+    }
+  };
+
+  for (const char * row : rows) {
+    for (int i = 0; row[i]; i++) {
+      ImGui::PushID (row[i]);
+      char label[2] = {row[i], '\0'};
+      if (accent_button (app, label, theme::AccentPrimary, ImVec2 (bw, bh)))
+        send_digit (row[i]);
+      ImGui::PopID ();
+      if (i < 2)
+        ImGui::SameLine ();
+    }
+  }
+
+  // Physical keyboard entry while the window has focus.
+  if (ImGui::IsWindowFocused (ImGuiFocusedFlags_RootAndChildWindows)) {
+    for (ImGuiKey k = ImGuiKey_0; k <= ImGuiKey_9; k = (ImGuiKey) (k + 1))
+      if (ImGui::IsKeyPressed (k))
+        send_digit ((char) ('0' + (k - ImGuiKey_0)));
+    if (ImGui::IsKeyPressed (ImGuiKey_KeypadMultiply))
+      send_digit ('*');
+  }
+
+  ImGui::Dummy (ImVec2 (0, 4));
+  if (ImGui::Button ("Clear", ImVec2 (bw, 0)))
+    app.dtmf_sent.clear ();
+  ImGui::SameLine ();
+  if (ImGui::Button ("Close", ImVec2 (bw, 0)))
+    app.show_keypad = false;
+
+  ImGui::End ();
+  ImGui::PopStyleVar ();
+  ImGui::PopStyleColor ();
 }
 
 // SSO provider chooser, shown while a registration/join is parked on
@@ -2605,9 +2920,27 @@ ui_in_call (App & app, ImVec2 win_size)
   // on the right.
   {
     const float bw = 110, bh = 36, gap = 10;
-    float bar_w = bh + gap + bh + gap + bh + gap + bh + gap + bw + gap + bh + gap + bh + gap + bh + gap + bh;
+    float bar_w = bh + gap + bh + gap + bh + gap + bh + gap + bw + gap + (bh + gap) * 5 - gap;
     float x = p.x + (win_size.x - bar_w) / 2;
     float y = p.y + win_size.y - bh - 22;
+
+    // Scrim behind the bar. The buttons are translucent glass, which vanishes
+    // over bright video; a dark rounded plate plus a soft fade underneath
+    // keeps them legible over any content.
+    {
+      const float pad_x = 14.0f, pad_y = 10.0f;
+      ImVec2 s0 (x - pad_x, y - pad_y), s1 (x + bar_w + pad_x, y + bh + pad_y);
+
+      // Vertical fade from transparent to the shell colour, anchored to the
+      // window bottom, so the plate doesn't read as a floating slab.
+      ImU32 top = theme::HexU32 (theme::WindowBgStart, 0.0f);
+      ImU32 bottom = theme::HexU32 (theme::WindowBgStart, 0.55f);
+      dl->AddRectFilledMultiColor (ImVec2 (p.x, s0.y - 26), ImVec2 (p.x + win_size.x, p.y + win_size.y), top, top,
+                                   bottom, bottom);
+
+      dl->AddRectFilled (s0, s1, theme::HexU32 (theme::WindowBgStart, 0.72f), (s1.y - s0.y) / 2);
+      dl->AddRect (s0, s1, theme::WhiteU32 (0.10f), (s1.y - s0.y) / 2, 0, 1.0f);
+    }
 
     if (glyph_button (app, dl, "##callroster", ImVec2 (x, y), bh, app.show_roster, glyph_people))
       app.show_roster = !app.show_roster;
@@ -2674,6 +3007,10 @@ ui_in_call (App & app, ImVec2 win_size)
     if (glyph_button (app, dl, "##callconf", ImVec2 (b1.x + gap + (bh + gap) * 3, y), bh, app.show_conf_controls,
                       glyph_dots))
       app.show_conf_controls = !app.show_conf_controls;
+
+    if (glyph_button (app, dl, "##callkeypad", ImVec2 (b1.x + gap + (bh + gap) * 4, y), bh, app.show_keypad,
+                      glyph_keypad))
+      app.show_keypad = !app.show_keypad;
   }
 }
 
@@ -2871,6 +3208,10 @@ main (int argc, char ** argv)
   pin_cb.func = on_pin_request;
   pin_cb.user_context = &app;
   pulse_options_set_pin_code_request_callbacks (app.pulse, &pin_cb);
+  PulseConferenceExtensionRequestCallbackConfig ext_cb{};
+  ext_cb.func = on_conference_extension;
+  ext_cb.user_context = &app;
+  pulse_options_set_conference_extension_request_callback (app.pulse, &ext_cb);
 
   // Re-enumerate the device combos when hardware comes and goes.
   pulse_register_device_list_changed_callback (app.pulse, PULSE_MEDIA_AUDIO, on_device_list_changed, &app);
@@ -2949,6 +3290,8 @@ main (int argc, char ** argv)
       app.show_chat = false;
       clear_chat (app);
       app.show_conf_controls = false;
+      app.show_keypad = false;
+      app.dtmf_sent.clear ();
       app.captions_on = false;
       {
         std::lock_guard<std::mutex> lock (app.caption_mutex);
@@ -2999,8 +3342,12 @@ main (int argc, char ** argv)
       ui_settings (app);
     }
 
+    update_devices_request (app);
+    update_ringing (app);
     ui_incoming_banner (app, vp->Size);
     ui_pin_card (app, vp->Size);
+    ui_extension_card (app);
+    ui_keypad_window (app);
     ui_sso_card (app);
     ui_devices_window (app);
     ui_share_window (app);

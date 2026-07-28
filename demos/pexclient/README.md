@@ -22,6 +22,9 @@ What it does:
   disconnect per participant), broadcast + direct chat with unread badge,
   live captions, and host conference controls (lock, guest mute policy,
   layout, dial-out, disconnect-all).
+* **Virtual reception & DTMF** — extension entry when Infinity routes you via
+  an IVR, plus a keypad for sending DTMF into gateway calls.
+* **Incoming-call alerting** — ring tone, Dock bounce and window raise.
 * **SSO** — IdP sign-in for both conference joins and device registration,
   with a provider chooser. Requires the `.app` bundle — see
   [Single sign-on](#single-sign-on-sso).
@@ -150,5 +153,4 @@ assets/          Pulse backdrop image + the script that generates it.
 make-bundle.sh   Wraps the built binary into pexclient.app (needed for SSO).
 ```
 
-Known gaps: DTMF keypad and virtual-reception (IVR) extension entry,
-breakout rooms.
+Known gaps: breakout rooms; media statistics are not surfaced in the UI.

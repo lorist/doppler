@@ -24,9 +24,12 @@ target_link_libraries(pexclient PRIVATE
 if(APPLE)
     find_library(COREGRAPHICS_LIBRARY CoreGraphics REQUIRED)
     find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+    # AudioToolbox: incoming-call ring tone (system sound).
+    find_library(AUDIOTOOLBOX_LIBRARY AudioToolbox REQUIRED)
     target_link_libraries(pexclient PRIVATE
         ${COREGRAPHICS_LIBRARY}
-        ${COREFOUNDATION_LIBRARY})
+        ${COREFOUNDATION_LIBRARY}
+        ${AUDIOTOOLBOX_LIBRARY})
 endif()
 
 pulse_demo_rpath(pexclient)
