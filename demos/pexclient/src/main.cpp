@@ -108,6 +108,15 @@ struct Config
   bool reg_auto = false;
   bool reg_sso = false; // authenticate registration via SSO instead of password
   float ui_scale = 1.2f;  // 1.0 = the design handoff's literal type scale
+
+  // Video pipeline. bg_mode: 0 = off, 1 = blur, 2 = replace with bg_image.
+  // content_mode: 0 = dual stream (content and camera as separate streams),
+  // 1 = composition (camera composited into the content stream as a PiP).
+  int bg_mode = 0;
+  std::string bg_image;
+  int content_mode = 0;
+  float pip_size = 0.25f;  // PiP width as a fraction of the frame
+  int pip_corner = 3;      // 0=TL 1=TR 2=BL 3=BR
   char default_server[256] = ""; // used for bare aliases when not registered
 
   std::vector<Contact> favorites;
@@ -188,6 +197,12 @@ struct App
   std::vector<ShareSource> share_sources;
   bool presenting = false;
   PulseVideoMixInputID share_input = PULSE_VIDEO_MIX_INPUT_ID_NONE;
+  App::ShareSource share_src;      // remembered so the mix can be rebuilt
+  // Compositor inputs shared between the MAIN and PRESENTATION mixes.
+  PulseVideoMixInputID camera_input = PULSE_VIDEO_MIX_INPUT_ID_NONE;
+  PulseVideoMixInputID bg_input = PULSE_VIDEO_MIX_INPUT_ID_NONE;
+  PulseDevice * camera_device = nullptr; // owned copy for the mix input
+  bool main_mix_active = false;
   std::atomic<bool> remote_presenting{false}; // far end is presenting to us
   GLVideoCtx preso_ctx;
 
@@ -341,6 +356,16 @@ load_config (Config & cfg)
       cfg.dev_mic = value;
     else if (key == "dev_speaker")
       cfg.dev_speaker = value;
+    else if (key == "bg_mode")
+      cfg.bg_mode = atoi (value.c_str ());
+    else if (key == "bg_image")
+      cfg.bg_image = value;
+    else if (key == "content_mode")
+      cfg.content_mode = atoi (value.c_str ());
+    else if (key == "pip_size")
+      cfg.pip_size = (float) atof (value.c_str ());
+    else if (key == "pip_corner")
+      cfg.pip_corner = atoi (value.c_str ());
     else if (key == "favorite") {
       std::size_t bar = value.find ('|');
       if (bar != std::string::npos)
@@ -374,6 +399,11 @@ save_config (const Config & cfg)
   ofs << "dev_camera=" << cfg.dev_camera << "\n";
   ofs << "dev_mic=" << cfg.dev_mic << "\n";
   ofs << "dev_speaker=" << cfg.dev_speaker << "\n";
+  ofs << "bg_mode=" << cfg.bg_mode << "\n";
+  ofs << "bg_image=" << cfg.bg_image << "\n";
+  ofs << "content_mode=" << cfg.content_mode << "\n";
+  ofs << "pip_size=" << cfg.pip_size << "\n";
+  ofs << "pip_corner=" << cfg.pip_corner << "\n";
   for (const Contact & f : cfg.favorites)
     ofs << "favorite=" << f.name << "|" << f.address << "\n";
   for (const RecentCall & r : cfg.recents)
@@ -505,6 +535,7 @@ on_progress (const PulseOperationProgressInfo * info, void * user_context)
 }
 
 static void connect_default_devices (App & app);
+static void rebuild_video (App & app);
 
 // --- Incoming-call alerting -------------------------------------------------
 //
@@ -796,10 +827,10 @@ connect_default_devices (App & app)
   // attach below unconditional and idempotent.
   pulse_device_session_disconnect_main_video (app.pulse, PULSE_MEDIA_CONTENT_MAIN, PULSE_MEDIA_INPUT);
   pulse_device_session_disconnect_main_audio (app.pulse);
-  apply_device (app, app.cameras, app.cfg.dev_camera, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT);
   apply_device (app, app.mics, app.cfg.dev_mic, PULSE_MEDIA_AUDIO, PULSE_MEDIA_INPUT);
   apply_device (app, app.speakers, app.cfg.dev_speaker, PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT);
   app.devices_connected = true;
+  rebuild_video (app); // attaches the camera, plainly or through the compositor
 }
 
 static void
@@ -896,6 +927,213 @@ enumerate_share_sources ()
 
 #endif
 
+// ----------------------------------------------------------------------------
+//  Video pipeline
+// ----------------------------------------------------------------------------
+//
+//  Two outgoing video streams, each either a plain source or a composition:
+//
+//    MAIN          camera. Plain device session when no background effect is
+//                  wanted (cheapest); otherwise a mix carrying the camera with
+//                  BLUR, or SEGMENTATION over a background image.
+//    PRESENTATION  shared display/window. Alone in "dual stream" mode, or with
+//                  the camera composited in as a PiP in "composition" mode —
+//                  for far ends that show only one stream.
+//
+//  Everything is rebuilt from config by rebuild_video(), so a settings change
+//  is just "update the value, rebuild". The mix inputs (camera, background,
+//  desktop) are acquired once and referenced by both configurations.
+// ----------------------------------------------------------------------------
+
+// Resolve the configured camera to an owned PulseDevice, needed by
+// pulse_video_mix_input_from_device().
+static PulseDevice *
+copy_selected_camera (App & app)
+{
+  PulseDeviceIterator * it = nullptr;
+  if (pulse_device_iterator_new (app.pulse, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT, &it) != PULSE_SUCCESS || !it)
+    return nullptr;
+
+  PulseDevice * chosen = nullptr;
+  for (const PulseDevice * d = pulse_device_iterator_first (it); d != nullptr; d = pulse_device_iterator_next (it)) {
+    const char * name = pulse_device_get_name (d);
+    bool match = app.cfg.dev_camera.empty () ? pulse_device_is_system_default (d)
+                                             : (name && app.cfg.dev_camera == name);
+    if (match) {
+      chosen = pulse_device_copy (d);
+      break;
+    }
+  }
+  if (!chosen) { // configured camera absent — fall back to the first one
+    const PulseDevice * first = pulse_device_iterator_first (it);
+    if (first)
+      chosen = pulse_device_copy (first);
+  }
+  pulse_device_iterator_free (it);
+  return chosen;
+}
+
+static void
+release_mix_inputs (App & app)
+{
+  if (app.camera_input != PULSE_VIDEO_MIX_INPUT_ID_NONE) {
+    pulse_video_mix_input_release (app.pulse, app.camera_input);
+    app.camera_input = PULSE_VIDEO_MIX_INPUT_ID_NONE;
+  }
+  if (app.bg_input != PULSE_VIDEO_MIX_INPUT_ID_NONE) {
+    pulse_video_mix_input_release (app.pulse, app.bg_input);
+    app.bg_input = PULSE_VIDEO_MIX_INPUT_ID_NONE;
+  }
+  if (app.camera_device) {
+    pulse_device_free (app.camera_device);
+    app.camera_device = nullptr;
+  }
+}
+
+// Acquire the camera as a mix input (idempotent).
+static bool
+ensure_camera_input (App & app)
+{
+  if (app.camera_input != PULSE_VIDEO_MIX_INPUT_ID_NONE)
+    return true;
+  if (!app.camera_device)
+    app.camera_device = copy_selected_camera (app);
+  if (!app.camera_device)
+    return false;
+  PulseError err = pulse_video_mix_input_from_device (app.pulse, app.camera_device, &app.camera_input);
+  if (err != PULSE_SUCCESS) {
+    std::fprintf (stderr, "[pexclient] camera mix input failed: %s\n", pulse_strerror (err));
+    app.camera_input = PULSE_VIDEO_MIX_INPUT_ID_NONE;
+    return false;
+  }
+  return true;
+}
+
+// Anchor for the PiP, from the configured corner.
+static void
+pip_anchor (int corner, double * x, double * y)
+{
+  *x = (corner == 0 || corner == 2) ? 0.0 : 1.0;
+  *y = (corner == 0 || corner == 1) ? 0.0 : 1.0;
+}
+
+static void
+rebuild_video (App & app)
+{
+  if (!app.devices_connected)
+    return; // nothing attached yet; connect_default_devices will call us
+
+  const bool want_bg = app.cfg.bg_mode != 0;
+  const bool want_pip = app.presenting && app.cfg.content_mode == 1;
+
+  // --- tear down whatever is currently attached -------------------------
+  if (app.main_mix_active) {
+    pulse_video_mix_disconnect (app.pulse, PULSE_MEDIA_CONTENT_MAIN);
+    app.main_mix_active = false;
+  }
+  pulse_device_session_disconnect_main_video (app.pulse, PULSE_MEDIA_CONTENT_MAIN, PULSE_MEDIA_INPUT);
+  if (app.presenting)
+    pulse_video_mix_disconnect (app.pulse, PULSE_MEDIA_CONTENT_PRESENTATION);
+  release_mix_inputs (app);
+
+  // --- MAIN --------------------------------------------------------------
+  if (!want_bg && !want_pip) {
+    // No compositing needed anywhere: plain camera device session.
+    apply_device (app, app.cameras, app.cfg.dev_camera, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT);
+  } else if (!ensure_camera_input (app)) {
+    set_status (app, "Camera unavailable for compositing — using plain camera.", true);
+    apply_device (app, app.cameras, app.cfg.dev_camera, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT);
+  } else if (want_bg) {
+    PulseVideoMixInput inputs[2];
+    size_t n = 0;
+
+    if (app.cfg.bg_mode == 2 && !app.cfg.bg_image.empty ()) {
+      // Background image sits behind; the camera is keyed over it.
+      if (pulse_video_mix_input_from_file (app.pulse, app.cfg.bg_image.c_str (), &app.bg_input) == PULSE_SUCCESS) {
+        inputs[n] = {};
+        inputs[n].input_id = app.bg_input;
+        inputs[n].layer = 0;
+        inputs[n].width_ratio = 1.0;
+        inputs[n].height_ratio = 1.0;
+        inputs[n].x_centrepoint = 0.5;
+        inputs[n].y_centrepoint = 0.5;
+        inputs[n].videoproc_mask = PULSE_VIDEO_PROCESS_TYPE_NONE;
+        n++;
+      } else {
+        set_status (app, "Background image could not be loaded.", true);
+      }
+    }
+
+    inputs[n] = {};
+    inputs[n].input_id = app.camera_input;
+    inputs[n].layer = (int) n; // above the background when there is one
+    inputs[n].width_ratio = 1.0;
+    inputs[n].height_ratio = 1.0;
+    inputs[n].x_centrepoint = 0.5;
+    inputs[n].y_centrepoint = 0.5;
+    // SEGMENTATION keys the person out so the image shows through; BLUR
+    // blurs whatever is behind them. The mask is a bitfield.
+    inputs[n].videoproc_mask = (app.bg_input != PULSE_VIDEO_MIX_INPUT_ID_NONE)
+                                 ? PULSE_VIDEO_PROCESS_TYPE_SEGMENTATION
+                                 : PULSE_VIDEO_PROCESS_TYPE_BLUR;
+    n++;
+
+    PulseVideoMixConfig cfg{n, inputs};
+    PulseError err = pulse_video_mix_connect (app.pulse, &cfg, PULSE_MEDIA_CONTENT_MAIN);
+    if (err != PULSE_SUCCESS) {
+      std::fprintf (stderr, "[pexclient] main mix failed: %s\n", pulse_strerror (err));
+      set_status (app, std::string ("background: ") + pulse_strerror (err), true);
+      release_mix_inputs (app);
+      apply_device (app, app.cameras, app.cfg.dev_camera, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT);
+    } else {
+      app.main_mix_active = true;
+    }
+  } else {
+    // PiP only: camera still goes out plainly on MAIN as well.
+    apply_device (app, app.cameras, app.cfg.dev_camera, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT);
+  }
+
+  // --- PRESENTATION ------------------------------------------------------
+  if (app.presenting && app.share_input != PULSE_VIDEO_MIX_INPUT_ID_NONE) {
+    PulseVideoMixInput inputs[2];
+    size_t n = 0;
+
+    inputs[n] = {};
+    inputs[n].input_id = app.share_input;
+    inputs[n].layer = 0;
+    inputs[n].width_ratio = 1.0;
+    inputs[n].height_ratio = 1.0;
+    inputs[n].x_centrepoint = 0.5;
+    inputs[n].y_centrepoint = 0.5;
+    inputs[n].videoproc_mask = PULSE_VIDEO_PROCESS_TYPE_NONE;
+    n++;
+
+    if (want_pip && ensure_camera_input (app)) {
+      double ax, ay;
+      pip_anchor (app.cfg.pip_corner, &ax, &ay);
+      inputs[n] = {};
+      inputs[n].input_id = app.camera_input;
+      inputs[n].layer = 1;
+      inputs[n].width_ratio = app.cfg.pip_size;
+      inputs[n].height_ratio = app.cfg.pip_size;
+      inputs[n].x_centrepoint = ax;
+      inputs[n].y_centrepoint = ay;
+      // Keying the PiP means the presenter floats over the content instead
+      // of sitting in a hard rectangle.
+      inputs[n].videoproc_mask =
+        app.cfg.bg_mode != 0 ? PULSE_VIDEO_PROCESS_TYPE_SEGMENTATION : PULSE_VIDEO_PROCESS_TYPE_NONE;
+      n++;
+    }
+
+    PulseVideoMixConfig cfg{n, inputs};
+    PulseError err = pulse_video_mix_connect (app.pulse, &cfg, PULSE_MEDIA_CONTENT_PRESENTATION);
+    if (err != PULSE_SUCCESS) {
+      std::fprintf (stderr, "[pexclient] presentation mix failed: %s\n", pulse_strerror (err));
+      set_status (app, std::string ("share: ") + pulse_strerror (err), true);
+    }
+  }
+}
+
 static void
 stop_share (App & app)
 {
@@ -908,6 +1146,7 @@ stop_share (App & app)
   }
   pulse_participant_control_release_floor (app.pulse, nullptr);
   app.presenting = false;
+  rebuild_video (app); // MAIN may have been carrying a PiP-shared camera input
 }
 
 // Share one display/window: acquire it as a mix input, run a single-input
@@ -927,26 +1166,11 @@ start_share (App & app, const App::ShareSource & src)
     return;
   }
 
-  PulseVideoMixInput input{};
-  input.input_id = app.share_input;
-  input.layer = 0;
-  input.width_ratio = 1.0;
-  input.height_ratio = 1.0;
-  input.x_centrepoint = 0.5;
-  input.y_centrepoint = 0.5;
-  input.videoproc_mask = PULSE_VIDEO_PROCESS_TYPE_NONE;
-
-  PulseVideoMixConfig config{1, &input};
-  err = pulse_video_mix_connect (app.pulse, &config, PULSE_MEDIA_CONTENT_PRESENTATION);
-  if (err != PULSE_SUCCESS) {
-    set_status (app, std::string ("share: ") + pulse_strerror (err), true);
-    pulse_video_mix_input_release (app.pulse, app.share_input);
-    app.share_input = PULSE_VIDEO_MIX_INPUT_ID_NONE;
-    return;
-  }
+  app.share_src = src;
+  app.presenting = true;
+  rebuild_video (app); // builds PRESENTATION (and re-does MAIN if it shares the camera)
 
   pulse_participant_control_take_floor (app.pulse, nullptr);
-  app.presenting = true;
   set_status (app, "Presenting " + src.name);
 }
 
@@ -1989,6 +2213,59 @@ ui_devices_window (App & app)
   combo ("Camera", app.cameras, app.cfg.dev_camera, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT);
   combo ("Microphone", app.mics, app.cfg.dev_mic, PULSE_MEDIA_AUDIO, PULSE_MEDIA_INPUT);
   combo ("Speaker", app.speakers, app.cfg.dev_speaker, PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT);
+
+  // --- Background --------------------------------------------------------
+  ImGui::Dummy (ImVec2 (0, 8));
+  ImGui::TextDisabled ("BACKGROUND");
+  {
+    static const char * modes = "None\0Blur\0Replace with image\0";
+    ImGui::SetNextItemWidth (-FLT_MIN);
+    if (ImGui::Combo ("##bgmode", &app.cfg.bg_mode, modes)) {
+      changed = true;
+      rebuild_video (app);
+    }
+    if (app.cfg.bg_mode == 2) {
+      static char path[1024] = "";
+      if (ImGui::IsWindowAppearing () || (path[0] == '\0' && !app.cfg.bg_image.empty ()))
+        snprintf (path, sizeof (path), "%s", app.cfg.bg_image.c_str ());
+      ImGui::SetNextItemWidth (-FLT_MIN);
+      if (ImGui::InputTextWithHint ("##bgimage", "path to a .png / .jpg", path, sizeof (path),
+                                    ImGuiInputTextFlags_EnterReturnsTrue)) {
+        app.cfg.bg_image = path;
+        changed = true;
+        rebuild_video (app);
+      }
+      ImGui::TextDisabled ("Press Enter to apply.");
+    }
+  }
+
+  // --- Content sending ---------------------------------------------------
+  ImGui::Dummy (ImVec2 (0, 8));
+  ImGui::TextDisabled ("SENDING CONTENT");
+  {
+    static const char * modes = "Dual stream (content + camera)\0Composition (camera in content)\0";
+    ImGui::SetNextItemWidth (-FLT_MIN);
+    if (ImGui::Combo ("##contentmode", &app.cfg.content_mode, modes)) {
+      changed = true;
+      rebuild_video (app);
+    }
+    if (app.cfg.content_mode == 1) {
+      static const char * corners = "Top left\0Top right\0Bottom left\0Bottom right\0";
+      ImGui::SetNextItemWidth (-FLT_MIN);
+      if (ImGui::Combo ("##pipcorner", &app.cfg.pip_corner, corners)) {
+        changed = true;
+        rebuild_video (app);
+      }
+      ImGui::SetNextItemWidth (-FLT_MIN);
+      if (ImGui::SliderFloat ("##pipsize", &app.cfg.pip_size, 0.12f, 0.45f, "PiP size %.2f"))
+        changed = true;
+      if (ImGui::IsItemDeactivatedAfterEdit ())
+        rebuild_video (app); // rebuild on release, not every frame of the drag
+    }
+    ImGui::TextDisabled ("%s", app.cfg.content_mode == 0
+                                 ? "Camera and content sent as separate streams."
+                                 : "Camera composited into the content stream, for far ends\nthat show only one stream.");
+  }
 
   if (changed)
     save_config (app.cfg);
@@ -3278,6 +3555,11 @@ main (int argc, char ** argv)
       // Release the capture devices so the camera light goes off between
       // calls; connect_default_devices() re-attaches them on the next dial
       // (or incoming accept).
+      if (app.main_mix_active) {
+        pulse_video_mix_disconnect (app.pulse, PULSE_MEDIA_CONTENT_MAIN);
+        app.main_mix_active = false;
+      }
+      release_mix_inputs (app);
       pulse_device_session_disconnect_main_video (app.pulse, PULSE_MEDIA_CONTENT_MAIN, PULSE_MEDIA_INPUT);
       pulse_device_session_disconnect_main_audio (app.pulse);
       app.devices_connected = false;

@@ -17,7 +17,10 @@ What it does:
   before and during calls, floating/hideable self-view. The camera is
   released (light off) whenever you're not in a call.
 * **Content** — share a display or window (with floor control); incoming
-  presentations take the big pane automatically.
+  presentations take the big pane automatically. Send content and camera as
+  **dual streams**, or as a **composition** with the camera as a keyed PiP
+  for far ends that render only one stream.
+* **Background** — blur, or replace with an image (Pulse segmentation).
 * **In-conference** — roster drawer with host controls (mute / camera /
   disconnect per participant), broadcast + direct chat with unread badge,
   live captions, and host conference controls (lock, guest mute policy,
@@ -98,6 +101,11 @@ default_server=conf.example.com    # used for bare aliases when NOT registered
 dev_camera=                        # preferred device names; blank = system default
 dev_mic=
 dev_speaker=
+bg_mode=0                          # 0 none, 1 blur, 2 replace with bg_image
+bg_image=                          # path to a .png/.jpg for bg_mode=2
+content_mode=0                     # 0 dual stream, 1 camera composited into content
+pip_size=0.25                      # PiP width as a fraction of the frame
+pip_corner=3                       # 0 TL, 1 TR, 2 BL, 3 BR
 favorite=Desk|desk@example.com     # one line per favourite
 recent=Desk|desk@example.com|10:09|00:08|0   # written by the app
 ```
