@@ -254,6 +254,11 @@ struct ActiveSource
     PulseVideoMixInputID mix_input  = PULSE_VIDEO_MIX_INPUT_ID_NONE;  // image / mp4
     PulseRtspSessionID   rtsp_session = 0;                            // rtsp (0 == none)
     bool rtmp_listening = false;
+    // The RGBA output session is opened at the *end* of start_source, so a
+    // source that fails to start never has one. Disconnecting a session that
+    // was never connected trips an assert inside Pulse and aborts the process,
+    // so the teardown has to know.
+    bool output_open = false;
 
     // Live conference status (written from a Pulse callback thread).
     std::atomic<int> conn_status{PULSE_CONNECTION_STATUS_DISCONNECTED};
@@ -794,18 +799,26 @@ static void start_source(ActiveSource & src)
 
         case SourceKind::Rtsp: {
             src.render_content = PULSE_MEDIA_CONTENT_SELFVIEW;
-            if (src.rtsp_url[0] == '\0') { err = PULSE_ERROR_INVALID_PARAMETER; break; }
+            if (src.rtsp_url[0] == '\0') {
+                err = PULSE_ERROR_INVALID_PARAMETER;
+                src.last_error = "enter an RTSP URL (rtsp://host/path)";
+                break;
+            }
             PulseRtspInputConfig cfg{};
             cfg.location   = src.rtsp_url;
             cfg.transport  = PULSE_RTSP_TRANSPORT_TCP;
             cfg.latency_ms = 200;
             PulseRtspSessionID session = 0;
             err = pulse_rtsp_session_connect_input(src.pulse, &cfg, &session);
-            if (err == PULSE_SUCCESS) {
-                src.rtsp_session = session;
-                err = pulse_rtsp_session_bind_to_content(src.pulse, session,
-                                                         PULSE_MEDIA_CONTENT_MAIN);
+            if (err != PULSE_SUCCESS) {
+                src.last_error = std::string("RTSP connect failed: ") + pulse_strerror(err) +
+                                 " (check the URL, and that the camera is reachable)";
+                break;
             }
+            src.rtsp_session = session;
+            err = pulse_rtsp_session_bind_to_content(src.pulse, session, PULSE_MEDIA_CONTENT_MAIN);
+            if (err != PULSE_SUCCESS)
+                src.last_error = std::string("RTSP bind failed: ") + pulse_strerror(err);
             break;
         }
 
@@ -905,7 +918,8 @@ static void start_source(ActiveSource & src)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 
         PulseDataSessionConfig * dcfg = make_video_output_config();
-        pulse_data_session_connect_output(src.pulse, dcfg, src.render_content);
+        if (pulse_data_session_connect_output(src.pulse, dcfg, src.render_content) == PULSE_SUCCESS)
+            src.output_open = true;
         pulse_data_session_config_free(dcfg);
     }
 
@@ -943,9 +957,11 @@ static void stop_source(ActiveSource & src)
 
     // Disconnect the data-session output (mirrors connect_output). Only opened
     // for video-capable sources.
-    if (source_has_video(src))
+    if (src.output_open) {
         pulse_data_session_disconnect(src.pulse, PULSE_MEDIA_VIDEO, PULSE_MEDIA_OUTPUT,
                                       src.render_content);
+        src.output_open = false;
+    }
 
     switch (src.kind) {
         case SourceKind::Camera:

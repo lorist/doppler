@@ -67,6 +67,18 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(imgui implot imgui_addons)
 
+# ImGui-Addons predates Dear ImGui 1.90's BeginChild() signature change, and
+# the asserts added with it abort the process as soon as the file picker
+# renders. Fix it after populate (not via PATCH_COMMAND — that belongs to the
+# update step, which FetchContent skips in several configurations). The script
+# is idempotent, so running it on every configure is harmless.
+execute_process(
+    COMMAND "${CMAKE_SOURCE_DIR}/cmake/fix-imgui-addons.sh" "${imgui_addons_SOURCE_DIR}"
+    RESULT_VARIABLE _addons_fix_result)
+if(NOT _addons_fix_result EQUAL 0)
+    message(FATAL_ERROR "Failed to patch ImGui-Addons for the Dear ImGui 1.90+ API")
+endif()
+
 # gl3w needs network access at configure time to download glcorearb.h /
 # khrplatform.h from registry.khronos.org. Sandboxes (and some CI) don't
 # have that, but the headers are shipped by the system's libgl-dev /

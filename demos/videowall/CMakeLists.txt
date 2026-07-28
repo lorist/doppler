@@ -15,11 +15,26 @@ add_executable(videowall
 # CMakeLists, so we compile its single .cpp into a small static lib that links
 # the shared `imgui` target for its headers.
 include(FetchContent)
+#
+# It also predates Dear ImGui 1.90's BeginChild() signature change, and the
+# asserts added with it abort the process as soon as the picker renders — so
+# fix them up on checkout. See fix-imgui-addons.sh.
 FetchContent_Declare(
     imgui_addons
     GIT_REPOSITORY https://github.com/gallickgunner/ImGui-Addons.git
     GIT_TAG        0b25588ba842b93537f82ae84f27a75f604b04ce)
 FetchContent_MakeAvailable(imgui_addons)
+
+# Apply the API fix after populate. Done here rather than via PATCH_COMMAND:
+# that runs as part of ExternalProject's update step, which FetchContent
+# skips in several configurations, so the fix silently did not happen. The
+# script is idempotent, so running it on every configure is harmless.
+execute_process(
+    COMMAND "${CMAKE_SOURCE_DIR}/cmake/fix-imgui-addons.sh" "${imgui_addons_SOURCE_DIR}"
+    RESULT_VARIABLE _addons_fix_result)
+if(NOT _addons_fix_result EQUAL 0)
+    message(FATAL_ERROR "Failed to patch ImGui-Addons for the Dear ImGui 1.90+ API")
+endif()
 
 add_library(videowall_imgui_addons STATIC
     ${imgui_addons_SOURCE_DIR}/FileBrowser/ImGuiFileBrowser.cpp)
