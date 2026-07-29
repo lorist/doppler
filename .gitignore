@@ -26,3 +26,8 @@ uavwall.conf
 
 # Demo footage — large binaries, and usually not ours to redistribute
 UAV_footage/
+
+# Recordings written by uavwall. The folder is tracked so a fresh checkout has
+# somewhere to write; the captures themselves never are.
+recordings/*
+!recordings/.gitkeep

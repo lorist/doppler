@@ -44,6 +44,13 @@
 #include <mach/mach.h>
 #endif
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <unistd.h>
+#include <cctype>
+#include <cerrno>
 
 #include <algorithm>
 #include <atomic>
@@ -52,6 +59,8 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <sstream>
@@ -102,6 +111,10 @@ struct Config
   int rtsp_latency_ms = 200;
   bool autoconnect = false;              // connect every feed at startup
 
+  // Where recordings are written. Relative paths resolve against the working
+  // directory, same as uavwall.conf itself.
+  std::string record_dir = "recordings";
+
   // Interface
   float ui_scale = 1.2f;
   bool show_stats = true;
@@ -119,6 +132,21 @@ struct Config
 // ----------------------------------------------------------------------------
 //  Model
 // ----------------------------------------------------------------------------
+
+struct Recorder
+{
+  pid_t pid = -1;
+  int in_fd = -1; // ffmpeg's stdin: "q" for a feed, raw frames for the canvas
+  std::string path;
+  double started_at = 0.0;
+  bool stopping = false;
+  double kill_after = 0.0; // last resort if it will not exit
+  uint64_t bytes = 0;
+  uint64_t dropped = 0; // canvas only: frames the encoder could not keep up with
+
+  bool active () const { return pid > 0 && !stopping; }
+  bool busy () const { return pid > 0; }
+};
 
 struct RgbaImage
 {
@@ -142,6 +170,7 @@ struct Feed
   RgbaImage frame; // CPU copy for the compositor
   double last_frame_at = 0.0;
   double connected_at = 0.0;   // for the inspector's UPTIME
+  Recorder rec;                // per-feed capture, stream-copied
 
   // Measured locally: Pulse exposes no RTSP-level counters, so decoded-frame
   // rate and payload throughput are what we can honestly report per feed.
@@ -181,6 +210,25 @@ struct App
   int last_push_w = 0, last_push_h = 0;
 
   RgbaImage canvas; // composited each frame
+  Recorder canvas_rec; // capture of the composed programme
+  // A 1920x1080 RGBA frame is 8.3 MB and a pipe buffer is 64 KB, so writing
+  // whole frames means blocking — which the UI thread must never do. A writer
+  // thread takes one frame at a time and blocks on its behalf; frames offered
+  // while it is still busy are dropped whole, never torn.
+  // A few frames deep rather than one: the encoder's pace is not perfectly
+  // even, and a single slot turned every small stall into a dropped frame —
+  // which shortens the recording and plays it back fast.
+  std::thread canvas_writer;
+  std::mutex canvas_wm;
+  std::condition_variable canvas_wcv;
+  std::deque<std::vector<unsigned char>> canvas_wq;   // frames awaiting write
+  std::vector<std::vector<unsigned char>> canvas_wfree; // recycled buffers
+  bool canvas_wquit = false;
+  // The recording's own clock. The render loop cannot always sustain send_fps
+  // composites a second, and a short file plays back fast — so the cadence is
+  // held here and the last frame repeated when we are late. Wall-clock
+  // duration then matches what the operator watched.
+  double rec_next_frame = 0.0;
 
   theme::Fonts fonts;
   int drag_tile = -1;      // tile being moved
@@ -382,6 +430,8 @@ load_config (App & app)
     // so the choice silently reverted to main video on every restart.
     else if (k == "send_as")
       app.cfg.send_as_content = (v == "content");
+    else if (k == "record_dir")
+      app.cfg.record_dir = v;
     else if (k == "preset_a")
       app.cfg.preset_a = v;
     else if (k == "preset_b")
@@ -455,6 +505,8 @@ save_config (App & app)
   ofs << "# Interface. ui_scale applies on next start.\n";
   ofs << "ui_scale=" << app.cfg.ui_scale << "\n";
   ofs << "show_stats=" << (app.cfg.show_stats ? "true" : "false") << "\n\n";
+  ofs << "# Where recordings are written, relative to the working directory.\n";
+  ofs << "record_dir=" << app.cfg.record_dir << "\n\n";
   ofs << "# Saved layouts, recalled from the A/B/C slots. feed,x,y,w,h per tile.\n";
   ofs << "preset_a=" << app.cfg.preset_a << "\n";
   ofs << "preset_b=" << app.cfg.preset_b << "\n";
@@ -709,6 +761,416 @@ push_canvas (App & app)
   pulse_data_session_push_frame (app.conf, &frame, app.input_content);
   if (upd)
     pulse_data_session_config_free (upd);
+}
+
+// ----------------------------------------------------------------------------
+//  Recording
+//
+//  Pulse has no recording API — pulse_file_session.h is playback only — so each
+//  recording is an ffmpeg subprocess. Two shapes:
+//
+//    * a feed  — ffmpeg pulls the RTSP stream itself and stream-copies it, so
+//      nothing is decoded or re-encoded (measured at 0.3% CPU) and the file
+//      holds the original picture rather than the downscaled canvas tile.
+//    * the canvas — no source stream to copy, so composited RGBA frames are
+//      piped to ffmpeg's stdin and hardware-encoded.
+//
+//  Stopping is the fiddly part, and all of this was measured rather than
+//  assumed: SIGINT hangs on an RTSP input, and SIGKILL leaves a file with no
+//  moov atom that nothing will play. Writing "q" to stdin exits cleanly, and
+//  for the canvas — whose stdin carries frames — closing the pipe does the same
+//  job via EOF.
+// ----------------------------------------------------------------------------
+
+// Resolved once. Empty means the record controls are unavailable rather than
+// silently broken — ffmpeg is a runtime dependency only for this feature.
+static std::string g_ffmpeg;
+
+static void
+find_ffmpeg ()
+{
+  static const char * fixed[] = {"/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"};
+  for (const char * p : fixed)
+    if (access (p, X_OK) == 0) {
+      g_ffmpeg = p;
+      return;
+    }
+  const char * path = getenv ("PATH");
+  if (!path)
+    return;
+  std::string s (path), dir;
+  std::istringstream iss (s);
+  while (std::getline (iss, dir, ':')) {
+    if (dir.empty ())
+      continue;
+    std::string cand = dir + "/ffmpeg";
+    if (access (cand.c_str (), X_OK) == 0) {
+      g_ffmpeg = cand;
+      return;
+    }
+  }
+}
+
+// "HAWKEYE 21" -> "HAWKEYE-21", so the filename survives a shell and a USB stick.
+static std::string
+slug (const std::string & in)
+{
+  std::string out;
+  for (char c : in) {
+    if (isalnum ((unsigned char) c))
+      out += (char) toupper ((unsigned char) c);
+    else if (!out.empty () && out.back () != '-')
+      out += '-';
+  }
+  while (!out.empty () && out.back () == '-')
+    out.pop_back ();
+  return out.empty () ? "FEED" : out;
+}
+
+static std::string
+utc_stamp ()
+{
+  std::time_t now = std::time (nullptr);
+  std::tm g{};
+#if defined(_WIN32)
+  gmtime_s (&g, &now);
+#else
+  gmtime_r (&now, &g);
+#endif
+  char buf[32];
+  snprintf (buf, sizeof (buf), "%04d%02d%02dT%02d%02d%02dZ", g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour,
+            g.tm_min, g.tm_sec);
+  return buf;
+}
+
+// mkdir -p, so a configured folder that does not exist yet is not an error the
+// operator has to go and fix mid-demo.
+static bool
+ensure_dir (const std::string & path)
+{
+  if (path.empty ())
+    return false;
+  std::string acc;
+  size_t i = 0;
+  if (path[0] == '/') {
+    acc = "/";
+    i = 1;
+  }
+  while (i <= path.size ()) {
+    size_t slash = path.find ('/', i);
+    if (slash == std::string::npos)
+      slash = path.size ();
+    acc += path.substr (i, slash - i);
+    if (!acc.empty () && mkdir (acc.c_str (), 0755) != 0 && errno != EEXIST)
+      return false;
+    acc += "/";
+    i = slash + 1;
+  }
+  struct stat st{};
+  return stat (path.c_str (), &st) == 0 && S_ISDIR (st.st_mode);
+}
+
+// Fork/exec with a pipe on stdin. ffmpeg's own output goes to a log beside the
+// recording so a failure can be diagnosed after the fact.
+static bool
+spawn_recorder (Recorder & r, const std::vector<std::string> & args, bool nonblocking_stdin)
+{
+  int fds[2];
+  if (pipe (fds) != 0)
+    return false;
+
+  std::vector<char *> argv;
+  argv.reserve (args.size () + 1);
+  for (const std::string & a : args)
+    argv.push_back (const_cast<char *> (a.c_str ()));
+  argv.push_back (nullptr);
+
+  pid_t pid = fork ();
+  if (pid < 0) {
+    close (fds[0]);
+    close (fds[1]);
+    return false;
+  }
+  if (pid == 0) {
+    dup2 (fds[0], STDIN_FILENO);
+    close (fds[0]);
+    close (fds[1]);
+    int log = open ((r.path + ".log").c_str (), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log >= 0) {
+      dup2 (log, STDOUT_FILENO);
+      dup2 (log, STDERR_FILENO);
+      close (log);
+    }
+    execv (argv[0], argv.data ());
+    _exit (127);
+  }
+
+  close (fds[0]);
+  if (nonblocking_stdin) {
+    // The UI thread must never block on a stalled encoder; a full pipe drops
+    // the frame instead.
+    int fl = fcntl (fds[1], F_GETFL, 0);
+    fcntl (fds[1], F_SETFL, fl | O_NONBLOCK);
+  }
+  r.pid = pid;
+  r.in_fd = fds[1];
+  r.started_at = ImGui::GetTime ();
+  r.stopping = false;
+  r.bytes = 0;
+  return true;
+}
+
+static void
+stop_recorder (Recorder & r, bool frames_on_stdin)
+{
+  if (r.pid <= 0 || r.stopping)
+    return;
+  if (r.in_fd >= 0) {
+    // A feed recorder is told to quit; the canvas recorder simply gets EOF,
+    // which finalises the file the same way.
+    if (!frames_on_stdin) {
+      ssize_t n = write (r.in_fd, "q\n", 2);
+      (void) n;
+    }
+    close (r.in_fd);
+    r.in_fd = -1;
+  }
+  r.stopping = true;
+  r.kill_after = ImGui::GetTime () + 8.0;
+}
+
+// Called every frame. Reaping is deferred rather than waited on, so stopping a
+// recording never stalls the UI.
+static void
+reap_recorder (Recorder & r)
+{
+  if (r.pid <= 0)
+    return;
+  int st = 0;
+  pid_t got = waitpid (r.pid, &st, WNOHANG);
+  if (got == r.pid || got < 0) {
+    r.pid = -1;
+    r.stopping = false;
+    if (r.in_fd >= 0) {
+      close (r.in_fd);
+      r.in_fd = -1;
+    }
+    return;
+  }
+  if (r.stopping && ImGui::GetTime () > r.kill_after) {
+    // It will not go quietly; the file is likely unplayable, but a wedged
+    // child is worse.
+    kill (r.pid, SIGKILL);
+    r.kill_after = ImGui::GetTime () + 5.0;
+  }
+}
+
+
+// Record one feed by stream-copying it: ffmpeg opens the RTSP URL itself, so
+// this is independent of whether the feed is connected in the wall, and the
+// file holds the source picture rather than the canvas tile.
+static bool
+start_feed_recording (App & app, Feed & f)
+{
+  if (g_ffmpeg.empty () || f.rec.busy ())
+    return false;
+  if (!ensure_dir (app.cfg.record_dir)) {
+    set_status (app, "Cannot create " + app.cfg.record_dir);
+    return false;
+  }
+  f.rec.path = app.cfg.record_dir + "/" + slug (f.name) + "_" + utc_stamp () + ".mp4";
+
+  std::vector<std::string> args = {g_ffmpeg,
+                                   "-hide_banner",
+                                   "-loglevel",
+                                   "error",
+                                   "-rtsp_transport",
+                                   app.cfg.rtsp_tcp ? "tcp" : "udp",
+                                   "-i",
+                                   f.url,
+                                   "-c",
+                                   "copy",
+                                   "-movflags",
+                                   "+faststart",
+                                   "-y",
+                                   f.rec.path};
+  if (!spawn_recorder (f.rec, args, false)) {
+    set_status (app, "Could not start recorder for " + f.name);
+    return false;
+  }
+  set_status (app, "Recording " + f.name + " → " + f.rec.path);
+  return true;
+}
+
+// Record the composed canvas. There is no source stream to copy, so frames go
+// down a pipe and are encoded — hardware-encoded on macOS, which keeps this
+// far cheaper than the compositing that produced them.
+static bool
+start_canvas_recording (App & app)
+{
+  if (g_ffmpeg.empty () || app.canvas_rec.busy ())
+    return false;
+  if (!ensure_dir (app.cfg.record_dir)) {
+    set_status (app, "Cannot create " + app.cfg.record_dir);
+    return false;
+  }
+  app.canvas_rec.path = app.cfg.record_dir + "/CANVAS_" + utc_stamp () + ".mp4";
+
+  char size[32], rate[16];
+  snprintf (size, sizeof (size), "%dx%d", app.cfg.canvas_w, app.cfg.canvas_h);
+  snprintf (rate, sizeof (rate), "%d", std::max (1, app.cfg.send_fps));
+
+  std::vector<std::string> args = {g_ffmpeg,
+                                   "-hide_banner",
+                                   "-loglevel",
+                                   "error",
+                                   "-f",
+                                   "rawvideo",
+                                   "-pixel_format",
+                                   "rgba",
+                                   "-video_size",
+                                   size,
+                                   "-framerate",
+                                   rate,
+                                   "-i",
+                                   "-",
+#if defined(__APPLE__)
+                                   "-c:v",
+                                   "h264_videotoolbox",
+                                   "-b:v",
+                                   "6M",
+#else
+                                   "-c:v",
+                                   "libx264",
+                                   "-preset",
+                                   "veryfast",
+                                   "-crf",
+                                   "23",
+#endif
+                                   "-pix_fmt",
+                                   "yuv420p",
+                                   "-movflags",
+                                   "+faststart",
+                                   "-y",
+                                   app.canvas_rec.path};
+  if (!spawn_recorder (app.canvas_rec, args, false)) {
+    set_status (app, "Could not start the canvas recorder");
+    return false;
+  }
+
+  // A previous writer may still be joinable — the encoder can exit on its own
+  // (EPIPE, a bad path), and assigning over a joinable std::thread terminates.
+  if (app.canvas_writer.joinable ()) {
+    {
+      std::lock_guard<std::mutex> lock (app.canvas_wm);
+      app.canvas_wquit = true;
+      app.canvas_wq.clear ();
+    }
+    app.canvas_wcv.notify_all ();
+    app.canvas_writer.join ();
+  }
+
+  app.canvas_wquit = false;
+  app.canvas_rec.dropped = 0;
+  app.canvas_wq.clear ();
+  app.canvas_wfree.clear ();
+  app.rec_next_frame = 0.0;
+  app.canvas_writer = std::thread ([&app] () {
+    for (;;) {
+      std::vector<unsigned char> frame;
+      {
+        std::unique_lock<std::mutex> lock (app.canvas_wm);
+        app.canvas_wcv.wait (lock, [&app] { return !app.canvas_wq.empty () || app.canvas_wquit; });
+        // Drain what is queued before quitting, so a stop does not truncate
+        // frames the operator has already seen composed.
+        if (app.canvas_wq.empty ())
+          return;
+        frame.swap (app.canvas_wq.front ());
+        app.canvas_wq.pop_front ();
+      }
+      const unsigned char * pp = frame.data ();
+      size_t left = frame.size ();
+      while (left > 0) {
+        ssize_t n = write (app.canvas_rec.in_fd, pp, left);
+        if (n > 0) {
+          pp += n;
+          left -= (size_t) n;
+          continue;
+        }
+        if (n < 0 && errno == EINTR)
+          continue;
+        return; // EPIPE: the encoder is gone
+      }
+      app.canvas_rec.bytes += frame.size ();
+      {
+        std::lock_guard<std::mutex> lock (app.canvas_wm);
+        if (app.canvas_wfree.size () < 4)
+          app.canvas_wfree.push_back (std::move (frame)); // keep the allocation
+      }
+    }
+  });
+
+  set_status (app, "Recording the canvas → " + app.canvas_rec.path);
+  return true;
+}
+
+// Join the writer before closing the pipe, so the last frame is whole and the
+// EOF that finalises the file arrives after it.
+static void
+stop_canvas_recording (App & app)
+{
+  if (!app.canvas_rec.busy ())
+    return;
+  {
+    std::lock_guard<std::mutex> lock (app.canvas_wm);
+    app.canvas_wquit = true;
+  }
+  app.canvas_wcv.notify_all ();
+  if (app.canvas_writer.joinable ())
+    app.canvas_writer.join ();
+  stop_recorder (app.canvas_rec, true);
+}
+
+// One composited frame to the encoder. Partial writes are normal on a pipe, so
+// this loops, but never blocks: if the encoder is behind, the frame is dropped
+// rather than stalling the UI thread.
+static void
+write_canvas_frame (App & app)
+{
+  Recorder & r = app.canvas_rec;
+  if (!r.active () || r.in_fd < 0 || app.canvas.px.empty ())
+    return;
+  // A resolution change mid-recording would corrupt the stream: ffmpeg was told
+  // the frame size up front. Stop instead of writing mismatched frames.
+  if (app.canvas.w != app.cfg.canvas_w || app.canvas.h != app.cfg.canvas_h)
+    return;
+
+  std::lock_guard<std::mutex> lock (app.canvas_wm);
+  if (app.canvas_wq.size () >= 3) {
+    // Genuinely behind. Drop this frame whole — a partial write would
+    // desynchronise the raw stream and corrupt everything after it.
+    r.dropped++;
+    return;
+  }
+  std::vector<unsigned char> buf;
+  if (!app.canvas_wfree.empty ()) {
+    buf = std::move (app.canvas_wfree.back ());
+    app.canvas_wfree.pop_back ();
+  }
+  buf.assign (app.canvas.px.begin (), app.canvas.px.end ());
+  app.canvas_wq.push_back (std::move (buf));
+  app.canvas_wcv.notify_one ();
+}
+
+// Any recording at all — drives the footer cell and the composite gate.
+static int
+recording_count (const App & app)
+{
+  int n = app.canvas_rec.active () ? 1 : 0;
+  for (const Feed & f : app.feeds)
+    if (f.rec.active ())
+      n++;
+  return n;
 }
 
 // ----------------------------------------------------------------------------
@@ -1440,6 +1902,36 @@ label_w (App & app, const char * text, float size = 10.5f)
   return app.fonts.label->CalcTextSizeA (theme::fs (size), FLT_MAX, 0, text).x;
 }
 
+// The record control: a ring that fills when armed. The design has no icon set,
+// and a circle is the one shape that reads as "record" without one.
+static bool
+record_dot (App & app, const char * id, bool on, ImVec2 at, float d, bool enabled)
+{
+  (void) app;
+  ImGui::PushID (id);
+  ImGui::SetCursorScreenPos (at);
+  ImGui::InvisibleButton ("##rec", ImVec2 (du (d), du (d)));
+  const bool hovered = enabled && ImGui::IsItemHovered ();
+  const bool clicked = hovered && ImGui::IsMouseReleased (ImGuiMouseButton_Left);
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 c (at.x + du (d) / 2, at.y + du (d) / 2);
+  const float r = du (d) / 2;
+  const float dim = enabled ? 1.0f : 0.35f;
+
+  if (on) {
+    // Slow pulse: recording is a state worth noticing, but a blink would be
+    // noise on a wall an operator watches for an hour.
+    float t = 0.75f + 0.25f * (float) sin (ImGui::GetTime () * 3.0);
+    dl->AddCircleFilled (c, r, theme::HexU32 (theme::StatusError, t));
+  } else {
+    dl->AddCircle (c, r - 0.5f, theme::WhiteU32 ((hovered ? 0.55f : 0.30f) * dim), 0, 1.2f);
+  }
+  if (hovered)
+    ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+  ImGui::PopID ();
+  return clicked;
+}
+
 // A 22x12 pill switch — the per-feed connect toggle, in the rail and in
 // Settings. Returns true when pressed.
 static bool
@@ -1688,7 +2180,7 @@ ui_feed_rail (App & app, float w, float h)
                      scrolls ? ImGuiWindowFlags_None : ImGuiWindowFlags_NoScrollbar);
   dl = ImGui::GetWindowDrawList ();
 
-  int toggle_feed = -1;
+  int toggle_feed = -1, rec_feed = -1;
   for (int i = 0; i < n; i++) {
     Feed & f = app.feeds[(size_t) i];
     ImGui::PushID (i);
@@ -1784,6 +2276,12 @@ ui_feed_rail (App & app, float w, float h)
 
     if (toggle_switch (app, "sw", f.connected, ImVec2 (t1.x - du (22.0f), my + (meta_h - du (12.0f)) / 2)))
       toggle_feed = i;
+    // Recording is independent of the wall: ffmpeg opens the URL itself, so a
+    // feed can be captured whether or not it is connected here or on canvas.
+    if (record_dot (app, "rec", f.rec.active (), ImVec2 (t1.x - du (22.0f) - du (11.0f) - du (6.0f),
+                                                        my + (meta_h - du (11.0f)) / 2),
+                    11.0f, !g_ffmpeg.empty ()))
+      rec_feed = i;
 
     // ---- gestures ---------------------------------------------------------
     if (hovered) {
@@ -1819,6 +2317,14 @@ ui_feed_rail (App & app, float w, float h)
   }
   ImGui::EndChild ();
   ImGui::PopStyleColor ();
+
+  if (rec_feed >= 0) {
+    Feed & f = app.feeds[(size_t) rec_feed];
+    if (f.rec.busy ())
+      stop_recorder (f.rec, false);
+    else
+      start_feed_recording (app, f);
+  }
 
   // Deferred: start_feed/stop_feed mutate the feed list's contents, so do it
   // after the loop rather than under the iteration.
@@ -2000,9 +2506,10 @@ ui_settings (App & app)
   dl->AddRectFilled (ImVec2 (win.x + nav_w, win.y + title_h), ImVec2 (win.x + nav_w + 1, win.y + win_h),
                      theme::WhiteU32 (0.07f));
   {
-    static const char * tabs[] = {"Conference", "Registration", "Canvas & sending", "Feeds", "Interface"};
+    static const char * tabs[] = {"Conference", "Registration", "Canvas & sending",
+                                  "Feeds",      "Recording",    "Interface"};
     float y = win.y + title_h + du (8.0f);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
       ImVec2 r0 (win.x + du (12.0f), y), r1 (win.x + nav_w - du (12.0f), y + du (27.0f));
       ImGui::PushID (4000 + i);
       ImGui::SetCursorScreenPos (r0);
@@ -2354,6 +2861,77 @@ ui_settings (App & app)
         nf.url = "rtsp://";
         app.feeds.push_back (std::move (nf));
       }
+    }
+    break;
+  }
+
+  case 4: { // ---- Recording ---------------------------------------------
+    heading ("RECORDING", "Captured with ffmpeg, alongside the wall.");
+
+    static char rdir[512];
+    if (ImGui::IsWindowAppearing ())
+      snprintf (rdir, sizeof (rdir), "%s", app.cfg.record_dir.c_str ());
+    row ("Folder");
+    if (panel_field (app, "##rdir", rdir, sizeof (rdir), panel_w - du (125.0f), true))
+      app.cfg.record_dir = rdir;
+    next_row ();
+    {
+      ImVec2 at = ImGui::GetCursorScreenPos ();
+      dl->AddText (app.fonts.body, theme::fs (11.0f), ImVec2 (at.x + du (125.0f), at.y), theme::WhiteU32 (0.40f),
+                   "Relative to the working directory. Created if missing.");
+      seek (at.y + du (22.0f));
+    }
+    gap (6.0f);
+
+    // Whether the feature works at all comes down to one binary being present,
+    // so say which one was found rather than failing silently at the controls.
+    {
+      ImVec2 at = ImGui::GetCursorScreenPos ();
+      const bool ok = !g_ffmpeg.empty ();
+      dl->AddCircleFilled (ImVec2 (at.x + du (3.0f), at.y + theme::fs (10.5f) / 2), du (3.0f),
+                           ok ? theme::HexU32 (theme::StatusOnline) : theme::HexU32 (theme::StatusError));
+      draw_mono (app, dl, ImVec2 (at.x + du (12.0f), at.y), ok ? g_ffmpeg.c_str () : "ffmpeg not found",
+                 ok ? theme::WhiteU32 (0.60f) : theme::HexU32 (theme::StatusError, 0.90f), 9.5f);
+      if (!ok)
+        dl->AddText (app.fonts.body, theme::fs (11.0f), ImVec2 (at.x, at.y + du (16.0f)), theme::WhiteU32 (0.40f),
+                     "Install it (brew install ffmpeg) to enable the record controls.");
+      seek (at.y + du (ok ? 22.0f : 38.0f));
+    }
+    gap (8.0f);
+
+    {
+      ImVec2 at = ImGui::GetCursorScreenPos ();
+      draw_label (app, dl, at, "IN PROGRESS", theme::WhiteU32 (theme::TextLabel), 9.0f);
+      float ry = at.y + du (18.0f);
+      int shown = 0;
+      auto line = [&] (const char * what, const Recorder & r) {
+        int d = (int) (ImGui::GetTime () - r.started_at);
+        char t[64];
+        snprintf (t, sizeof (t), "%d:%02d:%02d", d / 3600, (d / 60) % 60, d % 60);
+        dl->AddCircleFilled (ImVec2 (at.x + du (3.0f), ry + theme::fs (9.5f) / 2), du (3.0f),
+                             theme::HexU32 (theme::StatusError));
+        draw_mono (app, dl, ImVec2 (at.x + du (12.0f), ry), what, theme::WhiteU32 (0.75f), 9.5f);
+        draw_mono (app, dl, ImVec2 (at.x + du (140.0f), ry), t, theme::WhiteU32 (0.50f), 9.5f);
+        std::string base = r.path.substr (r.path.find_last_of ('/') + 1);
+        if (r.dropped > 0) {
+          char d[64];
+          snprintf (d, sizeof (d), "%llu dropped", (unsigned long long) r.dropped);
+          draw_mono (app, dl, ImVec2 (at.x + du (200.0f), ry), d, theme::HexU32 (theme::StatusWarn, 0.85f), 9.5f);
+        } else {
+          draw_mono (app, dl, ImVec2 (at.x + du (200.0f), ry), base.c_str (), theme::WhiteU32 (0.35f), 9.5f);
+        }
+        ry += du (14.0f);
+        shown++;
+      };
+      if (app.canvas_rec.active ())
+        line ("canvas", app.canvas_rec);
+      for (const Feed & f : app.feeds)
+        if (f.rec.active ())
+          line (f.name.c_str (), f.rec);
+      if (shown == 0)
+        dl->AddText (app.fonts.body, theme::fs (11.0f), ImVec2 (at.x, ry), theme::WhiteU32 (0.35f),
+                     "Nothing recording. Arm a source in the rail, or the canvas above it.");
+      seek (ry + du (18.0f));
     }
     break;
   }
@@ -2716,7 +3294,29 @@ ui_canvas (App & app, ImVec2 size)
     char spec[128];
     snprintf (spec, sizeof (spec), "%d×%d · %d fps · H.264 · %s", app.cfg.canvas_w, app.cfg.canvas_h,
               app.cfg.send_fps, app.cfg.send_as_content ? "CONTENT" : "MAIN");
-    draw_mono (app, dl, ImVec2 (at.x + cw - mono_w (app, spec), at.y - du (1.0f)), spec, theme::WhiteU32 (0.45f));
+    float rx = at.x + cw - mono_w (app, spec);
+    draw_mono (app, dl, ImVec2 (rx, at.y - du (1.0f)), spec, theme::WhiteU32 (0.45f));
+
+    // Capture the programme itself — what the VMR receives, composed.
+    const bool rec = app.canvas_rec.active ();
+    char rlabel[64];
+    if (rec) {
+      int d = (int) (ImGui::GetTime () - app.canvas_rec.started_at);
+      snprintf (rlabel, sizeof (rlabel), "REC %d:%02d", d / 60, d % 60);
+    } else {
+      snprintf (rlabel, sizeof (rlabel), "RECORD CANVAS");
+    }
+    rx -= du (14.0f) + mono_w (app, rlabel, 9.5f);
+    draw_mono (app, dl, ImVec2 (rx, at.y - du (1.0f)), rlabel,
+               rec ? theme::HexU32 (theme::StatusError, 0.95f) : theme::WhiteU32 (0.40f), 9.5f);
+    rx -= du (11.0f) + du (6.0f);
+    if (record_dot (app, "canvasrec", rec, ImVec2 (rx, at.y - du (2.0f)), 11.0f, !g_ffmpeg.empty ())) {
+      if (app.canvas_rec.busy ())
+        stop_canvas_recording (app);
+      else
+        start_canvas_recording (app);
+    }
+    ImGui::SetCursorScreenPos (at);
     ImGui::Dummy (ImVec2 (0, du (14.0f) + du (theme::GapTight)));
   }
 
@@ -3437,6 +4037,28 @@ ui_footer (App & app, float width)
     }
   }
 
+  // Recording is a state the operator must not lose track of, so it earns a
+  // cell of its own — but only while it is happening.
+  {
+    const int n = recording_count (app);
+    if (n > 0) {
+      char v[64];
+      const Recorder & lead = app.canvas_rec.active () ? app.canvas_rec : app.feeds[0].rec;
+      double since = lead.started_at;
+      for (const Feed & f : app.feeds)
+        if (f.rec.active () && (since <= 0 || f.rec.started_at < since))
+          since = f.rec.started_at;
+      if (app.canvas_rec.active () && app.canvas_rec.started_at < since)
+        since = app.canvas_rec.started_at;
+      int d = (int) (ImGui::GetTime () - since);
+      if (n == 1)
+        snprintf (v, sizeof (v), "%d:%02d:%02d", d / 3600, (d / 60) % 60, d % 60);
+      else
+        snprintf (v, sizeof (v), "%d × %d:%02d:%02d", n, d / 3600, (d / 60) % 60, d % 60);
+      cell ("REC", v, theme::HexU32 (theme::StatusError, 0.95f));
+    }
+  }
+
   // Right-aligned: today's status line, plus the call duration once up.
   std::string s = get_status (app);
   if (app.call_started && app.call_connected_at > 0) {
@@ -3532,6 +4154,9 @@ main (int argc, char ** argv)
     load_config (app);
   }
 
+  // Resolved once, for both normal and bench starts.
+  find_ffmpeg ();
+
   g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
   g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
 
@@ -3594,10 +4219,11 @@ main (int argc, char ** argv)
   while (!glfwWindowShouldClose (window)) {
     glfwPollEvents ();
 
+
     // Only feeds that are both placed on the canvas and being sent somewhere
     // need a CPU-side copy.
     {
-      bool sending = app.input_open || app.bench_force_composite;
+      bool sending = app.input_open || app.bench_force_composite || app.canvas_rec.active ();
       for (int i = 0; i < (int) app.feeds.size (); i++)
         pump_feed (app.feeds[i], sending && feed_is_placed (app, i));
     }
@@ -3606,17 +4232,43 @@ main (int argc, char ** argv)
     // this app does, and the canvas preview draws from the feed textures
     // directly — so only build it when there is a conference to push it to,
     // and only at the 30fps the send session is configured for.
-    if (app.input_open || app.bench_force_composite) {
+    if (app.input_open || app.bench_force_composite || app.canvas_rec.active ()) {
       double now = glfwGetTime ();
       static double last_push = 0.0;
       if (now - last_push >= 1.0 / std::max (1, app.cfg.send_fps)) {
         double t0 = glfwGetTime ();
         composite (app);
         app.composite_ms = (glfwGetTime () - t0) * 1000.0;
-        push_canvas (app);
+        if (app.input_open)
+          push_canvas (app);
+
+        // Same composite to the encoder, so the recording is exactly what the
+        // far end receives. Emitted on its own fixed cadence: if the loop ran
+        // slow, the previous picture is repeated to fill the gap rather than
+        // the file coming out short and playing fast.
+        if (app.canvas_rec.active ()) {
+          const double period = 1.0 / std::max (1, app.cfg.send_fps);
+          if (app.rec_next_frame == 0.0)
+            app.rec_next_frame = now;
+          int emitted = 0;
+          while (now + 1e-6 >= app.rec_next_frame && emitted < 4) {
+            write_canvas_frame (app);
+            app.rec_next_frame += period;
+            emitted++;
+          }
+          // A long stall (a drag, a resize) should not be paid back forever.
+          if (now - app.rec_next_frame > 1.0)
+            app.rec_next_frame = now;
+        }
         last_push = now;
       }
     }
+
+    // Reap finished recorders. Deferred rather than waited on, so stopping a
+    // recording never stalls a frame.
+    reap_recorder (app.canvas_rec);
+    for (Feed & f : app.feeds)
+      reap_recorder (f.rec);
 
     // Ring while an incoming call is waiting on the operator, and bring the
     // window forward so the banner is actually seen. GLFW window calls must
@@ -3768,6 +4420,28 @@ main (int argc, char ** argv)
   }
 
   save_config (app);
+
+  // Stop every recording before anything else and wait for the children to
+  // finalise their files: a killed ffmpeg leaves an MP4 with no moov atom that
+  // nothing will play. Bounded, so a wedged encoder cannot hang the exit.
+  stop_canvas_recording (app);
+  for (Feed & f : app.feeds)
+    stop_recorder (f.rec, false);
+  for (int waited = 0; waited < 100; waited++) {
+    bool any = app.canvas_rec.busy ();
+    for (Feed & f : app.feeds)
+      any = any || f.rec.busy ();
+    if (!any)
+      break;
+    std::this_thread::sleep_for (std::chrono::milliseconds (100));
+    int st = 0;
+    if (app.canvas_rec.pid > 0 && waitpid (app.canvas_rec.pid, &st, WNOHANG) == app.canvas_rec.pid)
+      app.canvas_rec.pid = -1;
+    for (Feed & f : app.feeds)
+      if (f.rec.pid > 0 && waitpid (f.rec.pid, &st, WNOHANG) == f.rec.pid)
+        f.rec.pid = -1;
+  }
+
   conf_disconnect (app);
   for (Feed & f : app.feeds)
     stop_feed (f);

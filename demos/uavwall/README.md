@@ -36,6 +36,8 @@ this participant's video — so everyone in the VMR sees the composed picture.
 * **Stats** — per-feed rates, plus this process's CPU and memory and, once in
   a conference, the real transmit bitrate, packet loss and RTT from Pulse,
   shown as discrete metric cells along the foot of the window.
+* **Recording** — capture any feed (stream-copied, so the file is the original
+  picture) or the composed canvas to MP4, into `recordings/`.
 * **Registration** — register to Infinity with a username and password so the
   wall can be *dialled into*, search the directory for VMRs and devices, and
   answer incoming calls (including while already in one).
@@ -124,6 +126,9 @@ auto_accept=false          # answer incoming calls without asking
 rtsp_transport=tcp
 rtsp_latency_ms=200
 autoconnect=false          # connect every feed at startup
+
+# Where recordings are written, relative to the working directory.
+record_dir=recordings
 
 # Interface. ui_scale applies on next start.
 ui_scale=1.2
@@ -274,46 +279,56 @@ answered on that same one — so the long-lived instance that keeps global
 GStreamer state alive is also the conference instance, rather than one being
 created per call.
 
+## Recording
+
+Any feed, and the composed canvas, can be captured to MP4 while the wall runs.
+Arm a source with the ring on its rail card, and the canvas with the ring in the
+canvas header; the footer shows a REC cell with the elapsed time whenever
+anything is recording. Files land in `record_dir` (default `recordings/`,
+created if missing) named by callsign and UTC start —
+`HAWKEYE-21_20260729T085346Z.mp4`, `CANVAS_20260729T085346Z.mp4`.
+
+Pulse has no recording API — `pulse_file_session.h` is playback only — so each
+recording is an `ffmpeg` subprocess. **This makes ffmpeg a runtime dependency**
+for the feature alone; without it the record controls are disabled and Settings
+→ Recording says so rather than failing at the point of use.
+
+The two shapes are quite different:
+
+* **A feed** is stream-copied: ffmpeg opens the RTSP URL itself, so nothing is
+  decoded or re-encoded (measured at **0.3% CPU and ~36 MB** per recording) and
+  the file holds the *original* picture rather than the downscaled canvas tile.
+  It works whether or not that feed is connected in the wall or placed on the
+  canvas. Budget roughly 900 MB/hour at 2 Mbps.
+* **The canvas** has no source stream to copy, so composited frames are piped to
+  ffmpeg and encoded — `h264_videotoolbox` on macOS, so the encode is in
+  hardware and costs about 10% of a core at 1080p30. Recording the canvas forces
+  the compositor to run even with no conference up, which is the same ~45% floor
+  the sizing table describes.
+
+Three things about this were measured rather than assumed, and each cost a
+rewrite:
+
+* **Stopping.** `SIGINT` hangs on an RTSP input — a test sat for two minutes.
+  `SIGKILL` leaves an MP4 with no moov atom that nothing will play, and
+  fragmented MP4, MPEG-TS and Matroska all failed to survive it in testing.
+  Writing `q` to ffmpeg's stdin exits cleanly; the canvas encoder, whose stdin
+  carries frames, gets the same result from EOF when the pipe closes. Quitting
+  the app stops every recording and waits (bounded at 10s) for the files to
+  finalise — so **quit properly rather than force-quitting**, or you lose the
+  in-progress captures.
+* **Whole frames only.** A 1920x1080 RGBA frame is 8.3 MB and a pipe buffer is
+  64 KB. Writing non-blocking from the UI thread tore every frame in half and
+  produced a 56-second recording containing 11 usable frames. A writer thread
+  now blocks on the pipe on the UI thread's behalf, a few frames deep, and drops
+  whole frames if it ever falls behind.
+* **The recording keeps its own clock.** The render loop cannot always sustain
+  `send_fps` composites a second under load, and a file that is simply short
+  plays back fast — 21s of canvas against 25s of the same wall-clock window. The
+  cadence is now held independently and the previous picture repeated when a
+  frame is late, so duration matches what the operator watched to within 1%.
+
 ## Planned
-
-**Recording.** The operator marks one or more feeds and each is written to its
-own MP4, independently of whether that feed is on the canvas.
-
-Pulse cannot do this: `pulse_file_session.h` is playback only, and while the
-dylib exports an internal `_pmx_data_session_add_file_output`, no public API
-reaches it. The plan is instead one `ffmpeg` subprocess per recorded feed:
-
-```
-ffmpeg -rtsp_transport tcp -i <feed url> -c copy -movflags +faststart out.mp4
-```
-
-`-c copy` never decodes, so it measured **0.3% CPU and ~36 MB RSS** per
-recorder — negligible beside the ~8.6%/feed compositing — and it captures the
-original stream rather than the downscaled canvas tile. Budget roughly
-900 MB/hour/feed at 2 Mbps.
-
-Stopping is the part that needs care, all of this measured rather than assumed:
-
-* `SIGINT` **hangs** on an RTSP input — a test sat for two minutes.
-* `SIGKILL` leaves no moov atom and an unplayable file. Fragmented MP4 does not
-  save it: with `+frag_keyframe+empty_moov`, `-frag_duration` and
-  `-flush_packets 1`, seven seconds of recording had put between 28 and 1267
-  bytes on disk. MPEG-TS and Matroska wrote nothing at all.
-* **Writing `q` to stdin exits cleanly** and yields a valid file. So spawn with
-  stdin as a pipe, send `q\n`, wait bounded — and stop every recorder on app
-  exit, since a force-quit costs the in-progress files either way.
-
-Open: where the toggle lives. A per-feed control in the rail was tried before
-for connect/disconnect and got in the way, so the alternative is the Settings
-feed list. Note also that this makes `ffmpeg` a **runtime** dependency, where
-today it is only needed to generate test feeds — the control should degrade
-when it is absent rather than fail silently.
-
-Recording the composed canvas is a separate mechanism, since there is no source
-stream to copy: pipe the RGBA buffer to an ffmpeg stdin and encode, which
-`h264_videotoolbox` does in hardware on macOS.
-
-## Also planned
 
 * **SSO-protected VMRs**, if a demonstration ever needs one. The blocker is the
   macOS URL-scheme arbitration above, and the fallback is a script that
