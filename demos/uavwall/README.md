@@ -245,6 +245,14 @@ The pieces, all ported from [`pexclient`](../pexclient/):
   conference state to reach DISCONNECTED, and only then returning `true` — all
   without deadlocking against the UI thread that owns the answer. Worth
   prototyping that sequence before building the dialog around it.
+* **Directory search**, once registered: `pulse_registrations_query_alias()`
+  returns matching conference (VMR) and device aliases, so the VMR field
+  autocompletes as the operator types instead of requiring the address to be
+  known and typed exactly. It is only available while registered — the call
+  fails otherwise — so the field should degrade to plain text entry when the
+  wall is not registered, rather than appearing broken. pexclient drives the
+  same call per keystroke, with separate result limits for devices and
+  services.
 * Config: registration host, alias, username, password, and whether to register
   on startup.
 
