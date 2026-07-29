@@ -206,32 +206,40 @@ machine with `-a` when measuring.
 
 ## Planned
 
-Features to borrow from [`pexclient`](../pexclient/), which already implements
-each of them against a live Infinity deployment:
+**Register to Infinity so the wall can be dialled** — the goal is dial-*in*:
+an operator already in a conference calls `uavwall@your-domain` and the feeds
+appear as a participant, rather than the wall joining a VMR itself. Dialling
+out to a VMR (with a PIN where needed) stays as it is today.
 
-* **Register to Infinity**, with username/password or SSO, so the wall is a
-  known device rather than an anonymous guest — and so it can be called.
-  pexclient's `start_register()` and its registration-state callback port
-  directly.
-* **Join SSO-protected VMRs**, including the PIN-then-SSO sequence. Both are
-  parked-callback flows in Pulse (the worker thread blocks until the UI
-  answers), the same shape as pexclient's PIN and provider-chooser modals.
-* **An `.app` bundle**, which is a *prerequisite* for either of the above on
-  macOS: Infinity returns the IdP token as a `pexip-auth://` URL, and macOS only
-  delivers custom URL schemes to bundles that declare one. See pexclient's
-  `make-bundle.sh` and the SSO prerequisites table in its README.
+Scope, decided deliberately:
 
-Two implementation notes for whoever picks this up:
+* **Username/password registration only — no SSO.** A wall is a fixed
+  installation, not a person, so a device credential is the better fit. It also
+  avoids two macOS problems: SSO would require an `.app` bundle to receive the
+  `pexip-auth://` callback, and only one application on a machine can own that
+  URL scheme — `pexclient` already does. If a customer VMR ever forces SSO,
+  the fallback is a script that repoints the scheme at whichever app is being
+  demonstrated.
+* **PINs for VMRs**, which pexclient's `pin_code_request` callback already
+  covers.
 
-* The conference instance must be created with
-  `pulse_new_with_internal_sso_handling()` rather than `pulse_new()` — on macOS
-  registration fails without it even for password auth. Whether the per-feed
-  instances and the keepalive can remain plain `pulse_new()` needs checking,
-  since the first instance created performs global initialisation.
-* Registration is a property of one Pulse instance. uavwall runs many, so the
-  registered identity should live on the conference instance only.
+The pieces, all ported from [`pexclient`](../pexclient/):
 
-## Where things live
+* `pulse_register_async()` with a `PulseRegistrationRequest` (`use_sso=false`),
+  plus the registration-state callback for status in the footer.
+* `pulse_options_set_registrations_events_callbacks()` for incoming calls —
+  a parked-callback flow, where the Pulse worker blocks until the UI accepts or
+  declines. A demo wall probably wants an auto-accept option.
+* Config: registration host, alias, username, password, and whether to register
+  on startup.
+
+One structural note: registration belongs to a single Pulse instance, and the
+incoming call is answered on that same instance. uavwall should therefore
+register its **keepalive** instance — which already lives for the whole run —
+and use it as the conference instance, instead of creating one per call in
+`conf_connect()`.
+
+## Where things live## Where things live
 
 ```
 src/main.cpp   The whole demo: feed instances, compositor, canvas UI, VMR send.
