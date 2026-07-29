@@ -93,6 +93,34 @@ constexpr float RadiusSmall = 8.0f;
 constexpr float WindowPad = 20.0f;  /* window edge padding        */
 constexpr float PanelGap = 14.0f;   /* gap between the two panels */
 
+/* --- Instrument additions -------------------------------------------------
+ * uavwall's "Instrument" restyle (design_handoff_uavwall_instrument). Added
+ * alongside the Dark Frosted set rather than replacing it: this file is shared
+ * with pexclient, which still wants the frosted radii and pill metrics.
+ */
+constexpr unsigned int StatusWarn = 0xF59E0B; /* alias of StarActive, read as amber */
+
+constexpr float ControlStroke = 0.12f; /* white @ — segmented + field borders   */
+constexpr float TileStroke = 0.14f;    /* white @ — canvas tile dividers        */
+constexpr float ReticleStroke = 0.26f; /* white @ — placeholder reticle only    */
+
+/* Radii — the Instrument set is tighter than the frosted panel radii. */
+constexpr float RadiusDeck = 12.0f;     /* control deck, rail, canvas pane       */
+constexpr float RadiusControl2 = 7.0f;  /* segmented controls, fields, buttons   */
+constexpr float RadiusChip = 5.0f;      /* preset slots, slot-number badges      */
+constexpr float RadiusThumb = 6.0f;     /* rail thumbnails                       */
+constexpr float RadiusFooter = 10.0f;   /* metric-cell strip                     */
+
+/* Metrics, design units — multiply by theme::scale at use. */
+constexpr float TallyStrip = 3.0f; /* NOT scaled — a hairline is a hairline  */
+constexpr float ControlH = 25.0f;  /* every control in the deck              */
+constexpr float RailW = 218.0f;
+constexpr float FooterH = 32.0f;
+constexpr float GroupPadX = 13.0f; /* horizontal padding inside a deck group */
+constexpr float DeckPadY = 8.0f;
+constexpr float Gap = 10.0f;      /* between panels                         */
+constexpr float GapTight = 6.0f;  /* inside a group / between cards         */
+
 /* --- Fonts ----------------------------------------------------------------
  * The handoff's type scale needs real weights, so the static DM Sans TTFs are
  * loaded at the roles below (sizes in CSS px == ImGui units at 1x).
@@ -105,7 +133,34 @@ struct Fonts
   ImFont * smallMed = nullptr;  /* 500 @ 11   — favourite name labels        */
   ImFont * label = nullptr;     /* 700 @ 10.5 + tracking — section labels    */
   ImFont * title = nullptr;     /* 500 @ 12   — title-bar app name           */
+
+  /* Instrument roles. mono carries every numeric readout, so digits must be
+   * tabular; microCap is the same Bold face as `label`, smaller and tracked
+   * harder, for metric-cell captions. */
+  ImFont * mono = nullptr;     /* 400 @ 10.5 — numbers, URLs, aliases, clock */
+  ImFont * microCap = nullptr; /* 700 @  8.5 + 1.0 tracking — cell labels    */
+  /* The PIN field asks for mono @ 14, which is the one place a reader stares
+   * at individual digits. Rasterised separately rather than upscaled from
+   * 10.5, where the glyph edges would visibly soften. */
+  ImFont * monoLg = nullptr;   /* 400 @ 14 + tracking — PIN entry only       */
 };
+
+/* ImGui's default range stops at U+00FF, which silently renders the em dash,
+ * ellipsis and arrow this UI uses as '?'. Latin-1 plus exactly the punctuation
+ * the design calls for — no CJK, so the atlas stays small. */
+static inline const ImWchar *
+InstrumentRanges ()
+{
+  static const ImWchar ranges[] = {
+    0x0020, 0x00FF, /* Basic Latin + Latin-1 Supplement (covers · and ×) */
+    0x2013, 0x2014, /* en dash, em dash                                  */
+    0x2018, 0x201D, /* curly quotes                                      */
+    0x2026, 0x2026, /* horizontal ellipsis                               */
+    0x2192, 0x2192, /* rightwards arrow                                  */
+    0,
+  };
+  return ranges;
+}
 
 /* Load the DM Sans set, rasterised at content_scale for crisp Retina glyphs
  * (FontGlobalScale draws them back at logical size). Any missing file falls
@@ -117,38 +172,58 @@ LoadFonts (ImGuiIO & io, const char * font_dir, float content_scale)
     content_scale = 1.0f;
 
   Fonts f;
-  char reg[1024], semi[1024], med[1024], bold[1024];
+  char reg[1024], semi[1024], med[1024], bold[1024], mono[1024];
   snprintf (reg, sizeof (reg), "%s/DMSans-Regular.ttf", font_dir);
   snprintf (semi, sizeof (semi), "%s/DMSans-SemiBold.ttf", font_dir);
   snprintf (med, sizeof (med), "%s/DMSans-Medium.ttf", font_dir);
   snprintf (bold, sizeof (bold), "%s/DMSans-Bold.ttf", font_dir);
+  snprintf (mono, sizeof (mono), "%s/IBMPlexMono-Regular.ttf", font_dir);
 
   /* Rasterise at content_scale (Retina crispness, undone by FontGlobalScale)
    * AND at the UI scale (which must survive, so it is folded in here and not
    * divided back out below). */
   const float s = content_scale * scale;
 
-  f.body = io.Fonts->AddFontFromFileTTF (reg, 13.5f * s);
+  f.body = io.Fonts->AddFontFromFileTTF (reg, 13.5f * s, nullptr, InstrumentRanges ());
   if (f.body == nullptr) {
     /* Fonts unavailable — degrade to the built-in font for every role. */
     f.body = io.Fonts->AddFontDefault ();
-    f.bodyBold = f.small_ = f.smallMed = f.label = f.title = f.body;
+    f.bodyBold = f.small_ = f.smallMed = f.label = f.title = f.mono = f.microCap = f.monoLg = f.body;
     return f;
   }
 
-  f.bodyBold = io.Fonts->AddFontFromFileTTF (semi, 13.5f * s);
+  f.bodyBold = io.Fonts->AddFontFromFileTTF (semi, 13.5f * s, nullptr, InstrumentRanges ());
 
-  f.small_ = io.Fonts->AddFontFromFileTTF (reg, 11.5f * s);
-  f.smallMed = io.Fonts->AddFontFromFileTTF (med, 11.0f * s);
+  f.small_ = io.Fonts->AddFontFromFileTTF (reg, 11.5f * s, nullptr, InstrumentRanges ());
+  f.smallMed = io.Fonts->AddFontFromFileTTF (med, 11.0f * s, nullptr, InstrumentRanges ());
 
   /* Section labels: 10.5/700 with +0.8 tracking, per the handoff. */
   ImFontConfig label_cfg;
   label_cfg.GlyphExtraSpacing.x = 0.8f * s;
-  f.label = io.Fonts->AddFontFromFileTTF (bold, 10.5f * s, &label_cfg);
+  f.label = io.Fonts->AddFontFromFileTTF (bold, 10.5f * s, &label_cfg, InstrumentRanges ());
 
   ImFontConfig title_cfg;
   title_cfg.GlyphExtraSpacing.x = 0.3f * s;
-  f.title = io.Fonts->AddFontFromFileTTF (med, 12.0f * s, &title_cfg);
+  f.title = io.Fonts->AddFontFromFileTTF (med, 12.0f * s, &title_cfg, InstrumentRanges ());
+
+  /* Metric-cell captions: the label face again, smaller and tracked harder. */
+  ImFontConfig micro_cfg;
+  micro_cfg.GlyphExtraSpacing.x = 1.0f * s;
+  f.microCap = io.Fonts->AddFontFromFileTTF (bold, 8.5f * s, &micro_cfg, InstrumentRanges ());
+  if (f.microCap == nullptr)
+    f.microCap = f.label;
+
+  /* Every numeric readout. Falls back to the proportional body face rather
+   * than failing the launch — the numbers shift a little, nothing breaks. */
+  f.mono = io.Fonts->AddFontFromFileTTF (mono, 10.5f * s, nullptr, InstrumentRanges ());
+  if (f.mono == nullptr)
+    f.mono = f.small_;
+
+  ImFontConfig mono_lg_cfg;
+  mono_lg_cfg.GlyphExtraSpacing.x = 4.0f * s; /* PIN dots must read as digits */
+  f.monoLg = io.Fonts->AddFontFromFileTTF (mono, 14.0f * s, &mono_lg_cfg, InstrumentRanges ());
+  if (f.monoLg == nullptr)
+    f.monoLg = f.mono;
 
   io.FontGlobalScale = 1.0f / content_scale;
   io.FontDefault = f.body;

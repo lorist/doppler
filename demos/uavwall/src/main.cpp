@@ -50,6 +50,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <mutex>
 #include <thread>
@@ -104,6 +105,15 @@ struct Config
   // Interface
   float ui_scale = 1.2f;
   bool show_stats = true;
+
+  // Saved layouts, one per slot, each "feed,x,y,w,h;feed,x,y,w,h;…". Kept as
+  // text so the config parser stays a flat key=value reader.
+  std::string preset_a, preset_b, preset_c;
+
+  // Session-only: silences the feed-loss cue without hiding the visual state.
+  // Deliberately not persisted — an operator muting alerts during one demo
+  // should not find them still muted at the next.
+  bool alerts_muted = false;
 };
 
 // ----------------------------------------------------------------------------
@@ -131,6 +141,7 @@ struct Feed
   int tex_w = 0, tex_h = 0;
   RgbaImage frame; // CPU copy for the compositor
   double last_frame_at = 0.0;
+  double connected_at = 0.0;   // for the inspector's UPTIME
 
   // Measured locally: Pulse exposes no RTSP-level counters, so decoded-frame
   // rate and payload throughput are what we can honestly report per feed.
@@ -184,6 +195,8 @@ struct App
   // until it is torn down. app.conf outlives any single call, so it can no
   // longer serve as the "are we in a call" test.
   bool call_started = false;
+  // When the conference actually came up, for the footer's call duration.
+  double call_connected_at = 0.0;
 
   // Registration lives on app.conf, the one instance that outlives any call.
   std::atomic<int> reg_status{PULSE_CONNECTION_STATUS_DISCONNECTED};
@@ -221,6 +234,17 @@ struct App
   // this itself — it is running on a Pulse worker thread.
   std::atomic<bool> hangup_for_incoming{false};
 
+  // PIN request during a dial-out. Parked the same way as an incoming call.
+  std::atomic<bool> pin_pending{false};
+  std::atomic<int> pin_answer{-1}; // -1 undecided, 0 cancel, 1 submit
+  std::atomic<bool> pin_guest_required{false};
+  // The configured PIN is offered once per dial. If Infinity asks again it was
+  // wrong, and asking the operator beats resubmitting it forever.
+  bool pin_auto_used = false;
+  std::atomic<bool> call_failed{false};
+  std::mutex pin_mutex;
+  std::string pin_value;
+
   // Benchmark mode (--bench): connect everything, lay it out, force the
   // compositor to run as if sending, sample for N seconds and print a row.
   // Exists so capacity numbers are reproducible without anyone clicking.
@@ -234,6 +258,22 @@ struct App
   int bench_samples = 0;
 
   bool show_settings = false;
+  int settings_tab = 0; // 0..4, left-nav selection
+
+  // Rail selection, driving the inspector card at the foot of the rail.
+  int inspect_feed = -1;
+
+  // Feed-loss alert. alert_feed is the worst current stall, recomputed each
+  // frame; dismissal is remembered against it so a *new* stall re-raises the
+  // bar but the same one does not.
+  int alert_feed = -1;
+  bool alert_dismissed = false;
+  int alert_dismissed_feed = -1;
+  double alert_rang_at = 0.0;
+
+  // Long-press to store a layout preset: which slot, and since when.
+  int preset_held = -1;
+  double preset_held_since = 0.0;
 
   // Resource / network readout.
   double proc_cpu_pct = 0.0;   // this process, % of one core
@@ -338,6 +378,16 @@ load_config (App & app)
       }
     } else if (k == "send_fps")
       app.cfg.send_fps = std::max (1, std::min (60, atoi (v.c_str ())));
+    // send_as was written by save_config from the start but never read back,
+    // so the choice silently reverted to main video on every restart.
+    else if (k == "send_as")
+      app.cfg.send_as_content = (v == "content");
+    else if (k == "preset_a")
+      app.cfg.preset_a = v;
+    else if (k == "preset_b")
+      app.cfg.preset_b = v;
+    else if (k == "preset_c")
+      app.cfg.preset_c = v;
     else if (k == "rtsp_transport")
       app.cfg.rtsp_tcp = (v != "udp");
     else if (k == "rtsp_latency_ms")
@@ -405,6 +455,10 @@ save_config (App & app)
   ofs << "# Interface. ui_scale applies on next start.\n";
   ofs << "ui_scale=" << app.cfg.ui_scale << "\n";
   ofs << "show_stats=" << (app.cfg.show_stats ? "true" : "false") << "\n\n";
+  ofs << "# Saved layouts, recalled from the A/B/C slots. feed,x,y,w,h per tile.\n";
+  ofs << "preset_a=" << app.cfg.preset_a << "\n";
+  ofs << "preset_b=" << app.cfg.preset_b << "\n";
+  ofs << "preset_c=" << app.cfg.preset_c << "\n\n";
   ofs << "# One per feed: feed=NAME|URL\n";
   for (const Feed & f : app.feeds)
     ofs << "feed=" << f.name << "|" << f.url << "\n";
@@ -672,6 +726,26 @@ placed_feeds (App & app)
   return out;
 }
 
+// Geometry only, so the control deck can compute what a preset *would* produce
+// and light the matching segment without mutating anything.
+static std::vector<Tile>
+grid_tiles (const Config & cfg, const std::vector<int> & feeds, int cols, int rows)
+{
+  std::vector<Tile> out;
+  const float cw = (float) cfg.canvas_w / cols;
+  const float ch = (float) cfg.canvas_h / rows;
+  for (int i = 0; i < (int) feeds.size () && i < cols * rows; i++) {
+    Tile t;
+    t.feed = feeds[i];
+    t.x = (i % cols) * cw;
+    t.y = (i / cols) * ch;
+    t.w = cw;
+    t.h = ch;
+    out.push_back (t);
+  }
+  return out;
+}
+
 static void
 apply_grid (App & app, int cols, int rows)
 {
@@ -680,19 +754,35 @@ apply_grid (App & app, int cols, int rows)
     for (int i = 0; i < (int) app.feeds.size () && i < cols * rows; i++)
       feeds.push_back (i); // nothing placed yet: fill from the rail
 
-  app.tiles.clear ();
-  const float cw = (float) app.cfg.canvas_w / cols;
-  const float ch = (float) app.cfg.canvas_h / rows;
-  for (int i = 0; i < (int) feeds.size () && i < cols * rows; i++) {
+  app.tiles = grid_tiles (app.cfg, feeds, cols, rows);
+  app.fullscreen_feed = -1;
+}
+
+static std::vector<Tile>
+pip_tiles (const Config & cfg, const std::vector<int> & feeds)
+{
+  std::vector<Tile> out;
+  if (feeds.empty ())
+    return out;
+  Tile big;
+  big.feed = feeds[0];
+  big.x = big.y = 0;
+  big.w = (float) cfg.canvas_w;
+  big.h = (float) cfg.canvas_h;
+  out.push_back (big);
+
+  const float pw = cfg.canvas_w * 0.22f, ph = pw * 9.0f / 16.0f;
+  const float margin = 24.0f;
+  for (int i = 1; i < (int) feeds.size () && i <= 4; i++) {
     Tile t;
     t.feed = feeds[i];
-    t.x = (i % cols) * cw;
-    t.y = (i / cols) * ch;
-    t.w = cw;
-    t.h = ch;
-    app.tiles.push_back (t);
+    t.w = pw;
+    t.h = ph;
+    t.x = cfg.canvas_w - (pw + margin) * i;
+    t.y = cfg.canvas_h - ph - margin;
+    out.push_back (t);
   }
-  app.fullscreen_feed = -1;
+  return out;
 }
 
 // One feed full frame, the rest as a strip of PiPs along the bottom.
@@ -706,25 +796,7 @@ apply_pip (App & app)
   if (feeds.empty ())
     return;
 
-  app.tiles.clear ();
-  Tile big;
-  big.feed = feeds[0];
-  big.x = big.y = 0;
-  big.w = app.cfg.canvas_w;
-  big.h = app.cfg.canvas_h;
-  app.tiles.push_back (big);
-
-  const float pw = app.cfg.canvas_w * 0.22f, ph = pw * 9.0f / 16.0f;
-  const float margin = 24.0f;
-  for (int i = 1; i < (int) feeds.size () && i <= 4; i++) {
-    Tile t;
-    t.feed = feeds[i];
-    t.w = pw;
-    t.h = ph;
-    t.x = app.cfg.canvas_w - (pw + margin) * i;
-    t.y = app.cfg.canvas_h - ph - margin;
-    app.tiles.push_back (t);
-  }
+  app.tiles = pip_tiles (app.cfg, feeds);
   app.fullscreen_feed = -1;
 }
 
@@ -781,8 +853,12 @@ static void
 on_conf_result (const PulseError err, void * ctx)
 {
   auto * app = static_cast<App *> (ctx);
-  if (err != PULSE_SUCCESS)
+  if (err != PULSE_SUCCESS) {
     set_status (*app, std::string ("conference: ") + pulse_strerror (err));
+    // A refused or cancelled join leaves the UI showing "connecting…" forever
+    // otherwise. The UI thread owns call_started, so flag it and let it clear.
+    app->call_failed.store (true);
+  }
 }
 
 static void
@@ -902,6 +978,42 @@ on_incoming_cancelled (const PulseRegistrationsEventIncomingCancelled *, void * 
   if (app->incoming_pending.load ())
     app->incoming_answer.store (0); // caller gave up; release the parked worker
   set_status (*app, "Incoming call cancelled");
+}
+
+// The VMR wants a PIN. Like the incoming-call callback this blocks a Pulse
+// worker until answered, and the supplied setter must be invoked before
+// returning — it is invalid in any other context.
+static bool
+on_pin_request (bool guest_pin_required, const PulseSetPinCode * set_pin, void * ctx)
+{
+  auto * app = static_cast<App *> (ctx);
+  {
+    std::lock_guard<std::mutex> lock (app->pin_mutex);
+    app->pin_value.clear ();
+  }
+  app->pin_guest_required.store (guest_pin_required);
+
+  // A PIN configured up front is used without troubling the operator — an
+  // unattended wall should be able to dial a known VMR unaided.
+  if (!app->cfg.pin.empty () && !app->pin_auto_used) {
+    app->pin_auto_used = true;
+    set_pin->func (set_pin->context, app->cfg.pin.c_str ());
+    return true;
+  }
+
+  app->pin_answer.store (-1);
+  app->pin_pending.store (true);
+  while (app->pin_answer.load () == -1)
+    std::this_thread::sleep_for (std::chrono::milliseconds (100));
+  app->pin_pending.store (false);
+
+  bool submit = app->pin_answer.load () == 1;
+  if (submit) {
+    std::lock_guard<std::mutex> lock (app->pin_mutex);
+    // NULL means "no PIN", which is valid where a guest PIN is not required.
+    set_pin->func (set_pin->context, app->pin_value.empty () ? nullptr : app->pin_value.c_str ());
+  }
+  return submit;
 }
 
 // ----------------------------------------------------------------------------
@@ -1056,6 +1168,7 @@ conf_connect (App & app)
     return; // the instance stays; only this call attempt failed
   }
   app.call_started = true;
+  app.pin_auto_used = false;
 
   // The push side is opened when the conference reports CONNECTED, in the
   // frame loop — the same path an answered incoming call takes.
@@ -1149,90 +1262,530 @@ sample_resources (App & app)
 }
 
 // ----------------------------------------------------------------------------
-//  UI
+//  UI — Instrument primitives
+//
+//  Almost nothing in this design is a stock ImGui widget: the chrome is drawn
+//  with the draw list over InvisibleButtons, which is what lets a control be
+//  25 high with a 7 radius and mixed type inside it. The rules the other demos
+//  learned the hard way still apply — anything interactive is a real item in a
+//  real window, and no widget's submission is ever gated on another widget's
+//  hovered/active state.
 // ----------------------------------------------------------------------------
 
+// A feed is stalled when it is connected, has delivered at least one frame,
+// and has delivered nothing for two seconds. Derived every frame rather than
+// stored, so recovery needs no bookkeeping.
 static bool
-pill_button (App & app, const char * label, unsigned int color, ImVec2 size, bool active = false)
+feed_stalled (const Feed & f)
 {
-  ImGui::PushStyleColor (ImGuiCol_Button, theme::Hex (color, active ? 0.95f : 0.14f));
-  ImGui::PushStyleColor (ImGuiCol_ButtonHovered, theme::Hex (color, active ? 1.0f : 0.30f));
-  ImGui::PushStyleColor (ImGuiCol_ButtonActive, theme::Hex (color, 0.85f));
-  ImGui::PushStyleColor (ImGuiCol_Text, theme::Hex (0xFFFFFF, active ? 1.0f : 0.85f));
-  ImGui::PushStyleVar (ImGuiStyleVar_FrameRounding, size.y / 2);
-  ImGui::PushFont (app.fonts.bodyBold);
-  bool clicked = ImGui::Button (label, size);
-  ImGui::PopFont ();
-  ImGui::PopStyleVar ();
-  ImGui::PopStyleColor (4);
-  if (ImGui::IsItemHovered ())
+  return f.connected && f.last_frame_at > 0 && ImGui::GetTime () - f.last_frame_at > 2.0;
+}
+
+static bool
+feed_live (const Feed & f)
+{
+  return f.connected && f.last_frame_at > 0 && !feed_stalled (f);
+}
+
+// Design units -> screen pixels. Every new metric goes through this so the
+// layout holds at a 1440x900 laptop and at a control-room display alike.
+static inline float
+du (float design)
+{
+  return design * theme::scale;
+}
+
+enum class Btn
+{
+  Fill,    // solid colour, white text — the primary action of its group
+  Tinted,  // 12% fill + 35% border — constructive but secondary
+  Outline, // border only — destructive or quiet
+  Ghost    // no chrome at all — text buttons in the alert bar
+};
+
+// The Instrument button: squared, control-label type, optional leading glyph
+// drawn as a plain triangle or square (the design has no icon set at all).
+static bool
+deck_button (App & app, const char * id, const char * label, ImVec2 size, unsigned int color, Btn style,
+             bool enabled = true, int glyph = 0) // glyph: 0 none, 1 play, 2 stop
+{
+  ImGui::PushID (id);
+  ImVec2 p0 = ImGui::GetCursorScreenPos ();
+  ImGui::InvisibleButton ("##b", size);
+  const bool hovered = enabled && ImGui::IsItemHovered ();
+  const bool held = hovered && ImGui::IsMouseDown (ImGuiMouseButton_Left);
+  const bool clicked = enabled && ImGui::IsItemHovered () && ImGui::IsMouseReleased (ImGuiMouseButton_Left);
+  ImVec2 p1 (p0.x + size.x, p0.y + size.y);
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+
+  const float dim = enabled ? 1.0f : 0.45f;
+  ImU32 text_col;
+  switch (style) {
+  case Btn::Fill:
+    dl->AddRectFilled (p0, p1, theme::HexU32 (color, (held ? 0.80f : hovered ? 1.0f : 0.92f) * dim),
+                       du (theme::RadiusControl2));
+    text_col = theme::WhiteU32 (dim);
+    break;
+  case Btn::Tinted:
+    dl->AddRectFilled (p0, p1, theme::HexU32 (color, (hovered ? 0.22f : 0.12f) * dim), du (theme::RadiusControl2));
+    dl->AddRect (p0, p1, theme::HexU32 (color, 0.35f * dim), du (theme::RadiusControl2), 0, 1.0f);
+    text_col = theme::HexU32 (color, 0.95f * dim);
+    break;
+  case Btn::Outline:
+    if (hovered)
+      dl->AddRectFilled (p0, p1, theme::HexU32 (color, 0.10f), du (theme::RadiusControl2));
+    dl->AddRect (p0, p1, theme::HexU32 (color, 0.35f * dim), du (theme::RadiusControl2), 0, 1.0f);
+    text_col = theme::HexU32 (color, 0.90f * dim);
+    break;
+  default:
+    text_col = theme::WhiteU32 ((hovered ? 0.70f : 0.45f) * dim);
+    break;
+  }
+
+  const float fsz = theme::fs (9.5f);
+  ImVec2 ts = app.fonts.label->CalcTextSizeA (fsz, FLT_MAX, 0, label);
+  const float gw = glyph ? du (glyph == 1 ? 6.0f : 7.0f) + du (6.0f) : 0.0f;
+  float tx = p0.x + (size.x - ts.x - gw) / 2 + gw;
+  float ty = p0.y + (size.y - ts.y) / 2;
+
+  if (glyph == 1) { // play: a filled triangle, no icon font
+    float g = du (6.0f), gh = du (10.0f);
+    float gx = tx - gw, gy = p0.y + (size.y - gh) / 2;
+    dl->AddTriangleFilled (ImVec2 (gx, gy), ImVec2 (gx, gy + gh), ImVec2 (gx + g, gy + gh / 2), text_col);
+  } else if (glyph == 2) { // stop: a filled square
+    float g = du (7.0f);
+    float gx = tx - gw, gy = p0.y + (size.y - g) / 2;
+    dl->AddRectFilled (ImVec2 (gx, gy), ImVec2 (gx + g, gy + g), text_col, 1.0f);
+  }
+  dl->AddText (app.fonts.label, fsz, ImVec2 (tx, ty), text_col, label);
+
+  if (hovered)
     ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+  ImGui::PopID ();
   return clicked;
 }
 
-// Left rail: every configured feed, with a live thumbnail and state.
+// A segmented control: one rounded track, hairline dividers, no per-cell
+// rounding. Returns the index pressed, or -1. `active` may be -1 for "none",
+// which is what a hand-dragged layout leaves behind.
+static int
+segmented (App & app, const char * id, const char * const * labels, int count, int active, float cell_w, float h)
+{
+  ImGui::PushID (id);
+  ImVec2 p0 = ImGui::GetCursorScreenPos ();
+  ImVec2 size (cell_w * count, h);
+  ImGui::InvisibleButton ("##seg", size);
+  ImVec2 p1 (p0.x + size.x, p0.y + size.y);
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  const float r = du (theme::RadiusControl2);
+
+  dl->AddRectFilled (p0, p1, theme::WhiteU32 (0.06f), r);
+
+  int pressed = -1;
+  const bool hovered = ImGui::IsItemHovered ();
+  const int hot = hovered ? std::min (count - 1, std::max (0, (int) ((ImGui::GetIO ().MousePos.x - p0.x) / cell_w)))
+                          : -1;
+  if (hovered && ImGui::IsMouseReleased (ImGuiMouseButton_Left))
+    pressed = hot;
+
+  // The active cell is filled inside the clipped track so its corners follow
+  // the group's rounding rather than showing square edges at the ends.
+  dl->PushClipRect (p0, p1, true);
+  for (int i = 0; i < count; i++) {
+    ImVec2 c0 (p0.x + cell_w * i, p0.y), c1 (c0.x + cell_w, p1.y);
+    if (i == active)
+      dl->AddRectFilled (c0, c1, theme::HexU32 (theme::AccentPrimary, 0.92f));
+    else if (i == hot)
+      dl->AddRectFilled (c0, c1, theme::WhiteU32 (0.06f));
+    if (i > 0)
+      dl->AddLine (ImVec2 (c0.x, p0.y + du (1.0f)), ImVec2 (c0.x, p1.y - du (1.0f)), theme::WhiteU32 (0.10f), 1.0f);
+
+    const float fsz = theme::fs (9.5f);
+    ImVec2 ts = app.fonts.label->CalcTextSizeA (fsz, FLT_MAX, 0, labels[i]);
+    dl->AddText (app.fonts.label, fsz, ImVec2 (c0.x + (cell_w - ts.x) / 2, c0.y + (h - ts.y) / 2),
+                 i == active ? theme::WhiteU32 (1.0f) : theme::WhiteU32 (0.55f), labels[i]);
+  }
+  dl->PopClipRect ();
+  dl->AddRect (p0, p1, theme::WhiteU32 (theme::ControlStroke), r, 0, 1.0f);
+
+  if (hovered)
+    ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+  ImGui::PopID ();
+  return pressed;
+}
+
+// Small drawing conveniences — the design repeats these three shapes
+// everywhere, and spelling them out at each site buried the layout.
+static void
+draw_label (App & app, ImDrawList * dl, ImVec2 at, const char * text, ImU32 col, float size = 10.5f)
+{
+  dl->AddText (app.fonts.label, theme::fs (size), at, col, text);
+}
+
+static void
+draw_mono (App & app, ImDrawList * dl, ImVec2 at, const char * text, ImU32 col, float size = 10.5f)
+{
+  dl->AddText (app.fonts.mono, theme::fs (size), at, col, text);
+}
+
+static float
+mono_w (App & app, const char * text, float size = 10.5f)
+{
+  return app.fonts.mono->CalcTextSizeA (theme::fs (size), FLT_MAX, 0, text).x;
+}
+
+static float
+label_w (App & app, const char * text, float size = 10.5f)
+{
+  return app.fonts.label->CalcTextSizeA (theme::fs (size), FLT_MAX, 0, text).x;
+}
+
+// A 22x12 pill switch — the per-feed connect toggle, in the rail and in
+// Settings. Returns true when pressed.
+static bool
+toggle_switch (App & app, const char * id, bool on, ImVec2 at, float w = 22.0f, float h = 12.0f)
+{
+  (void) app;
+  ImGui::PushID (id);
+  ImGui::SetCursorScreenPos (at);
+  ImVec2 size (du (w), du (h));
+  ImGui::InvisibleButton ("##sw", size);
+  const bool hovered = ImGui::IsItemHovered ();
+  const bool clicked = hovered && ImGui::IsMouseReleased (ImGuiMouseButton_Left);
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 p1 (at.x + size.x, at.y + size.y);
+  dl->AddRectFilled (at, p1, on ? theme::HexU32 (theme::StatusOnline, 0.85f) : theme::WhiteU32 (0.12f), size.y / 2);
+  const float knob = size.y * 0.66f;
+  const float kx = on ? p1.x - knob / 2 - du (2.0f) : at.x + knob / 2 + du (2.0f);
+  dl->AddCircleFilled (ImVec2 (kx, at.y + size.y / 2), knob / 2, on ? theme::WhiteU32 (1.0f) : theme::WhiteU32 (0.40f));
+  if (hovered)
+    ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+  ImGui::PopID ();
+  return clicked;
+}
+
+// ----------------------------------------------------------------------------
+//  Layout presets — three slots, stored in uavwall.conf as text
+// ----------------------------------------------------------------------------
+
+static std::string
+serialise_tiles (const std::vector<Tile> & tiles)
+{
+  std::string out;
+  char buf[128];
+  for (const Tile & t : tiles) {
+    snprintf (buf, sizeof (buf), "%d,%.0f,%.0f,%.0f,%.0f;", t.feed, t.x, t.y, t.w, t.h);
+    out += buf;
+  }
+  return out;
+}
+
+static std::vector<Tile>
+parse_tiles (const std::string & s, int feed_count)
+{
+  std::vector<Tile> out;
+  std::size_t i = 0;
+  while (i < s.size ()) {
+    std::size_t end = s.find (';', i);
+    if (end == std::string::npos)
+      end = s.size ();
+    Tile t;
+    if (sscanf (s.substr (i, end - i).c_str (), "%d,%f,%f,%f,%f", &t.feed, &t.x, &t.y, &t.w, &t.h) == 5) {
+      // A preset saved against a longer feed list must not resurrect tiles
+      // pointing past the end of it.
+      if (t.feed >= 0 && t.feed < feed_count && t.w > 0 && t.h > 0)
+        out.push_back (t);
+    }
+    i = end + 1;
+  }
+  return out;
+}
+
+static std::string &
+preset_slot (App & app, int i)
+{
+  return i == 0 ? app.cfg.preset_a : i == 1 ? app.cfg.preset_b : app.cfg.preset_c;
+}
+
+// The inspector's fixed height, so the cards above it can be fitted to what is
+// left. Two states only: with a selection and without.
+static float
+inspector_h (const App & app)
+{
+  return du (app.inspect_feed >= 0 && app.inspect_feed < (int) app.feeds.size () ? 150.0f : 58.0f);
+}
+
+// Feed inspector, pinned to the foot of the rail: what this source actually is,
+// and the two things an operator does about it.
+static void
+ui_inspector (App & app, ImVec2 at, float w)
+{
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  const float h = inspector_h (app);
+  ImVec2 p1 (at.x + w, at.y + h);
+  const float pad = du (8.0f);
+
+  const bool has = app.inspect_feed >= 0 && app.inspect_feed < (int) app.feeds.size ();
+  if (!has) {
+    // Dashed, so an empty inspector reads as a slot rather than a broken card.
+    const float dash = du (4.0f);
+    for (float x = at.x; x < p1.x; x += dash * 2)
+      dl->AddLine (ImVec2 (x, at.y), ImVec2 (std::min (x + dash, p1.x), at.y), theme::WhiteU32 (0.14f), 1.0f);
+    for (float x = at.x; x < p1.x; x += dash * 2)
+      dl->AddLine (ImVec2 (x, p1.y), ImVec2 (std::min (x + dash, p1.x), p1.y), theme::WhiteU32 (0.14f), 1.0f);
+    for (float y = at.y; y < p1.y; y += dash * 2) {
+      dl->AddLine (ImVec2 (at.x, y), ImVec2 (at.x, std::min (y + dash, p1.y)), theme::WhiteU32 (0.14f), 1.0f);
+      dl->AddLine (ImVec2 (p1.x, y), ImVec2 (p1.x, std::min (y + dash, p1.y)), theme::WhiteU32 (0.14f), 1.0f);
+    }
+    draw_label (app, dl, ImVec2 (at.x + pad, at.y + pad), "INSPECTOR", theme::WhiteU32 (theme::TextLabel));
+    const char * msg = "Select a source to see its";
+    const char * msg2 = "URL, transport and uptime.";
+    dl->AddText (app.fonts.body, theme::fs (10.0f), ImVec2 (at.x + pad, at.y + pad + du (16.0f)),
+                 theme::WhiteU32 (0.30f), msg);
+    dl->AddText (app.fonts.body, theme::fs (10.0f), ImVec2 (at.x + pad, at.y + pad + du (28.0f)),
+                 theme::WhiteU32 (0.30f), msg2);
+    return;
+  }
+
+  Feed & f = app.feeds[(size_t) app.inspect_feed];
+  const bool stalled = feed_stalled (f);
+
+  dl->AddRectFilled (at, p1, theme::WhiteU32 (theme::PanelFillRaised), du (8.0f));
+  if (stalled)
+    dl->AddRect (at, p1, theme::HexU32 (theme::StatusWarn, 0.35f), du (8.0f), 0, 1.0f);
+
+  float y = at.y + pad;
+  draw_label (app, dl, ImVec2 (at.x + pad, y), "INSPECTOR", theme::WhiteU32 (theme::TextLabel));
+
+  const char * state = stalled ? "STALLED" : feed_live (f) ? "LIVE" : "OFFLINE";
+  ImU32 state_col = stalled ? theme::HexU32 (theme::StatusWarn)
+                            : feed_live (f) ? theme::HexU32 (theme::StatusOnline) : theme::WhiteU32 (0.35f);
+  dl->AddText (app.fonts.label, theme::fs (8.3f),
+               ImVec2 (p1.x - pad - label_w (app, state, 8.3f), y), state_col, state);
+  y += du (14.0f);
+
+  dl->AddText (app.fonts.label, theme::fs (10.8f), ImVec2 (at.x + pad, y), theme::WhiteU32 (0.88f), f.name.c_str ());
+  y += du (16.0f);
+
+  // Label/value rows: label left, value right-aligned, so the numbers form a
+  // column the eye can run down.
+  auto row = [&] (const char * k, const std::string & v, ImU32 vc) {
+    draw_mono (app, dl, ImVec2 (at.x + pad, y), k, theme::WhiteU32 (0.35f), 9.2f);
+    std::string val = v;
+    // Tail-elide: the end of an RTSP URL is the part that identifies the feed.
+    const float room = w - pad * 2 - du (52.0f);
+    while (val.size () > 4 && mono_w (app, val.c_str (), 9.2f) > room)
+      val = "…" + val.substr (2);
+    dl->AddText (app.fonts.mono, theme::fs (9.2f), ImVec2 (p1.x - pad - mono_w (app, val.c_str (), 9.2f), y), vc,
+                 val.c_str ());
+    y += du (12.0f);
+  };
+
+  row ("URL", f.url, theme::WhiteU32 (0.72f));
+  char tbuf[64];
+  snprintf (tbuf, sizeof (tbuf), "%s · %dms", app.cfg.rtsp_tcp ? "TCP" : "UDP", app.cfg.rtsp_latency_ms);
+  row ("TRANSPORT", tbuf, theme::WhiteU32 (0.72f));
+
+  if (f.connected && f.connected_at > 0) {
+    int up = (int) (ImGui::GetTime () - f.connected_at);
+    snprintf (tbuf, sizeof (tbuf), "%d:%02d:%02d", up / 3600, (up / 60) % 60, up % 60);
+  } else {
+    snprintf (tbuf, sizeof (tbuf), "—");
+  }
+  row ("UPTIME", tbuf, theme::WhiteU32 (0.72f));
+
+  double age = f.last_frame_at > 0 ? ImGui::GetTime () - f.last_frame_at : -1.0;
+  if (age < 0)
+    snprintf (tbuf, sizeof (tbuf), "—");
+  else
+    snprintf (tbuf, sizeof (tbuf), "%.1fs", age);
+  row ("LAST FRAME", tbuf, stalled ? theme::HexU32 (theme::StatusWarn) : theme::WhiteU32 (0.72f));
+
+  if (!f.error.empty ()) {
+    std::string e = f.error;
+    while (!e.empty () && mono_w (app, e.c_str (), 9.2f) > w - pad * 2)
+      e.pop_back ();
+    draw_mono (app, dl, ImVec2 (at.x + pad, y), e.c_str (), theme::HexU32 (theme::StatusError, 0.90f), 9.2f);
+  }
+
+  // Two half-width actions along the bottom.
+  const float bh = du (22.0f), bw = (w - pad * 2 - du (6.0f)) / 2;
+  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad, p1.y - pad - bh));
+  if (deck_button (app, "insp_rc", "RECONNECT", ImVec2 (bw, bh), theme::AccentPrimary, Btn::Fill)) {
+    stop_feed (f);
+    start_feed (f);
+    if (f.connected)
+      f.connected_at = ImGui::GetTime ();
+  }
+  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + bw + du (6.0f), p1.y - pad - bh));
+  if (deck_button (app, "insp_rm", "REMOVE", ImVec2 (bw, bh), 0xFFFFFF, Btn::Outline)) {
+    int idx = app.inspect_feed;
+    remove_feed_tiles (app, idx);
+    stop_feed (app.feeds[(size_t) idx]);
+    app.feeds.erase (app.feeds.begin () + idx);
+    for (Tile & tl : app.tiles)
+      if (tl.feed > idx)
+        tl.feed--;
+    app.inspect_feed = -1;
+    app.fullscreen_feed = -1;
+  }
+}
+
+// Left rail: every configured feed, with a live thumbnail, its state, and a
+// connect toggle; the inspector sits at the foot.
 static void
 ui_feed_rail (App & app, float w, float h)
 {
-  ImGui::BeginChild ("##rail", ImVec2 (w, h), ImGuiChildFlags_Borders);
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (du (10.0f), du (10.0f)));
+  ImGui::PushStyleColor (ImGuiCol_ChildBg, theme::Hex (0xFFFFFF, theme::PanelFill));
+  ImGui::PushStyleVar (ImGuiStyleVar_ChildRounding, du (theme::RadiusDeck));
+  ImGui::BeginChild ("##rail", ImVec2 (w, h), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
   ImDrawList * dl = ImGui::GetWindowDrawList ();
 
-  ImGui::PushFont (app.fonts.bodyBold);
-  ImGui::TextUnformatted ("FEEDS");
-  ImGui::PopFont ();
-  ImGui::Dummy (ImVec2 (0, 4));
+  const float cw = ImGui::GetContentRegionAvail ().x;
 
-  const float tw = ImGui::GetContentRegionAvail ().x;
-  const float th = tw * 9.0f / 16.0f;
+  // ---- header -------------------------------------------------------------
+  {
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    draw_label (app, dl, at, "SOURCES", theme::WhiteU32 (theme::TextLabel));
+    int live = 0;
+    for (const Feed & f : app.feeds)
+      if (f.connected)
+        live++;
+    char buf[48];
+    snprintf (buf, sizeof (buf), "%d LIVE / %d", live, (int) app.feeds.size ());
+    draw_mono (app, dl, ImVec2 (at.x + cw - mono_w (app, buf), at.y - du (1.0f)), buf, theme::WhiteU32 (0.30f));
+    ImGui::Dummy (ImVec2 (0, du (14.0f) + du (theme::GapTight)));
+  }
 
-  for (int i = 0; i < (int) app.feeds.size (); i++) {
-    Feed & f = app.feeds[i];
+  // ---- density ------------------------------------------------------------
+  // Thumbnail height is what flexes: the rail must hold every card without
+  // scrolling wherever it can, so fit to the space left after the inspector
+  // rather than hard-coding a height per feed count.
+  const float bar_w = du (2.5f), bar_gap = du (7.0f);
+  const float body_w = cw - bar_w - bar_gap;
+  const float meta_h = du (12.0f);
+  const float insp_h = inspector_h (app);
+  const int n = (int) app.feeds.size ();
+
+  float avail = ImGui::GetContentRegionAvail ().y - insp_h - du (theme::Gap);
+  float thumb_h = du (60.0f);
+  if (n > 0) {
+    float per_card = (avail + du (theme::GapTight)) / n - du (theme::GapTight);
+    thumb_h = per_card - du (3.0f) - meta_h;
+    thumb_h = std::min (thumb_h, du (60.0f));
+    thumb_h = std::max (thumb_h, du (45.0f)); // clamp, never shrink further
+  }
+  const float card_h = thumb_h + du (3.0f) + meta_h;
+
+  // Only scroll when the clamp bit — otherwise the rail is a fixed board.
+  const bool scrolls = n > 0 && (card_h + du (theme::GapTight)) * n - du (theme::GapTight) > avail + 0.5f;
+
+  // Transparent: the rail already painted PanelFill, and a nested child would
+  // paint it again and show as a lighter block.
+  ImGui::PushStyleColor (ImGuiCol_ChildBg, ImVec4 (0, 0, 0, 0));
+  ImGui::BeginChild ("##cards", ImVec2 (cw, avail), ImGuiChildFlags_None,
+                     scrolls ? ImGuiWindowFlags_None : ImGuiWindowFlags_NoScrollbar);
+  dl = ImGui::GetWindowDrawList ();
+
+  int toggle_feed = -1;
+  for (int i = 0; i < n; i++) {
+    Feed & f = app.feeds[(size_t) i];
     ImGui::PushID (i);
 
     ImVec2 p0 = ImGui::GetCursorScreenPos ();
-    ImGui::InvisibleButton ("##thumb", ImVec2 (tw, th + (app.cfg.show_stats ? 40 : 26)));
-    bool hovered = ImGui::IsItemHovered ();
-    bool dbl = hovered && ImGui::IsMouseDoubleClicked (ImGuiMouseButton_Left);
-    ImVec2 p1 (p0.x + tw, p0.y + th);
+    const bool placed = feed_is_placed (app, i);
+    const bool stalled = feed_stalled (f);
+    const bool live = feed_live (f);
+    const float dim = f.connected ? 1.0f : 0.62f; // an offline card recedes
 
-    // Thumbnail (or a placeholder when there is no picture yet).
+    // Placement bar — a feed's relationship to the canvas, read down the edge.
+    ImVec2 b0 (p0.x, p0.y), b1 (p0.x + bar_w, p0.y + card_h);
+    dl->AddRectFilled (b0, b1,
+                       placed   ? theme::HexU32 (theme::AccentPrimary)
+                       : stalled ? theme::HexU32 (theme::StatusWarn)
+                                 : theme::WhiteU32 (0.08f),
+                       du (2.0f));
+
+    ImVec2 t0 (p0.x + bar_w + bar_gap, p0.y), t1 (t0.x + body_w, t0.y + thumb_h);
+
+    // The whole card is the hit target; the toggle below claims its own rect
+    // first, so this must allow overlap or it swallows the toggle's click.
+    ImGui::SetCursorScreenPos (p0);
+    ImGui::SetNextItemAllowOverlap ();
+    ImGui::InvisibleButton ("##card", ImVec2 (cw, card_h));
+    const bool hovered = ImGui::IsItemHovered ();
+    const bool dbl = hovered && ImGui::IsMouseDoubleClicked (ImGuiMouseButton_Left);
+
     if (f.texture && f.tex_w > 0) {
-      dl->AddImageRounded ((ImTextureID) (intptr_t) f.texture, p0, p1, ImVec2 (0, 0), ImVec2 (1, 1), IM_COL32_WHITE,
-                           theme::RadiusRow);
+      dl->AddImageRounded ((ImTextureID) (intptr_t) f.texture, t0, t1, ImVec2 (0, 0), ImVec2 (1, 1),
+                           theme::WhiteU32 (dim), du (theme::RadiusThumb));
+      dl->AddRect (t0, t1,
+                   stalled  ? theme::HexU32 (theme::StatusWarn, 0.55f)
+                   : hovered ? theme::HexU32 (theme::AccentPrimary)
+                             : theme::WhiteU32 (theme::TileStroke),
+                   du (theme::RadiusThumb), 0, 1.0f);
+      // Name straight on the picture — no plate, which would fight the frame.
+      // A 1px shadow rather than a plate: real aerial footage is often bright
+      // enough that white-on-nothing is unreadable, which the mock's dark
+      // placeholder imagery never showed.
+      dl->AddText (app.fonts.label, theme::fs (8.3f), ImVec2 (t0.x + du (6.0f) + 1, t0.y + du (5.0f) + 1),
+                   theme::HexU32 (theme::WindowBgStart, 0.75f * dim), f.name.c_str ());
+      dl->AddText (app.fonts.label, theme::fs (8.3f), ImVec2 (t0.x + du (6.0f), t0.y + du (5.0f)),
+                   theme::WhiteU32 (0.85f * dim), f.name.c_str ());
     } else {
-      dl->AddRectFilled (p0, p1, theme::WhiteU32 (0.05f), theme::RadiusRow);
-      const char * msg = f.connected ? "waiting…" : (f.error.empty () ? "offline" : "error");
-      ImVec2 ts = app.fonts.small_->CalcTextSizeA (theme::fs (11.0f), FLT_MAX, 0, msg);
-      dl->AddText (app.fonts.small_, theme::fs (11.0f), ImVec2 ((p0.x + p1.x - ts.x) / 2, (p0.y + p1.y) / 2),
-                   theme::WhiteU32 (0.4f), msg);
+      dl->AddRectFilled (t0, t1, theme::WhiteU32 (0.04f), du (theme::RadiusThumb));
+      // Dashed edge: nothing is arriving, and the card should not look like a
+      // picture that happens to be black.
+      const float dash = du (4.0f);
+      for (float x = t0.x; x < t1.x; x += dash * 2) {
+        dl->AddLine (ImVec2 (x, t0.y), ImVec2 (std::min (x + dash, t1.x), t0.y), theme::WhiteU32 (0.16f), 1.0f);
+        dl->AddLine (ImVec2 (x, t1.y), ImVec2 (std::min (x + dash, t1.x), t1.y), theme::WhiteU32 (0.16f), 1.0f);
+      }
+      for (float y = t0.y; y < t1.y; y += dash * 2) {
+        dl->AddLine (ImVec2 (t0.x, y), ImVec2 (t0.x, std::min (y + dash, t1.y)), theme::WhiteU32 (0.16f), 1.0f);
+        dl->AddLine (ImVec2 (t1.x, y), ImVec2 (t1.x, std::min (y + dash, t1.y)), theme::WhiteU32 (0.16f), 1.0f);
+      }
+      const char * msg = f.connected ? "waiting…" : "OFFLINE";
+      float tw = label_w (app, msg, 8.3f);
+      dl->AddText (app.fonts.label, theme::fs (8.3f),
+                   ImVec2 ((t0.x + t1.x - tw) / 2, (t0.y + t1.y) / 2 - theme::fs (4.0f)), theme::WhiteU32 (0.35f),
+                   msg);
+      dl->AddText (app.fonts.label, theme::fs (8.3f), ImVec2 (t0.x + du (6.0f), t0.y + du (5.0f)),
+                   theme::WhiteU32 (0.55f * dim), f.name.c_str ());
     }
 
-    bool placed = feed_is_placed (app, i);
-    dl->AddRect (p0, p1,
-                 placed ? theme::HexU32 (theme::AccentPrimary, 0.9f) : theme::WhiteU32 (hovered ? 0.35f : 0.12f),
-                 theme::RadiusRow, 0, placed ? 2.0f : 1.0f);
+    // ---- meta row ---------------------------------------------------------
+    const float my = t1.y + du (3.0f);
+    ImVec2 m0 (t0.x, my + (meta_h - du (5.0f)) / 2);
+    // A square marker, not a dot: it reads as an indicator rather than a bullet.
+    dl->AddRectFilled (m0, ImVec2 (m0.x + du (5.0f), m0.y + du (5.0f)),
+                       live      ? theme::HexU32 (theme::StatusOnline)
+                       : stalled ? theme::HexU32 (theme::StatusWarn)
+                                 : theme::WhiteU32 (0.25f));
 
-    // Live dot: green while frames are arriving, amber if stalled.
-    double age = ImGui::GetTime () - f.last_frame_at;
-    if (f.connected) {
-      unsigned int c = (f.last_frame_at > 0 && age < 2.0) ? theme::StatusOnline : 0xF59E0B;
-      dl->AddCircleFilled (ImVec2 (p1.x - 12, p0.y + 12), 4.5f, theme::HexU32 (c));
-    }
-
-    dl->AddText (app.fonts.smallMed, theme::fs (11.0f), ImVec2 (p0.x + 2, p1.y + 5), theme::WhiteU32 (0.8f),
-                 f.name.c_str ());
-
-    // Per-feed readout: resolution, decoded frame rate and payload rate.
-    if (app.cfg.show_stats && f.connected) {
-      char line[96];
-      if (f.tex_w > 0)
-        snprintf (line, sizeof (line), "%dx%d  %.0f fps  %.0f Mbps", f.tex_w, f.tex_h, f.fps, f.mbps);
+    char meta[96];
+    if (f.connected && f.tex_w > 0) {
+      char rate[24];
+      if (f.mbps >= 1000.0)
+        snprintf (rate, sizeof (rate), "%.1fGb", f.mbps / 1000.0);
       else
-        snprintf (line, sizeof (line), "no frames yet");
-      dl->AddText (app.fonts.small_, theme::fs (10.0f), ImVec2 (p0.x + 2, p1.y + 5 + theme::fs (13.0f)),
-                   theme::WhiteU32 (0.42f), line);
+        snprintf (rate, sizeof (rate), "%.0fMb", f.mbps);
+      snprintf (meta, sizeof (meta), "%d×%d %.0ffps %s", f.tex_w, f.tex_h, f.fps, rate);
     }
+    else if (f.connected)
+      snprintf (meta, sizeof (meta), "no frames yet");
+    else if (!f.error.empty ())
+      snprintf (meta, sizeof (meta), "error");
+    else
+      snprintf (meta, sizeof (meta), "not connected");
+    draw_mono (app, dl, ImVec2 (m0.x + du (5.0f) + du (5.0f), my + du (1.0f)), meta,
+               f.error.empty () ? theme::WhiteU32 (0.55f) : theme::HexU32 (theme::StatusError, 0.75f), 9.2f);
 
+    if (toggle_switch (app, "sw", f.connected, ImVec2 (t1.x - du (22.0f), my + (meta_h - du (12.0f)) / 2)))
+      toggle_feed = i;
+
+    // ---- gestures ---------------------------------------------------------
     if (hovered) {
       ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
       if (!f.error.empty ())
@@ -1242,11 +1795,11 @@ ui_feed_rail (App & app, float w, float h)
                            placed ? "double-click: full screen · click: remove from canvas"
                                   : "click: add to canvas · double-click: full screen");
     }
-
-    // Double-click punches full screen; a single click adds/removes.
     if (dbl) {
       toggle_fullscreen (app, i);
+      app.inspect_feed = i;
     } else if (hovered && ImGui::IsMouseReleased (ImGuiMouseButton_Left) && !ImGui::IsMouseDragging (0)) {
+      app.inspect_feed = i;
       if (placed) {
         remove_feed_tiles (app, i);
       } else {
@@ -1261,233 +1814,609 @@ ui_feed_rail (App & app, float w, float h)
       }
     }
 
-    ImGui::Dummy (ImVec2 (0, 6));
+    ImGui::SetCursorScreenPos (ImVec2 (p0.x, p0.y + card_h + du (theme::GapTight)));
     ImGui::PopID ();
   }
+  ImGui::EndChild ();
+  ImGui::PopStyleColor ();
+
+  // Deferred: start_feed/stop_feed mutate the feed list's contents, so do it
+  // after the loop rather than under the iteration.
+  if (toggle_feed >= 0) {
+    Feed & f = app.feeds[(size_t) toggle_feed];
+    if (f.connected) {
+      stop_feed (f);
+      remove_feed_tiles (app, toggle_feed); // a source that is gone should not hold canvas space
+      app.fullscreen_feed = -1;
+    } else {
+      start_feed (f);
+      if (f.connected)
+        f.connected_at = ImGui::GetTime ();
+    }
+  }
+
+  ImGui::Dummy (ImVec2 (0, du (theme::Gap) - du (4.0f)));
+  ui_inspector (app, ImGui::GetCursorScreenPos (), cw);
 
   ImGui::EndChild ();
+  ImGui::PopStyleVar (2);
+  ImGui::PopStyleColor ();
 }
 
-// Settings. A real window (not a draw-list overlay) so its widgets receive
-// input reliably; see the ImGui overlay rules the other demos learned the hard
-// way. Changes apply immediately where that is safe, and are written to
-// uavwall.conf on Save.
+// ----------------------------------------------------------------------------
+//  Settings — a real window with a left nav, not one long scrolling form
+// ----------------------------------------------------------------------------
+
+// A card the operator picks between, rather than a combo they have to open.
+// The cost line is what makes the choice informed.
+static bool
+choice_card (App & app, const char * id, const char * title, const char * note, ImVec2 size, bool selected,
+             bool enabled = true)
+{
+  ImGui::PushID (id);
+  ImVec2 p0 = ImGui::GetCursorScreenPos ();
+  ImGui::InvisibleButton ("##card", size);
+  const bool hovered = enabled && ImGui::IsItemHovered ();
+  const bool clicked = hovered && ImGui::IsMouseReleased (ImGuiMouseButton_Left);
+  ImVec2 p1 (p0.x + size.x, p0.y + size.y);
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  const float dim = enabled ? 1.0f : 0.45f;
+
+  if (selected) {
+    dl->AddRectFilled (p0, p1, theme::HexU32 (theme::AccentPrimary, 0.16f * dim), du (8.0f));
+    dl->AddRect (p0, p1, theme::HexU32 (theme::AccentPrimary, dim), du (8.0f), 0, 1.5f);
+  } else {
+    if (hovered)
+      dl->AddRectFilled (p0, p1, theme::WhiteU32 (0.04f), du (8.0f));
+    dl->AddRect (p0, p1, theme::WhiteU32 (theme::ControlStroke * dim), du (8.0f), 0, 1.0f);
+  }
+  dl->AddText (app.fonts.bodyBold, theme::fs (12.0f), ImVec2 (p0.x + du (10.0f), p0.y + du (8.0f)),
+               theme::WhiteU32 (0.88f * dim), title);
+  if (note)
+    draw_mono (app, dl, ImVec2 (p0.x + du (10.0f), p0.y + du (8.0f) + theme::fs (14.0f)), note,
+               theme::WhiteU32 (0.50f * dim), 9.5f);
+  if (hovered)
+    ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+  ImGui::PopID ();
+  return clicked;
+}
+
+// Slider with a mono value and min/mid/max ticks — the stock ImGui slider does
+// not carry its own scale, and these two settings both have a cost story.
+static bool
+instrument_slider (App & app, const char * id, int * v, int lo, int hi, const char * fmt, float w)
+{
+  ImGui::PushID (id);
+  ImVec2 p0 = ImGui::GetCursorScreenPos ();
+  const float h = du (26.0f);
+  ImGui::InvisibleButton ("##sl", ImVec2 (w, h));
+  const bool active = ImGui::IsItemActive ();
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+
+  const float track_h = du (6.0f);
+  const float ty = p0.y + (h - track_h) / 2;
+  const float knob_r = du (6.5f);
+  const float x0 = p0.x + knob_r, x1 = p0.x + w - du (90.0f) - knob_r;
+
+  bool changed = false;
+  if (active) {
+    float t = (ImGui::GetIO ().MousePos.x - x0) / std::max (1.0f, x1 - x0);
+    int nv = lo + (int) std::lround (std::max (0.0f, std::min (1.0f, t)) * (hi - lo));
+    if (nv != *v) {
+      *v = nv;
+      changed = true;
+    }
+  }
+
+  const float frac = (float) (*v - lo) / std::max (1, hi - lo);
+  const float kx = x0 + frac * (x1 - x0);
+  dl->AddRectFilled (ImVec2 (x0 - knob_r, ty), ImVec2 (x1 + knob_r, ty + track_h), theme::WhiteU32 (0.09f),
+                     track_h / 2);
+  dl->AddRectFilled (ImVec2 (x0 - knob_r, ty), ImVec2 (kx, ty + track_h), theme::HexU32 (theme::AccentPrimary),
+                     track_h / 2);
+  dl->AddCircleFilled (ImVec2 (kx, ty + track_h / 2), knob_r, theme::WhiteU32 (1.0f));
+
+  char buf[48];
+  snprintf (buf, sizeof (buf), fmt, *v);
+  draw_mono (app, dl, ImVec2 (x1 + knob_r + du (12.0f), p0.y + (h - theme::fs (10.5f)) / 2), buf,
+             theme::WhiteU32 (0.80f));
+
+  if (ImGui::IsItemHovered ())
+    ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+  ImGui::PopID ();
+  return changed;
+}
+
+static void
+locked_callout (App & app, const char * text, float w)
+{
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 at = ImGui::GetCursorScreenPos ();
+  const float h = du (30.0f);
+  ImVec2 p1 (at.x + w, at.y + h);
+  dl->AddRectFilled (at, p1, theme::HexU32 (theme::StatusError, 0.10f), du (8.0f));
+  dl->AddRect (at, p1, theme::HexU32 (theme::StatusError, 0.30f), du (8.0f), 0, 1.0f);
+  dl->AddCircleFilled (ImVec2 (at.x + du (13.0f), at.y + h / 2), du (3.0f), theme::HexU32 (theme::StatusError));
+  dl->AddText (app.fonts.body, theme::fs (11.5f), ImVec2 (at.x + du (24.0f), at.y + (h - theme::fs (11.5f)) / 2),
+               theme::WhiteU32 (0.75f), text);
+  ImGui::Dummy (ImVec2 (w, h));
+}
+
+// Text field styled for the panel: mono for machine data, DM Sans for names.
+static bool
+panel_field (App & app, const char * id, char * buf, size_t sz, float w, bool mono, bool password = false,
+             bool error = false)
+{
+  ImGui::PushFont (mono ? app.fonts.mono : app.fonts.body);
+  const float pad_y = std::max (2.0f, (du (26.0f) - ImGui::GetFontSize ()) / 2);
+  ImGui::PushStyleVar (ImGuiStyleVar_FramePadding, ImVec2 (du (9.0f), pad_y));
+  ImGui::PushStyleVar (ImGuiStyleVar_FrameRounding, du (theme::RadiusControl2));
+  ImGui::PushStyleVar (ImGuiStyleVar_FrameBorderSize, 1.0f);
+  ImGui::PushStyleColor (ImGuiCol_FrameBg, theme::Hex (0xFFFFFF, theme::PanelFillRaised));
+  ImGui::PushStyleColor (ImGuiCol_Border,
+                         error ? theme::Hex (theme::StatusError, 0.40f) : theme::Hex (0xFFFFFF, theme::ControlStroke));
+  ImGui::SetNextItemWidth (w);
+  bool changed = ImGui::InputText (id, buf, sz, password ? ImGuiInputTextFlags_Password : 0);
+  ImGui::PopStyleColor (2);
+  ImGui::PopStyleVar (3);
+  ImGui::PopFont ();
+  return changed;
+}
+
 static void
 ui_settings (App & app)
 {
   if (!app.show_settings)
     return;
 
-  ImGui::SetNextWindowSize (ImVec2 (560 * theme::scale, 0));
+  const float win_w = du (683.0f), win_h = du (500.0f);
+  ImGui::SetNextWindowSize (ImVec2 (win_w, win_h));
   ImGui::SetNextWindowPos (ImGui::GetMainViewport ()->GetCenter (), ImGuiCond_Appearing, ImVec2 (0.5f, 0.5f));
-  ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.98f));
-  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (18, 16));
-  ImGui::Begin ("Settings", &app.show_settings,
-                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
-                  ImGuiWindowFlags_AlwaysAutoResize);
+  ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.99f));
+  ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (0xFFFFFF, 0.10f));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (0, 0));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowRounding, du (theme::RadiusPanel));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowBorderSize, 1.0f);
+  ImGui::Begin ("##settings", &app.show_settings,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoDocking |
+                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar);
 
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  const ImVec2 win = ImGui::GetWindowPos ();
   const bool live = app.call_started;
 
-  // ---- Conference -------------------------------------------------------
-  ImGui::TextDisabled ("CONFERENCE");
+  // ---- title bar ----------------------------------------------------------
+  const float title_h = du (38.0f);
+  draw_label (app, dl, ImVec2 (win.x + du (17.0f), win.y + (title_h - theme::fs (10.5f)) / 2), "SETTINGS",
+              theme::WhiteU32 (0.85f));
+  draw_mono (app, dl, ImVec2 (win.x + win_w - du (17.0f) - mono_w (app, "uavwall.conf", 10.0f),
+                              win.y + (title_h - theme::fs (10.0f)) / 2),
+             "uavwall.conf", theme::WhiteU32 (0.30f), 10.0f);
+  dl->AddRectFilled (ImVec2 (win.x, win.y + title_h), ImVec2 (win.x + win_w, win.y + title_h + 1),
+                     theme::WhiteU32 (0.07f));
+
+  // ---- left nav -----------------------------------------------------------
+  const float nav_w = du (163.0f);
+  dl->AddRectFilled (ImVec2 (win.x + nav_w, win.y + title_h), ImVec2 (win.x + nav_w + 1, win.y + win_h),
+                     theme::WhiteU32 (0.07f));
   {
-    static char vmr[512], pin[64], name[128];
-    if (ImGui::IsWindowAppearing ()) {
-      snprintf (vmr, sizeof (vmr), "%s", app.cfg.vmr.c_str ());
-      snprintf (pin, sizeof (pin), "%s", app.cfg.pin.c_str ());
-      snprintf (name, sizeof (name), "%s", app.cfg.display_name.c_str ());
+    static const char * tabs[] = {"Conference", "Registration", "Canvas & sending", "Feeds", "Interface"};
+    float y = win.y + title_h + du (8.0f);
+    for (int i = 0; i < 5; i++) {
+      ImVec2 r0 (win.x + du (12.0f), y), r1 (win.x + nav_w - du (12.0f), y + du (27.0f));
+      ImGui::PushID (4000 + i);
+      ImGui::SetCursorScreenPos (r0);
+      ImGui::InvisibleButton ("##nav", ImVec2 (r1.x - r0.x, r1.y - r0.y));
+      const bool hov = ImGui::IsItemHovered ();
+      if (hov && ImGui::IsMouseReleased (ImGuiMouseButton_Left))
+        app.settings_tab = i;
+      const bool sel = app.settings_tab == i;
+      if (sel)
+        dl->AddRectFilled (r0, r1, theme::HexU32 (theme::AccentPrimary, 0.92f), du (8.0f));
+      else if (hov)
+        dl->AddRectFilled (r0, r1, theme::WhiteU32 (0.05f), du (8.0f));
+      dl->AddText (sel ? app.fonts.bodyBold : app.fonts.smallMed, theme::fs (11.7f),
+                   ImVec2 (r0.x + du (10.0f), r0.y + (du (27.0f) - theme::fs (11.7f)) / 2 - du (1.0f)),
+                   sel ? theme::WhiteU32 (1.0f) : theme::WhiteU32 (0.60f), tabs[i]);
+      if (i == 3) {
+        char cnt[16];
+        snprintf (cnt, sizeof (cnt), "%d", (int) app.feeds.size ());
+        draw_mono (app, dl,
+                   ImVec2 (r1.x - du (10.0f) - mono_w (app, cnt, 10.0f), r0.y + (du (27.0f) - theme::fs (10.0f)) / 2),
+                   cnt, sel ? theme::WhiteU32 (0.75f) : theme::WhiteU32 (0.30f), 10.0f);
+      }
+      if (hov)
+        ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+      ImGui::PopID ();
+      y += du (27.0f) + du (4.0f);
     }
-    ImGui::BeginDisabled (live); // changing these mid-call would not take effect
-    if (ImGui::InputText ("VMR (name@server)", vmr, sizeof (vmr)))
-      app.cfg.vmr = vmr;
-    if (ImGui::InputText ("PIN", pin, sizeof (pin), ImGuiInputTextFlags_Password))
-      app.cfg.pin = pin;
-    if (ImGui::InputText ("Display name", name, sizeof (name)))
-      app.cfg.display_name = name;
-    ImGui::EndDisabled ();
-    if (live)
-      ImGui::TextDisabled ("Stop sending to change these.");
+
+    if (live) {
+      ImVec2 c0 (win.x + du (12.0f), win.y + win_h - du (52.0f));
+      ImVec2 c1 (win.x + nav_w - du (12.0f), win.y + win_h - du (12.0f));
+      dl->AddRectFilled (c0, c1, theme::HexU32 (theme::StatusError, 0.10f), du (8.0f));
+      dl->AddText (app.fonts.microCap, theme::fs (8.5f), ImVec2 (c0.x + du (10.0f), c0.y + du (8.0f)),
+                   theme::HexU32 (theme::StatusError, 0.85f), "SENDING");
+      draw_mono (app, dl, ImVec2 (c0.x + du (10.0f), c0.y + du (21.0f)), "live — some", theme::WhiteU32 (0.55f),
+                 9.5f);
+      draw_mono (app, dl, ImVec2 (c0.x + du (10.0f), c0.y + du (31.0f)), "fields locked", theme::WhiteU32 (0.55f),
+                 9.5f);
+    }
   }
 
-  // ---- Registration -----------------------------------------------------
-  ImGui::Dummy (ImVec2 (0, 8));
-  ImGui::TextDisabled ("REGISTRATION");
-  {
-    static char host[256], alias[256], user[256], pass[256];
-    if (ImGui::IsWindowAppearing ()) {
-      snprintf (host, sizeof (host), "%s", app.cfg.reg_host.c_str ());
-      snprintf (alias, sizeof (alias), "%s", app.cfg.reg_alias.c_str ());
-      snprintf (user, sizeof (user), "%s", app.cfg.reg_user.c_str ());
-      snprintf (pass, sizeof (pass), "%s", app.cfg.reg_pass.c_str ());
-    }
+  // ---- panel --------------------------------------------------------------
+  const float pad_x = du (15.0f), pad_y = du (17.0f);
+  const float panel_x = win.x + nav_w + 1 + pad_x;
+  const float panel_w = win_w - nav_w - 1 - pad_x * 2;
+  const float foot_h = du (27.0f);
+  ImGui::SetCursorScreenPos (ImVec2 (panel_x, win.y + title_h + pad_y));
 
-    int rs = app.reg_status.load ();
-    bool registered = rs == PULSE_CONNECTION_STATUS_CONNECTED;
-    bool busy = app.reg_in_flight.load () || rs == PULSE_CONNECTION_STATUS_CONNECTING ||
-                rs == PULSE_CONNECTION_STATUS_DISCONNECTING;
+  // Rows advance from an explicit origin. Reading the cursor back after a
+  // widget instead would compound each control's own height into the gap, and
+  // the form would drift further apart with every field.
+  float row_y = 0.0f;
+  auto seek = [&] (float y) {
+    row_y = y;
+    ImGui::SetCursorScreenPos (ImVec2 (panel_x, row_y));
+  };
+  auto heading = [&] (const char * title, const char * sub) {
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    draw_label (app, dl, at, title, theme::WhiteU32 (theme::TextLabel));
+    dl->AddText (app.fonts.body, theme::fs (11.5f), ImVec2 (at.x, at.y + du (16.0f)), theme::WhiteU32 (0.40f), sub);
+    seek (at.y + du (16.0f) + theme::fs (11.5f) + du (13.0f));
+  };
+  auto gap = [&] (float g = 8.0f) { seek (row_y + du (g)); };
+  auto row = [&] (const char * label) {
+    dl->AddText (app.fonts.smallMed, theme::fs (12.0f),
+                 ImVec2 (panel_x, row_y + (du (26.0f) - theme::fs (12.0f)) / 2), theme::WhiteU32 (0.70f), label);
+    ImGui::SetCursorScreenPos (ImVec2 (panel_x + du (125.0f), row_y));
+  };
+  auto next_row = [&] (float rh = 26.0f) { seek (row_y + du (rh) + du (6.0f)); };
 
-    ImGui::BeginDisabled (registered || busy);
-    if (ImGui::InputText ("Host / domain", host, sizeof (host)))
-      app.cfg.reg_host = host;
-    if (ImGui::InputText ("Device alias", alias, sizeof (alias)))
-      app.cfg.reg_alias = alias;
-    if (ImGui::InputText ("Username", user, sizeof (user)))
-      app.cfg.reg_user = user;
-    if (ImGui::InputText ("Password", pass, sizeof (pass), ImGuiInputTextFlags_Password))
-      app.cfg.reg_pass = pass;
+  static char vmr[512], pin[64], dname[128], host[256], alias[256], user[256], pass[256];
+  if (ImGui::IsWindowAppearing ()) {
+    snprintf (vmr, sizeof (vmr), "%s", app.cfg.vmr.c_str ());
+    snprintf (pin, sizeof (pin), "%s", app.cfg.pin.c_str ());
+    snprintf (dname, sizeof (dname), "%s", app.cfg.display_name.c_str ());
+    snprintf (host, sizeof (host), "%s", app.cfg.reg_host.c_str ());
+    snprintf (alias, sizeof (alias), "%s", app.cfg.reg_alias.c_str ());
+    snprintf (user, sizeof (user), "%s", app.cfg.reg_user.c_str ());
+    snprintf (pass, sizeof (pass), "%s", app.cfg.reg_pass.c_str ());
+  }
+
+  switch (app.settings_tab) {
+  case 0: { // ---- Conference ----------------------------------------------
+    heading ("CONFERENCE", "Where the composed canvas is sent.");
+    ImGui::BeginDisabled (live);
+    row ("VMR");
+    if (panel_field (app, "##svmr", vmr, sizeof (vmr), du (300.0f), true))
+      app.cfg.vmr = vmr;
+    next_row ();
+    row ("PIN");
+    if (panel_field (app, "##spin", pin, sizeof (pin), du (120.0f), true, true))
+      app.cfg.pin = pin;
+    next_row ();
+    row ("Display name");
+    if (panel_field (app, "##sdn", dname, sizeof (dname), du (300.0f), false))
+      app.cfg.display_name = dname;
+    next_row ();
     ImGui::EndDisabled ();
 
-    ImGui::Checkbox ("Register on startup", &app.cfg.reg_auto);
-    ImGui::Checkbox ("Answer incoming calls automatically", &app.cfg.auto_accept);
+    if (live) {
+      locked_callout (app, "Locked while sending. Stop sending to change the destination.", panel_w);
+      gap (12.0f);
+    }
 
-    ImGui::BeginDisabled (busy);
+    // The rest of the file at a glance, so the operator can see the whole
+    // configuration without leaving the panel.
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    draw_label (app, dl, at, "ALSO IN THIS FILE", theme::WhiteU32 (theme::TextLabel), 9.0f);
+    char sum[256];
+    snprintf (sum, sizeof (sum), "canvas=%dx%d  send_fps=%d", app.cfg.canvas_w, app.cfg.canvas_h, app.cfg.send_fps);
+    draw_mono (app, dl, ImVec2 (at.x, at.y + du (16.0f)), sum, theme::WhiteU32 (0.45f), 9.5f);
+    snprintf (sum, sizeof (sum), "send_as=%s  rtsp_transport=%s", app.cfg.send_as_content ? "content" : "main",
+              app.cfg.rtsp_tcp ? "tcp" : "udp");
+    draw_mono (app, dl, ImVec2 (at.x, at.y + du (28.0f)), sum, theme::WhiteU32 (0.45f), 9.5f);
+    break;
+  }
+
+  case 1: { // ---- Registration --------------------------------------------
+    heading ("REGISTRATION", "Register the wall so a conference can dial it.");
+    const int rs = app.reg_status.load ();
+    const bool registered = rs == PULSE_CONNECTION_STATUS_CONNECTED;
+    const bool busy = app.reg_in_flight.load () || rs == PULSE_CONNECTION_STATUS_CONNECTING ||
+                      rs == PULSE_CONNECTION_STATUS_DISCONNECTING;
+
+    ImGui::BeginDisabled (registered || busy);
+    row ("Host / domain");
+    if (panel_field (app, "##shost", host, sizeof (host), du (300.0f), true))
+      app.cfg.reg_host = host;
+    next_row ();
+    row ("Device alias");
+    if (panel_field (app, "##salias", alias, sizeof (alias), du (300.0f), true))
+      app.cfg.reg_alias = alias;
+    next_row ();
+    row ("Username");
+    if (panel_field (app, "##suser", user, sizeof (user), du (220.0f), false))
+      app.cfg.reg_user = user;
+    next_row ();
+    row ("Password");
+    if (panel_field (app, "##spass", pass, sizeof (pass), du (220.0f), false, true))
+      app.cfg.reg_pass = pass;
+    next_row ();
+    ImGui::EndDisabled ();
+
+    row ("Register at startup");
+    if (toggle_switch (app, "regauto", app.cfg.reg_auto, ImGui::GetCursorScreenPos (), 28.0f, 15.0f))
+      app.cfg.reg_auto = !app.cfg.reg_auto;
+    next_row (18.0f);
+    row ("Answer automatically");
+    if (toggle_switch (app, "autoacc", app.cfg.auto_accept, ImGui::GetCursorScreenPos (), 28.0f, 15.0f))
+      app.cfg.auto_accept = !app.cfg.auto_accept;
+    next_row (18.0f);
+    gap (6.0f);
+
+    const float bw = label_w (app, "DEREGISTER", 9.5f) + du (15.0f) * 2;
     if (registered) {
-      if (pill_button (app, "Deregister", theme::StatusError, ImVec2 (110, 26), true))
+      if (deck_button (app, "dereg", "DEREGISTER", ImVec2 (bw, du (27.0f)), theme::StatusError, Btn::Outline, !busy))
         start_deregister (app);
     } else {
-      if (pill_button (app, "Register", theme::AccentPrimary, ImVec2 (110, 26), true)) {
+      if (deck_button (app, "reg", "REGISTER", ImVec2 (bw, du (27.0f)), theme::AccentPrimary, Btn::Fill, !busy)) {
         save_config (app);
         start_register (app);
       }
     }
-    ImGui::EndDisabled ();
-    ImGui::SameLine ();
-    ImGui::TextDisabled ("%s", registered ? "registered" : busy ? "working…" : "not registered");
-    ImGui::TextDisabled ("Lets a conference dial the wall, and enables directory search.");
+    ImGui::SameLine (0.0f, du (12.0f));
+    {
+      ImVec2 at = ImGui::GetCursorScreenPos ();
+      const char * word = registered ? "REGISTERED" : busy ? "WORKING…" : "NOT REGISTERED";
+      draw_mono (app, dl, ImVec2 (at.x, at.y + du (8.0f)), word,
+                 registered ? theme::HexU32 (theme::StatusOnline, 0.9f) : theme::WhiteU32 (0.40f));
+    }
+    break;
   }
 
-  // ---- Canvas & sending -------------------------------------------------
-  ImGui::Dummy (ImVec2 (0, 8));
-  ImGui::TextDisabled ("CANVAS & SENDING");
-  {
-    // Presets rather than free entry: these are the sizes that make sense for
-    // a conference, and the cost difference between them is significant.
+  case 2: { // ---- Canvas & sending ----------------------------------------
+    heading ("CANVAS & SENDING", "What the far end receives, and how it arrives.");
     static const struct
     {
-      const char * label;
+      const char * title;
+      const char * note;
       int w, h;
-    } sizes[] = {{"1920x1080 (default)", 1920, 1080}, {"1280x720 (about half the compositing cost)", 1280, 720},
-                 {"960x540 (lightest)", 960, 540}};
+    } sizes[] = {{"1920×1080", "78% CPU · 16.6 ms", 1920, 1080},
+                 {"1280×720", "48% CPU · half the pixels", 1280, 720},
+                 {"960×540", "lightest", 960, 540}};
 
-    int current = 0;
-    for (int i = 0; i < 3; i++)
-      if (sizes[i].w == app.cfg.canvas_w && sizes[i].h == app.cfg.canvas_h)
-        current = i;
-
-    if (ImGui::BeginCombo ("Send resolution", sizes[current].label)) {
-      for (int i = 0; i < 3; i++) {
-        if (ImGui::Selectable (sizes[i].label, i == current) &&
-            (sizes[i].w != app.cfg.canvas_w || sizes[i].h != app.cfg.canvas_h)) {
-          // Rescale existing tiles so the layout survives the change.
-          float sx = (float) sizes[i].w / app.cfg.canvas_w;
-          float sy = (float) sizes[i].h / app.cfg.canvas_h;
-          for (Tile & t : app.tiles) {
-            t.x *= sx;
-            t.y *= sy;
-            t.w *= sx;
-            t.h *= sy;
-          }
-          app.cfg.canvas_w = sizes[i].w;
-          app.cfg.canvas_h = sizes[i].h;
-          // push_canvas notices the size change and reconfigures the session.
+    const float cw = (panel_w - du (8.0f) * 2) / 3, cardh = du (46.0f);
+    ImVec2 base = ImGui::GetCursorScreenPos ();
+    for (int i = 0; i < 3; i++) {
+      ImGui::SetCursorScreenPos (ImVec2 (base.x + (cw + du (8.0f)) * i, base.y));
+      const bool sel = sizes[i].w == app.cfg.canvas_w && sizes[i].h == app.cfg.canvas_h;
+      char cid[16];
+      snprintf (cid, sizeof (cid), "sz%d", i);
+      if (choice_card (app, cid, sizes[i].title, sizes[i].note, ImVec2 (cw, cardh), sel) && !sel) {
+        // Rescale existing tiles so the layout survives the change.
+        float sx = (float) sizes[i].w / app.cfg.canvas_w, sy = (float) sizes[i].h / app.cfg.canvas_h;
+        for (Tile & t : app.tiles) {
+          t.x *= sx;
+          t.y *= sy;
+          t.w *= sx;
+          t.h *= sy;
         }
+        app.cfg.canvas_w = sizes[i].w;
+        app.cfg.canvas_h = sizes[i].h;
       }
-      ImGui::EndCombo ();
     }
+    seek (base.y + cardh + du (16.0f));
 
-    ImGui::SliderInt ("Send frame rate", &app.cfg.send_fps, 10, 30, "%d fps");
-    ImGui::TextDisabled ("Lower is cheaper; 25-30 looks smooth for moving imagery.");
+    row ("Frame rate");
+    instrument_slider (app, "fps", &app.cfg.send_fps, 10, 30, "%d fps", panel_w - du (125.0f));
+    next_row ();
+    gap (4.0f);
 
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    draw_label (app, dl, at, "SEND AS", theme::WhiteU32 (theme::TextLabel), 9.0f);
+    seek (at.y + du (18.0f));
+    base = ImGui::GetCursorScreenPos ();
+    const float cw2 = (panel_w - du (8.0f)) / 2;
     ImGui::BeginDisabled (live);
-    static const char * as[] = {"Main video (as this participant's camera)", "Content (the presentation stream)"};
-    int mode = app.cfg.send_as_content ? 1 : 0;
-    if (ImGui::Combo ("Send as", &mode, as, 2))
-      app.cfg.send_as_content = (mode == 1);
+    ImGui::SetCursorScreenPos (base);
+    if (choice_card (app, "asmain", "Main video", "replaces our camera", ImVec2 (cw2, cardh), !app.cfg.send_as_content,
+                     !live))
+      app.cfg.send_as_content = false;
+    ImGui::SetCursorScreenPos (ImVec2 (base.x + cw2 + du (8.0f), base.y));
+    if (choice_card (app, "ascont", "Content", "shown alongside people", ImVec2 (cw2, cardh),
+                     app.cfg.send_as_content, !live))
+      app.cfg.send_as_content = true;
     ImGui::EndDisabled ();
-    ImGui::TextDisabled ("%s", app.cfg.send_as_content
-                                 ? "Most endpoints show content alongside the participants."
-                                 : "Replaces our camera; every endpoint can show it.");
+    seek (base.y + cardh + du (10.0f));
+    if (live)
+      locked_callout (app, "Locked while sending. Stop sending to change the stream.", panel_w);
+    break;
   }
 
-  // ---- Feeds ------------------------------------------------------------
-  ImGui::Dummy (ImVec2 (0, 8));
-  ImGui::TextDisabled ("FEEDS");
-  {
+  case 3: { // ---- Feeds ---------------------------------------------------
+    heading ("FEEDS", "The RTSP sources this wall can place on the canvas.");
     ImGui::BeginDisabled (live);
-    static const char * transports[] = {"TCP (most IP cameras)", "UDP"};
-    int t = app.cfg.rtsp_tcp ? 0 : 1;
-    if (ImGui::Combo ("Transport", &t, transports, 2))
-      app.cfg.rtsp_tcp = (t == 0);
-    ImGui::SliderInt ("Jitter buffer", &app.cfg.rtsp_latency_ms, 0, 1000, "%d ms");
+    row ("Transport");
+    {
+      static const char * tr[] = {"TCP", "UDP"};
+      int hit = segmented (app, "tr", tr, 2, app.cfg.rtsp_tcp ? 0 : 1, du (58.0f), du (26.0f));
+      if (hit >= 0)
+        app.cfg.rtsp_tcp = (hit == 0);
+    }
+    next_row ();
+    row ("Jitter buffer");
+    instrument_slider (app, "jit", &app.cfg.rtsp_latency_ms, 0, 1000, "%d ms", panel_w - du (125.0f));
+    next_row ();
     ImGui::EndDisabled ();
-    ImGui::Checkbox ("Connect all feeds on startup", &app.cfg.autoconnect);
+    row ("Connect at startup");
+    if (toggle_switch (app, "autoconn", app.cfg.autoconnect, ImGui::GetCursorScreenPos (), 28.0f, 15.0f))
+      app.cfg.autoconnect = !app.cfg.autoconnect;
+    next_row (18.0f);
+    gap (4.0f);
 
-    ImGui::Dummy (ImVec2 (0, 4));
-    int remove = -1;
+    // ---- table ------------------------------------------------------------
+    const float col_name = du (98.0f), col_state = du (80.0f);
+    const float col_url = panel_w - col_name - col_state - du (16.0f);
+    ImVec2 hdr = ImGui::GetCursorScreenPos ();
+    dl->AddText (app.fonts.microCap, theme::fs (8.5f), hdr, theme::WhiteU32 (0.30f), "NAME");
+    dl->AddText (app.fonts.microCap, theme::fs (8.5f), ImVec2 (hdr.x + col_name + du (8.0f), hdr.y),
+                 theme::WhiteU32 (0.30f), "RTSP URL");
+    dl->AddText (app.fonts.microCap, theme::fs (8.5f),
+                 ImVec2 (hdr.x + col_name + col_url + du (16.0f), hdr.y), theme::WhiteU32 (0.30f), "STATE");
+    seek (hdr.y + du (14.0f));
+
+    const float rows_h = win.y + win_h - ImGui::GetCursorScreenPos ().y - foot_h - pad_y - du (36.0f);
+    ImGui::BeginChild ("##feedrows", ImVec2 (panel_w, std::max (du (40.0f), rows_h)));
+    ImDrawList * rdl = ImGui::GetWindowDrawList ();
+    int remove = -1, toggle = -1;
     for (int i = 0; i < (int) app.feeds.size (); i++) {
-      ImGui::PushID (2000 + i);
+      Feed & f = app.feeds[(size_t) i];
+      ImGui::PushID (5000 + i);
+      ImVec2 r0 = ImGui::GetCursorScreenPos ();
+
       char nbuf[128], ubuf[512];
-      snprintf (nbuf, sizeof (nbuf), "%s", app.feeds[i].name.c_str ());
-      snprintf (ubuf, sizeof (ubuf), "%s", app.feeds[i].url.c_str ());
+      snprintf (nbuf, sizeof (nbuf), "%s", f.name.c_str ());
+      snprintf (ubuf, sizeof (ubuf), "%s", f.url.c_str ());
 
-      ImGui::SetNextItemWidth (110 * theme::scale);
-      if (ImGui::InputText ("##n", nbuf, sizeof (nbuf)))
-        app.feeds[i].name = nbuf;
-      ImGui::SameLine ();
-      ImGui::SetNextItemWidth (-90 * theme::scale);
-      if (ImGui::InputText ("##u", ubuf, sizeof (ubuf)))
-        app.feeds[i].url = ubuf;
-      ImGui::SameLine ();
-      ImGui::BeginDisabled (app.feeds[i].connected);
-      if (ImGui::Button ("Remove"))
-        remove = i;
-      ImGui::EndDisabled ();
+      ImGui::SetCursorScreenPos (r0);
+      ImGui::PushFont (app.fonts.bodyBold);
+      if (panel_field (app, "##fn", nbuf, sizeof (nbuf), col_name, false))
+        f.name = nbuf;
+      ImGui::PopFont ();
+
+      ImGui::SetCursorScreenPos (ImVec2 (r0.x + col_name + du (8.0f), r0.y));
+      if (panel_field (app, "##fu", ubuf, sizeof (ubuf), col_url, true, false, !f.error.empty ()))
+        f.url = ubuf;
+
+      const float sx = r0.x + col_name + col_url + du (16.0f);
+      if (toggle_switch (app, "fsw", f.connected, ImVec2 (sx, r0.y + du (7.0f)), 26.0f, 14.0f))
+        toggle = i;
+      const char * st = feed_stalled (f)  ? "STALLED"
+                        : feed_live (f)   ? "LIVE"
+                        : !f.error.empty () ? "ERROR"
+                                            : "OFF";
+      ImU32 sc = feed_stalled (f)     ? theme::HexU32 (theme::StatusWarn)
+                 : feed_live (f)      ? theme::HexU32 (theme::StatusOnline)
+                 : !f.error.empty () ? theme::HexU32 (theme::StatusError)
+                                     : theme::WhiteU32 (0.35f);
+      rdl->AddText (app.fonts.label, theme::fs (8.3f), ImVec2 (sx + du (32.0f), r0.y + du (9.0f)), sc, st);
+
+      ImGui::SetCursorScreenPos (ImVec2 (r0.x, r0.y + du (30.0f)));
       ImGui::PopID ();
+      (void) remove;
     }
-    if (remove >= 0) {
-      remove_feed_tiles (app, remove);
-      stop_feed (app.feeds[(size_t) remove]);
-      app.feeds.erase (app.feeds.begin () + remove);
-      // Tiles reference feeds by index, so anything after the removed one
-      // shifts down.
-      for (Tile & tl : app.tiles)
-        if (tl.feed > remove)
-          tl.feed--;
-      app.fullscreen_feed = -1;
+    ImGui::EndChild ();
+
+    if (toggle >= 0) {
+      Feed & f = app.feeds[(size_t) toggle];
+      if (f.connected) {
+        stop_feed (f);
+        remove_feed_tiles (app, toggle);
+        app.fullscreen_feed = -1;
+      } else {
+        start_feed (f);
+        if (f.connected)
+          f.connected_at = ImGui::GetTime ();
+      }
     }
-    if (ImGui::Button ("Add feed")) {
-      Feed f;
-      char buf[64];
-      snprintf (buf, sizeof (buf), "FEED %02d", (int) app.feeds.size () + 1);
-      f.name = buf; // a plain placeholder; rename it to a callsign
-      f.url = "rtsp://";
-      app.feeds.push_back (std::move (f));
+
+    seek (win.y + win_h - foot_h - pad_y - du (32.0f));
+    {
+      // Dashed outline: this row adds something that is not there yet.
+      ImVec2 a0 = ImGui::GetCursorScreenPos ();
+      const float aw = du (93.0f), ah = du (24.0f);
+      ImGui::InvisibleButton ("##addfeed", ImVec2 (aw, ah));
+      const bool hov = ImGui::IsItemHovered ();
+      ImVec2 a1 (a0.x + aw, a0.y + ah);
+      const float dash = du (4.0f);
+      ImU32 dc = theme::WhiteU32 (hov ? 0.40f : 0.20f);
+      for (float x = a0.x; x < a1.x; x += dash * 2) {
+        dl->AddLine (ImVec2 (x, a0.y), ImVec2 (std::min (x + dash, a1.x), a0.y), dc, 1.0f);
+        dl->AddLine (ImVec2 (x, a1.y), ImVec2 (std::min (x + dash, a1.x), a1.y), dc, 1.0f);
+      }
+      for (float y = a0.y; y < a1.y; y += dash * 2) {
+        dl->AddLine (ImVec2 (a0.x, y), ImVec2 (a0.x, std::min (y + dash, a1.y)), dc, 1.0f);
+        dl->AddLine (ImVec2 (a1.x, y), ImVec2 (a1.x, std::min (y + dash, a1.y)), dc, 1.0f);
+      }
+      float tw = label_w (app, "+ ADD FEED", 9.2f);
+      dl->AddText (app.fonts.label, theme::fs (9.2f),
+                   ImVec2 (a0.x + (aw - tw) / 2, a0.y + (ah - theme::fs (9.2f)) / 2), theme::WhiteU32 (0.55f),
+                   "+ ADD FEED");
+      if (hov)
+        ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+      if (hov && ImGui::IsMouseReleased (ImGuiMouseButton_Left)) {
+        Feed nf;
+        char buf[64];
+        snprintf (buf, sizeof (buf), "FEED %02d", (int) app.feeds.size () + 1);
+        nf.name = buf;
+        nf.url = "rtsp://";
+        app.feeds.push_back (std::move (nf));
+      }
     }
+    break;
   }
 
-  // ---- Interface --------------------------------------------------------
-  ImGui::Dummy (ImVec2 (0, 8));
-  ImGui::TextDisabled ("INTERFACE");
-  ImGui::SliderFloat ("UI scale", &app.cfg.ui_scale, 0.8f, 2.0f, "%.2f");
-  ImGui::TextDisabled ("Applies on next start.");
-  ImGui::Checkbox ("Show stats", &app.cfg.show_stats);
-
-  // ---- Save -------------------------------------------------------------
-  ImGui::Dummy (ImVec2 (0, 10));
-  if (pill_button (app, "Save", theme::AccentPrimary, ImVec2 (100, 28), true)) {
-    save_config (app);
-    g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
-    g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
-    set_status (app, "Saved to uavwall.conf");
-    app.show_settings = false;
+  default: { // ---- Interface ----------------------------------------------
+    heading ("INTERFACE", "How the wall itself is drawn.");
+    row ("UI scale");
+    {
+      int pct = (int) std::lround (app.cfg.ui_scale * 100.0f);
+      if (instrument_slider (app, "uis", &pct, 80, 200, "%d%%", panel_w - du (125.0f)))
+        app.cfg.ui_scale = pct / 100.0f;
+    }
+    next_row ();
+    {
+      ImVec2 at = ImGui::GetCursorScreenPos ();
+      dl->AddText (app.fonts.body, theme::fs (11.0f), ImVec2 (at.x + du (125.0f), at.y), theme::WhiteU32 (0.40f),
+                   "Applies on next start.");
+      seek (at.y + du (22.0f));
+    }
+    row ("Show stats");
+    if (toggle_switch (app, "shstats", app.cfg.show_stats, ImGui::GetCursorScreenPos (), 28.0f, 15.0f))
+      app.cfg.show_stats = !app.cfg.show_stats;
+    next_row (18.0f);
+    break;
   }
-  ImGui::SameLine ();
-  if (ImGui::Button ("Close", ImVec2 (100, 28)))
-    app.show_settings = false;
+  }
+
+  // ---- footer -------------------------------------------------------------
+  {
+    const float sw = label_w (app, "SAVE", 9.5f) + du (15.0f) * 2;
+    const float cw = label_w (app, "CLOSE", 9.5f) + du (15.0f) * 2;
+    float fx = win.x + win_w - pad_x - cw;
+    ImGui::SetCursorScreenPos (ImVec2 (fx, win.y + win_h - pad_y - foot_h));
+    if (deck_button (app, "sclose", "CLOSE", ImVec2 (cw, foot_h), 0xFFFFFF, Btn::Outline))
+      app.show_settings = false;
+    fx -= sw + du (8.0f);
+    ImGui::SetCursorScreenPos (ImVec2 (fx, win.y + win_h - pad_y - foot_h));
+    if (deck_button (app, "ssave", "SAVE", ImVec2 (sw, foot_h), theme::AccentPrimary, Btn::Fill)) {
+      save_config (app);
+      g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
+      g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
+      set_status (app, "Saved to uavwall.conf");
+      app.show_settings = false;
+    }
+  }
 
   ImGui::End ();
-  ImGui::PopStyleVar ();
-  ImGui::PopStyleColor ();
+  ImGui::PopStyleVar (3);
+  ImGui::PopStyleColor (2);
+}
+
+// A coloured strip along the top edge of an overlay window — the same tally
+// language as the main window, so "this is urgent" reads the same everywhere.
+static void
+overlay_strip (ImU32 col)
+{
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 p = ImGui::GetWindowPos ();
+  float w = ImGui::GetWindowSize ().x;
+  dl->PushClipRect (p, ImVec2 (p.x + w, p.y + du (14.0f)), true);
+  dl->AddRectFilled (p, ImVec2 (p.x + w, p.y + du (3.0f)), col, du (theme::RadiusDeck),
+                     ImDrawFlags_RoundCornersTop);
+  dl->PopClipRect ();
 }
 
 // Incoming-call banner. A real window, top-centre, so its buttons are reliably
@@ -1504,63 +2433,301 @@ ui_incoming (App & app, ImVec2 win_size)
     from = app.incoming_from;
     alias = app.incoming_alias;
   }
+  const bool busy = app.incoming_busy.load ();
 
   ImVec2 vp = ImGui::GetMainViewport ()->Pos;
-  ImGui::SetNextWindowPos (ImVec2 (vp.x + win_size.x / 2, vp.y + 70), ImGuiCond_Always, ImVec2 (0.5f, 0.0f));
-  ImGui::SetNextWindowSize (ImVec2 ((app.incoming_busy.load () ? 460.0f : 400.0f) * theme::scale, 0));
-  ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.98f));
-  ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (theme::AccentPrimary, 0.5f));
-  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (18, 16));
+  ImGui::SetNextWindowPos (ImVec2 (vp.x + win_size.x / 2, vp.y + du (70.0f)), ImGuiCond_Always, ImVec2 (0.5f, 0.0f));
+  ImGui::SetNextWindowSize (ImVec2 (du (busy ? 430.0f : 380.0f), 0));
+  ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.99f));
+  ImGui::PushStyleColor (ImGuiCol_Border,
+                         busy ? theme::Hex (theme::StatusError, 0.55f) : theme::Hex (theme::AccentPrimary, 0.55f));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (du (16.0f), du (14.0f)));
   ImGui::PushStyleVar (ImGuiStyleVar_WindowBorderSize, 1.0f);
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowRounding, du (theme::RadiusDeck));
   ImGui::Begin ("##incoming", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
 
-  bool busy = app.incoming_busy.load ();
+  overlay_strip (busy ? theme::HexU32 (theme::StatusError) : theme::HexU32 (theme::AccentPrimary));
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  const float w = ImGui::GetContentRegionAvail ().x;
 
-  ImGui::PushFont (app.fonts.bodyBold);
-  ImGui::TextUnformatted (busy ? "Incoming call — already in a conference" : "Incoming call");
-  ImGui::PopFont ();
-  ImGui::TextDisabled ("%s%s%s", from.c_str (), alias.empty () ? "" : "  ·  ", alias.c_str ());
-  if (busy)
-    ImGui::TextDisabled ("Accepting will leave the conference the wall is in now.");
-  ImGui::Dummy (ImVec2 (0, 8));
+  ImGui::Dummy (ImVec2 (0, du (2.0f)));
+  {
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    draw_label (app, dl, at, "INCOMING CALL",
+                busy ? theme::HexU32 (theme::StatusError) : theme::HexU32 (theme::AccentPrimary));
+    ImGui::Dummy (ImVec2 (0, du (15.0f)));
+  }
+  {
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    dl->AddText (app.fonts.bodyBold, theme::fs (13.3f), at, theme::WhiteU32 (0.92f),
+                 from.empty () ? "Unknown caller" : from.c_str ());
+    ImGui::Dummy (ImVec2 (0, theme::fs (15.0f)));
+  }
+  if (!alias.empty ()) {
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    draw_mono (app, dl, at, alias.c_str (), theme::WhiteU32 (0.42f), 10.4f);
+    ImGui::Dummy (ImVec2 (0, theme::fs (12.0f)));
+  }
 
+  const float bh = du (28.0f);
   if (busy) {
-    if (pill_button (app, "Disconnect and accept", theme::StatusError, ImVec2 (220, 30), true))
-      app.incoming_answer.store (1);
-    ImGui::SameLine ();
-    if (pill_button (app, "Reject", theme::AccentPrimary, ImVec2 (120, 30), true))
+    // Explain the consequence before offering the button that causes it.
+    ImGui::Dummy (ImVec2 (0, du (6.0f)));
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    const float eh = du (34.0f);
+    dl->AddRectFilled (at, ImVec2 (at.x + w, at.y + eh), theme::WhiteU32 (0.05f), du (8.0f));
+    char msg[320];
+    snprintf (msg, sizeof (msg), "Accepting leaves %s — the wall", app.cfg.vmr.c_str ());
+    dl->AddText (app.fonts.body, theme::fs (11.0f), ImVec2 (at.x + du (10.0f), at.y + du (6.0f)),
+                 theme::WhiteU32 (0.75f), msg);
+    dl->AddText (app.fonts.body, theme::fs (11.0f), ImVec2 (at.x + du (10.0f), at.y + du (19.0f)),
+                 theme::WhiteU32 (0.75f), "stops sending there first.");
+    ImGui::Dummy (ImVec2 (w, eh + du (10.0f)));
+
+    const float aw = label_w (app, "DISCONNECT & ACCEPT", 9.5f) + du (14.0f) * 2;
+    const float rw = label_w (app, "REJECT", 9.5f) + du (14.0f) * 2;
+    ImVec2 base = ImGui::GetCursorScreenPos ();
+    ImGui::SetCursorScreenPos (ImVec2 (base.x + w - rw, base.y));
+    if (deck_button (app, "inc_rej", "REJECT", ImVec2 (rw, bh), 0xFFFFFF, Btn::Outline))
       app.incoming_answer.store (0);
+    ImGui::SetCursorScreenPos (ImVec2 (base.x + w - rw - aw - du (8.0f), base.y));
+    if (deck_button (app, "inc_acc", "DISCONNECT & ACCEPT", ImVec2 (aw, bh), theme::StatusError, Btn::Fill))
+      app.incoming_answer.store (1);
+    ImGui::SetCursorScreenPos (ImVec2 (base.x, base.y + bh));
   } else {
-    if (pill_button (app, "Accept", theme::StatusOnline, ImVec2 (120, 30), true))
-      app.incoming_answer.store (1);
-    ImGui::SameLine ();
-    if (pill_button (app, "Decline", theme::StatusError, ImVec2 (120, 30), true))
+    const float aw = label_w (app, "ACCEPT", 9.5f) + du (14.0f) * 2;
+    const float dw = label_w (app, "DECLINE", 9.5f) + du (14.0f) * 2;
+    ImGui::Dummy (ImVec2 (0, du (4.0f)));
+    ImVec2 base = ImGui::GetCursorScreenPos ();
+    ImGui::SetCursorScreenPos (ImVec2 (base.x + w - dw, base.y));
+    if (deck_button (app, "inc_dec", "DECLINE", ImVec2 (dw, bh), theme::StatusError, Btn::Outline))
       app.incoming_answer.store (0);
+    ImGui::SetCursorScreenPos (ImVec2 (base.x + w - dw - aw - du (8.0f), base.y));
+    if (deck_button (app, "inc_ok", "ACCEPT", ImVec2 (aw, bh), theme::StatusOnline, Btn::Fill))
+      app.incoming_answer.store (1);
+    ImGui::SetCursorScreenPos (ImVec2 (base.x, base.y + bh));
   }
 
   ImGui::End ();
+  ImGui::PopStyleVar (3);
+  ImGui::PopStyleColor (2);
+}
+
+// PIN entry, shown while a dial-out is parked on on_pin_request. A real modal:
+// ImGui gives it the dimmed backdrop, top-of-stack input routing and keyboard
+// capture, which hand-rolled overlays in this repo have repeatedly not had.
+static void
+ui_pin (App & app)
+{
+  bool pending = app.pin_pending.load ();
+  if (pending && !ImGui::IsPopupOpen ("##pin"))
+    ImGui::OpenPopup ("##pin");
+  if (!ImGui::IsPopupOpen ("##pin"))
+    return;
+
+  ImGui::SetNextWindowPos (ImGui::GetMainViewport ()->GetCenter (), ImGuiCond_Appearing, ImVec2 (0.5f, 0.5f));
+  ImGui::SetNextWindowSize (ImVec2 (du (333.0f), 0));
+  ImGui::PushStyleColor (ImGuiCol_PopupBg, theme::Hex (theme::WindowBgMid, 0.99f));
+  ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (0xFFFFFF, 0.12f));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (du (16.0f), du (15.0f)));
+  ImGui::PushStyleVar (ImGuiStyleVar_PopupRounding, du (theme::RadiusDeck));
+
+  if (ImGui::BeginPopupModal ("##pin", nullptr,
+                              ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    static char buf[32] = "";
+    ImDrawList * dl = ImGui::GetWindowDrawList ();
+    const float w = ImGui::GetContentRegionAvail ().x;
+
+    {
+      ImVec2 at = ImGui::GetCursorScreenPos ();
+      draw_label (app, dl, at, "PIN REQUIRED", theme::WhiteU32 (0.32f));
+      ImGui::Dummy (ImVec2 (0, du (15.0f)));
+    }
+    {
+      ImVec2 at = ImGui::GetCursorScreenPos ();
+      dl->AddText (app.fonts.bodyBold, theme::fs (13.3f), at, theme::WhiteU32 (0.92f),
+                   app.cfg.vmr.empty () ? "this conference" : app.cfg.vmr.c_str ());
+      ImGui::Dummy (ImVec2 (0, theme::fs (15.0f) + du (8.0f)));
+    }
+
+    // The one place a reader stares at individual digits: bigger mono, wide
+    // tracking, and an accent border so the field is obviously the subject.
+    ImGui::PushFont (app.fonts.monoLg);
+    const float pad_y = std::max (2.0f, (du (32.0f) - ImGui::GetFontSize ()) / 2);
+    ImGui::PushStyleVar (ImGuiStyleVar_FramePadding, ImVec2 (du (10.0f), pad_y));
+    ImGui::PushStyleVar (ImGuiStyleVar_FrameRounding, du (theme::RadiusControl2));
+    ImGui::PushStyleVar (ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ImGui::PushStyleColor (ImGuiCol_FrameBg, theme::Hex (0xFFFFFF, theme::PanelFillRaised));
+    ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (theme::AccentPrimary, 0.60f));
+    if (ImGui::IsWindowAppearing ())
+      ImGui::SetKeyboardFocusHere ();
+    ImGui::SetNextItemWidth (w);
+    bool entered = ImGui::InputText ("##pinv", buf, sizeof (buf),
+                                     ImGuiInputTextFlags_Password | ImGuiInputTextFlags_CharsDecimal |
+                                       ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::PopStyleColor (2);
+    ImGui::PopStyleVar (3);
+    ImGui::PopFont ();
+
+    {
+      ImGui::Dummy (ImVec2 (0, du (6.0f)));
+      ImVec2 at = ImGui::GetCursorScreenPos ();
+      dl->AddText (app.fonts.body, theme::fs (10.8f), at, theme::WhiteU32 (0.40f),
+                   app.pin_guest_required.load () ? "This conference requires a PIN to join."
+                                                  : "Enter the host PIN, or join as a guest.");
+      ImGui::Dummy (ImVec2 (0, theme::fs (12.0f) + du (10.0f)));
+    }
+
+    const float bh = du (27.0f);
+    const float jw = label_w (app, "JOIN", 9.5f) + du (15.0f) * 2;
+    const float cw = label_w (app, "CANCEL", 9.5f) + du (15.0f) * 2;
+    ImVec2 base = ImGui::GetCursorScreenPos ();
+    ImGui::SetCursorScreenPos (ImVec2 (base.x + w - cw, base.y));
+    bool cancel = deck_button (app, "pin_c", "CANCEL", ImVec2 (cw, bh), 0xFFFFFF, Btn::Outline);
+    ImGui::SetCursorScreenPos (ImVec2 (base.x + w - cw - jw - du (8.0f), base.y));
+    bool join = deck_button (app, "pin_j", "JOIN", ImVec2 (jw, bh), theme::AccentPrimary, Btn::Fill) || entered;
+    ImGui::SetCursorScreenPos (ImVec2 (base.x, base.y + bh));
+
+    if (pending && join) {
+      {
+        std::lock_guard<std::mutex> lock (app.pin_mutex);
+        app.pin_value = buf;
+      }
+      buf[0] = '\0';
+      app.pin_answer.store (1);
+      ImGui::CloseCurrentPopup ();
+    } else if (pending && cancel) {
+      buf[0] = '\0';
+      app.pin_answer.store (0);
+      ImGui::CloseCurrentPopup ();
+    } else if (!pending) {
+      ImGui::CloseCurrentPopup ();
+    }
+    ImGui::EndPopup ();
+  }
+
   ImGui::PopStyleVar (2);
   ImGui::PopStyleColor (2);
 }
 
-// The send canvas: what the VMR receives, drawn to scale.
+// Feed error: what failed, and the two things worth trying. Replaces a plain
+// tooltip, which could not offer an action.
+static void
+ui_feed_error (App & app, ImVec2 win_size)
+{
+  // The inspected feed is the one an operator is asking about.
+  if (app.inspect_feed < 0 || app.inspect_feed >= (int) app.feeds.size ())
+    return;
+  Feed & f = app.feeds[(size_t) app.inspect_feed];
+  if (f.error.empty ())
+    return;
+
+  ImVec2 vp = ImGui::GetMainViewport ()->Pos;
+  ImGui::SetNextWindowPos (ImVec2 (vp.x + win_size.x / 2, vp.y + win_size.y - du (40.0f)), ImGuiCond_Always,
+                           ImVec2 (0.5f, 1.0f));
+  ImGui::SetNextWindowSize (ImVec2 (du (430.0f), 0));
+  ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.99f));
+  ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (theme::StatusError, 0.40f));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (du (16.0f), du (14.0f)));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowBorderSize, 1.0f);
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowRounding, du (theme::RadiusDeck));
+  ImGui::Begin ("##feederr", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+                  ImGuiWindowFlags_NoFocusOnAppearing);
+
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  const float w = ImGui::GetContentRegionAvail ().x;
+
+  {
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    dl->AddCircleFilled (ImVec2 (at.x + du (3.0f), at.y + theme::fs (10.5f) / 2), du (3.0f),
+                         theme::HexU32 (theme::StatusError));
+    draw_label (app, dl, ImVec2 (at.x + du (12.0f), at.y), "FEED ERROR", theme::HexU32 (theme::StatusError));
+    dl->AddText (app.fonts.label, theme::fs (9.5f),
+                 ImVec2 (at.x + w - label_w (app, f.name.c_str (), 9.5f), at.y), theme::WhiteU32 (0.60f),
+                 f.name.c_str ());
+    ImGui::Dummy (ImVec2 (0, du (18.0f)));
+  }
+
+  auto line = [&] (const char * text, ImU32 col) {
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    dl->AddText (app.fonts.mono, theme::fs (10.0f), at, col, text);
+    ImGui::Dummy (ImVec2 (0, theme::fs (13.0f)));
+  };
+  line (f.url.c_str (), theme::WhiteU32 (0.70f));
+  line (f.error.c_str (), theme::HexU32 (theme::StatusError, 0.90f));
+  line (app.cfg.rtsp_tcp ? "Some cameras only offer UDP. Try switching transport."
+                         : "Some cameras only offer TCP. Try switching transport.",
+        theme::WhiteU32 (0.35f));
+
+  ImGui::Dummy (ImVec2 (0, du (8.0f)));
+  const float bh = du (23.0f);
+  const float rw = label_w (app, "RETRY", 9.5f) + du (14.0f) * 2;
+  const char * swlabel = app.cfg.rtsp_tcp ? "SWITCH TO UDP" : "SWITCH TO TCP";
+  const float sw = label_w (app, swlabel, 9.5f) + du (14.0f) * 2;
+  ImVec2 base = ImGui::GetCursorScreenPos ();
+  if (deck_button (app, "fe_retry", "RETRY", ImVec2 (rw, bh), theme::AccentPrimary, Btn::Fill)) {
+    stop_feed (f);
+    start_feed (f);
+    if (f.connected)
+      f.connected_at = ImGui::GetTime ();
+  }
+  ImGui::SetCursorScreenPos (ImVec2 (base.x + rw + du (8.0f), base.y));
+  if (deck_button (app, "fe_udp", swlabel, ImVec2 (sw, bh), 0xFFFFFF, Btn::Outline)) {
+    // Switches this feed only — the global default is a Settings decision.
+    app.cfg.rtsp_tcp = !app.cfg.rtsp_tcp;
+    g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
+    stop_feed (f);
+    start_feed (f);
+    if (f.connected)
+      f.connected_at = ImGui::GetTime ();
+  }
+  ImGui::SetCursorScreenPos (ImVec2 (base.x, base.y + bh));
+
+  ImGui::End ();
+  ImGui::PopStyleVar (3);
+  ImGui::PopStyleColor (2);
+}
+
+// The send canvas: what the VMR receives, drawn to scale. Square-cornered on
+// purpose — the far end receives a rectangle, and rounding it here would be the
+// UI telling a small lie about the output.
 static void
 ui_canvas (App & app, ImVec2 size)
 {
+  const bool sending = app.input_open && app.conf_status.load () == PULSE_CONNECTION_STATUS_CONNECTED;
+
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (du (10.0f), du (10.0f)));
+  ImGui::PushStyleColor (ImGuiCol_ChildBg, theme::Hex (0xFFFFFF, theme::PanelFill));
+  ImGui::PushStyleVar (ImGuiStyleVar_ChildRounding, du (theme::RadiusDeck));
   ImGui::BeginChild ("##canvas", size, ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
   ImDrawList * dl = ImGui::GetWindowDrawList ();
 
-  // Fit the 16:9 canvas inside the available area.
+  // ---- header -------------------------------------------------------------
+  {
+    ImVec2 at = ImGui::GetCursorScreenPos ();
+    const float cw = ImGui::GetContentRegionAvail ().x;
+    draw_label (app, dl, at, sending ? "PROGRAM · WHAT THE VMR RECEIVES" : "CANVAS · READY TO SEND",
+                theme::WhiteU32 (theme::TextLabel));
+    char spec[128];
+    snprintf (spec, sizeof (spec), "%d×%d · %d fps · H.264 · %s", app.cfg.canvas_w, app.cfg.canvas_h,
+              app.cfg.send_fps, app.cfg.send_as_content ? "CONTENT" : "MAIN");
+    draw_mono (app, dl, ImVec2 (at.x + cw - mono_w (app, spec), at.y - du (1.0f)), spec, theme::WhiteU32 (0.45f));
+    ImGui::Dummy (ImVec2 (0, du (14.0f) + du (theme::GapTight)));
+  }
+
+  // Fit the canvas inside what is left.
   ImVec2 avail = ImGui::GetContentRegionAvail ();
   float scale = std::min (avail.x / app.cfg.canvas_w, avail.y / app.cfg.canvas_h);
   ImVec2 origin = ImGui::GetCursorScreenPos ();
   ImVec2 c0 (origin.x + (avail.x - app.cfg.canvas_w * scale) / 2, origin.y + (avail.y - app.cfg.canvas_h * scale) / 2);
   ImVec2 c1 (c0.x + app.cfg.canvas_w * scale, c0.y + app.cfg.canvas_h * scale);
 
-  dl->AddRectFilled (c0, c1, theme::HexU32 (theme::WindowBgStart), 6.0f);
-  dl->AddRect (c0, c1, theme::WhiteU32 (0.12f), 6.0f);
+  dl->AddRectFilled (c0, c1, theme::HexU32 (theme::WindowBgStart));
 
   auto to_screen = [&] (float cx, float cy) { return ImVec2 (c0.x + cx * scale, c0.y + cy * scale); };
 
@@ -1569,6 +2736,7 @@ ui_canvas (App & app, ImVec2 size)
     if (t.feed < 0 || t.feed >= (int) app.feeds.size ())
       continue;
     Feed & f = app.feeds[t.feed];
+    const bool stalled = feed_stalled (f);
 
     ImVec2 t0 = to_screen (t.x, t.y);
     ImVec2 t1 = to_screen (t.x + t.w, t.y + t.h);
@@ -1577,6 +2745,8 @@ ui_canvas (App & app, ImVec2 size)
       dl->AddImage ((ImTextureID) (intptr_t) f.texture, t0, t1);
     else
       dl->AddRectFilled (t0, t1, theme::WhiteU32 (0.06f));
+    if (stalled)
+      dl->AddRectFilled (t0, t1, theme::HexU32 (theme::StatusWarn, 0.05f));
 
     ImGui::PushID (1000 + i);
 
@@ -1593,9 +2763,11 @@ ui_canvas (App & app, ImVec2 size)
       t.y = std::max (0.0f, std::min ((float) app.cfg.canvas_h - t.h, t.y + d.y / scale));
       app.fullscreen_feed = -1;
     }
+    if (hovered && ImGui::IsMouseReleased (ImGuiMouseButton_Left) && !ImGui::IsMouseDragging (0))
+      app.inspect_feed = t.feed;
 
     // Resize handle, bottom-right.
-    const float grip = 16.0f;
+    const float grip = du (16.0f);
     ImGui::SetCursorScreenPos (ImVec2 (t1.x - grip, t1.y - grip));
     ImGui::InvisibleButton ("##size", ImVec2 (grip, grip));
     bool grip_hover = ImGui::IsItemHovered () || ImGui::IsItemActive ();
@@ -1607,31 +2779,685 @@ ui_canvas (App & app, ImVec2 size)
       app.fullscreen_feed = -1;
     }
 
-    dl->AddRect (t0, t1, hovered || grip_hover ? theme::HexU32 (theme::AccentPrimary) : theme::WhiteU32 (0.25f), 2.0f,
-                 0, hovered || grip_hover ? 2.0f : 1.0f);
-    dl->AddTriangleFilled (ImVec2 (t1.x - grip, t1.y), ImVec2 (t1.x, t1.y - grip), t1,
-                           grip_hover ? theme::HexU32 (theme::AccentPrimary) : theme::WhiteU32 (0.35f));
+    // Grid presets are edge-to-edge, so neighbours want a divider rather than
+    // a box each — a border per tile would double up to 2px on every seam.
+    dl->AddRect (t0, t1, theme::WhiteU32 (theme::TileStroke), 0, 0, 1.0f);
+    if (hovered || grip_hover) {
+      dl->AddRect (t0, t1, theme::HexU32 (theme::AccentPrimary), 0, 0, 2.0f);
+      dl->AddTriangleFilled (ImVec2 (t1.x - grip, t1.y), ImVec2 (t1.x, t1.y - grip), t1,
+                             theme::HexU32 (theme::AccentPrimary));
+    }
+    const bool selected = app.inspect_feed == t.feed;
+    if (selected)
+      dl->AddRect (ImVec2 (t0.x + 1, t0.y + 1), ImVec2 (t1.x - 1, t1.y - 1), theme::HexU32 (theme::AccentPrimary), 0,
+                   0, 2.0f);
 
-    // Name badge.
-    ImVec2 ts = app.fonts.smallMed->CalcTextSizeA (theme::fs (11.0f), FLT_MAX, 0, f.name.c_str ());
-    dl->AddRectFilled (ImVec2 (t0.x + 6, t0.y + 6), ImVec2 (t0.x + 14 + ts.x, t0.y + 12 + ts.y),
-                       theme::HexU32 (theme::WindowBgStart, 0.65f), 4.0f);
-    dl->AddText (app.fonts.smallMed, theme::fs (11.0f), ImVec2 (t0.x + 10, t0.y + 9), theme::WhiteU32 (0.9f),
+    // ---- overlay ----------------------------------------------------------
+    const float pad = du (7.0f);
+    const float badge = du (15.0f);
+    ImVec2 b0 (t0.x + pad, t0.y + pad);
+    dl->AddRectFilled (b0, ImVec2 (b0.x + badge, b0.y + badge),
+                       stalled ? theme::HexU32 (theme::StatusWarn) : theme::HexU32 (theme::AccentPrimary),
+                       du (4.0f));
+    char num[8];
+    snprintf (num, sizeof (num), "%d", i + 1);
+    float nw = label_w (app, num, 9.2f);
+    dl->AddText (app.fonts.label, theme::fs (9.2f),
+                 ImVec2 (b0.x + (badge - nw) / 2, b0.y + (badge - theme::fs (9.2f)) / 2 - du (0.5f)),
+                 stalled ? theme::HexU32 (theme::WindowBgStart) : theme::WhiteU32 (1.0f), num);
+
+    float nx = b0.x + badge + du (6.0f);
+    dl->AddText (app.fonts.label, theme::fs (10.0f), ImVec2 (nx + 1, b0.y + du (2.5f) + 1),
+                 theme::HexU32 (theme::WindowBgStart, 0.75f), f.name.c_str ());
+    dl->AddText (app.fonts.label, theme::fs (10.0f), ImVec2 (nx, b0.y + du (2.5f)), theme::WhiteU32 (0.92f),
                  f.name.c_str ());
+
+    if (stalled) {
+      // The tile says why it is amber, where the operator is already looking.
+      char chip[64];
+      snprintf (chip, sizeof (chip), "LAST FRAME %.1fs", ImGui::GetTime () - f.last_frame_at);
+      float cwid = mono_w (app, chip, 9.0f) + du (10.0f);
+      ImVec2 k0 (nx + label_w (app, f.name.c_str (), 10.0f) + du (7.0f), b0.y + du (1.0f));
+      ImVec2 k1 (k0.x + cwid, k0.y + du (13.0f));
+      dl->AddRect (k0, k1, theme::HexU32 (theme::StatusWarn, 0.55f), du (3.0f), 0, 1.0f);
+      draw_mono (app, dl, ImVec2 (k0.x + du (5.0f), k0.y + du (2.0f)), chip, theme::HexU32 (theme::StatusWarn), 9.0f);
+    }
+
+    if (selected)
+      dl->AddText (app.fonts.label, theme::fs (8.3f), ImVec2 (t0.x + pad, t1.y - pad - theme::fs (8.3f)),
+                   theme::HexU32 (theme::AccentPrimary), "SELECTED");
 
     if (hovered)
       ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
     ImGui::PopID ();
   }
 
+  // Tally, repeated where the operator is actually looking.
+  dl->AddRect (c0, c1, sending ? theme::HexU32 (theme::StatusError, 0.55f) : theme::WhiteU32 (0.14f), 0, 0, 1.0f);
+  if (sending) {
+    const float tick = du (12.0f), th = du (2.0f), off = du (2.0f);
+    const ImU32 tc = theme::HexU32 (theme::StatusError, 0.90f);
+    ImVec2 o0 (c0.x - off, c0.y - off), o1 (c1.x + off, c1.y + off);
+    dl->AddRectFilled (o0, ImVec2 (o0.x + tick, o0.y + th), tc);
+    dl->AddRectFilled (o0, ImVec2 (o0.x + th, o0.y + tick), tc);
+    dl->AddRectFilled (ImVec2 (o1.x - tick, o0.y), ImVec2 (o1.x, o0.y + th), tc);
+    dl->AddRectFilled (ImVec2 (o1.x - th, o0.y), ImVec2 (o1.x, o0.y + tick), tc);
+    dl->AddRectFilled (ImVec2 (o0.x, o1.y - th), ImVec2 (o0.x + tick, o1.y), tc);
+    dl->AddRectFilled (ImVec2 (o0.x, o1.y - tick), ImVec2 (o0.x + th, o1.y), tc);
+    dl->AddRectFilled (ImVec2 (o1.x - tick, o1.y - th), ImVec2 (o1.x, o1.y), tc);
+    dl->AddRectFilled (ImVec2 (o1.x - th, o1.y - tick), ImVec2 (o1.x, o1.y), tc);
+  }
+
   if (app.tiles.empty ()) {
-    const char * msg = "Click a feed to place it · double-click for full screen";
-    ImVec2 ts = app.fonts.body->CalcTextSizeA (theme::fs (13.5f), FLT_MAX, 0, msg);
-    dl->AddText (app.fonts.body, theme::fs (13.5f), ImVec2 ((c0.x + c1.x - ts.x) / 2, (c0.y + c1.y) / 2),
+    const char * msg = "Click a source to place it · double-click for full screen";
+    ImVec2 ts = app.fonts.body->CalcTextSizeA (theme::fs (11.5f), FLT_MAX, 0, msg);
+    dl->AddText (app.fonts.body, theme::fs (11.5f), ImVec2 ((c0.x + c1.x - ts.x) / 2, (c0.y + c1.y) / 2),
                  theme::WhiteU32 (0.35f), msg);
   }
 
   ImGui::EndChild ();
+  ImGui::PopStyleVar (2);
+  ImGui::PopStyleColor ();
+}
+
+// ----------------------------------------------------------------------------
+//  Instrument chrome — tally, header, control deck, alert bar, footer
+// ----------------------------------------------------------------------------
+
+// True when the canvas is actually reaching the far end. This one predicate
+// drives the tally strip, the header readout and the canvas ticks together —
+// one state shown in three places, which is the point of the treatment.
+static bool
+is_on_air (const App & app)
+{
+  return app.input_open && app.conf_status.load () == PULSE_CONNECTION_STATUS_CONNECTED;
+}
+
+// A 3px strip along the very top of the window, drawn outside the shell's
+// padding so it touches the edge. The strongest "we are live" signal there is.
+static void
+ui_tally (App & app, ImGuiViewport * vp)
+{
+  static float lit = 0.0f;
+  const float target = is_on_air (app) ? 1.0f : 0.0f;
+  // ~150ms fade, never a blink.
+  const float step = ImGui::GetIO ().DeltaTime / 0.15f;
+  lit += std::max (-step, std::min (step, target - lit));
+
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 p0 (vp->Pos.x, vp->Pos.y);
+  ImVec2 p1 (vp->Pos.x + vp->Size.x, vp->Pos.y + theme::TallyStrip); // a hairline is a hairline: not scaled
+  dl->AddRectFilled (p0, p1, theme::WhiteU32 (0.07f));
+  if (lit > 0.001f)
+    dl->AddRectFilled (p0, p1, theme::HexU32 (theme::StatusError, lit));
+}
+
+// Identity · state · registration · clock.
+static void
+ui_header (App & app, float width)
+{
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  const float h = du (22.0f);
+  ImVec2 at = ImGui::GetCursorScreenPos ();
+  const float cy = at.y + h / 2;
+  float x = at.x;
+
+  // App mark: a filled rounded square. The design has no icon set at all.
+  const float mark = du (16.0f);
+  dl->AddRectFilled (ImVec2 (x, cy - mark / 2), ImVec2 (x + mark, cy + mark / 2),
+                     theme::HexU32 (theme::AccentPrimary), du (4.0f));
+  x += mark + du (12.0f);
+
+  dl->AddText (app.fonts.label, theme::fs (10.5f), ImVec2 (x, cy - theme::fs (10.5f) / 2 - du (1.0f)),
+               theme::WhiteU32 (theme::TextPrimary), "UAV WALL");
+  x += label_w (app, "UAV WALL") + du (12.0f);
+
+  auto divider = [&] () {
+    dl->AddRectFilled (ImVec2 (x, cy - du (7.0f)), ImVec2 (x + 1, cy + du (7.0f)), theme::WhiteU32 (0.12f));
+    x += 1 + du (12.0f);
+  };
+  divider ();
+
+  const bool live = is_on_air (app);
+  dl->AddCircleFilled (ImVec2 (x + du (3.0f), cy), du (3.0f),
+                       live ? theme::HexU32 (theme::StatusError) : theme::WhiteU32 (0.22f));
+  x += du (6.0f) + du (7.0f);
+
+  const char * word = live ? "ON AIR" : "NOT SENDING";
+  dl->AddText (app.fonts.label, theme::fs (9.5f), ImVec2 (x, cy - theme::fs (9.5f) / 2 - du (1.0f)),
+               live ? theme::HexU32 (theme::StatusError) : theme::WhiteU32 (0.45f), word);
+  x += label_w (app, word, 9.5f) + du (10.0f);
+
+  char detail[256];
+  if (live)
+    snprintf (detail, sizeof (detail), "%s → %s%s", app.cfg.send_as_content ? "CONTENT" : "MAIN VIDEO",
+              app.cfg.vmr.c_str (), app.cfg.send_as_content && app.floor_taken ? " · floor taken" : "");
+  else if (app.call_started)
+    snprintf (detail, sizeof (detail), "connecting to %s", app.cfg.vmr.c_str ());
+  else
+    snprintf (detail, sizeof (detail), "canvas composited on demand");
+  draw_mono (app, dl, ImVec2 (x, cy - theme::fs (10.5f) / 2), detail, theme::WhiteU32 (0.62f));
+
+  // ---- right-hand cluster, laid out from the edge backwards ---------------
+  char clock[32];
+  std::time_t now = std::time (nullptr);
+  std::tm g{};
+#if defined(_WIN32)
+  gmtime_s (&g, &now);
+#else
+  gmtime_r (&now, &g);
+#endif
+  snprintf (clock, sizeof (clock), "%02d:%02d:%02dZ", g.tm_hour, g.tm_min, g.tm_sec);
+
+  float rx = at.x + width;
+  rx -= mono_w (app, clock);
+  draw_mono (app, dl, ImVec2 (rx, cy - theme::fs (10.5f) / 2), clock, theme::WhiteU32 (0.70f));
+  rx -= du (12.0f);
+  dl->AddRectFilled (ImVec2 (rx - 1, cy - du (7.0f)), ImVec2 (rx, cy + du (7.0f)), theme::WhiteU32 (0.12f));
+  rx -= du (12.0f) + 1;
+
+  // Registration is omitted entirely when the wall was never configured to
+  // register — an absent feature should not advertise itself as broken.
+  if (!app.cfg.reg_host.empty ()) {
+    const bool reg = app.reg_status.load () == PULSE_CONNECTION_STATUS_CONNECTED;
+    char rbuf[256];
+    if (reg)
+      snprintf (rbuf, sizeof (rbuf), "REGISTERED %s", app.cfg.reg_alias.c_str ());
+    else
+      snprintf (rbuf, sizeof (rbuf), "NOT REGISTERED");
+    rx -= mono_w (app, rbuf);
+    draw_mono (app, dl, ImVec2 (rx, cy - theme::fs (10.5f) / 2), rbuf,
+               reg ? theme::WhiteU32 (0.50f) : theme::WhiteU32 (0.32f));
+    rx -= du (7.0f) + du (6.0f);
+    if (reg)
+      dl->AddCircleFilled (ImVec2 (rx + du (3.0f), cy), du (3.0f), theme::HexU32 (theme::StatusOnline));
+  }
+
+  ImGui::Dummy (ImVec2 (width, h));
+}
+
+// The control deck: four labelled groups in one panel. Grouping is most of
+// what separates this from the undifferentiated row of pills it replaces.
+static void
+ui_deck (App & app, float width, char * vmr_buf, size_t vmr_sz, char * pin_buf, size_t pin_sz)
+{
+  const float h = du (58.0f);
+  ImVec2 at = ImGui::GetCursorScreenPos ();
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+
+  dl->AddRectFilled (at, ImVec2 (at.x + width, at.y + h), theme::WhiteU32 (theme::PanelFill),
+                     du (theme::RadiusDeck));
+  dl->AddRect (at, ImVec2 (at.x + width, at.y + h), theme::WhiteU32 (theme::PanelStroke), du (theme::RadiusDeck), 0,
+               1.0f);
+
+  const float label_y = at.y + du (theme::DeckPadY);
+  const float ctrl_y = label_y + du (11.0f) + du (theme::GapTight);
+  const float ch = du (theme::ControlH);
+  float x = at.x + du (theme::GroupPadX);
+
+  auto group_label = [&] (const char * text) { draw_label (app, dl, ImVec2 (x, label_y), text, theme::WhiteU32 (theme::TextLabel)); };
+  auto divider = [&] () {
+    x += du (theme::GroupPadX);
+    dl->AddRectFilled (ImVec2 (x, at.y + du (2.0f)), ImVec2 (x + 1, at.y + h - du (2.0f)),
+                       theme::WhiteU32 (theme::PanelStroke));
+    x += 1 + du (theme::GroupPadX);
+  };
+
+  // ---- DESTINATION --------------------------------------------------------
+  group_label ("DESTINATION");
+  {
+    const bool registered = app.reg_status.load () == PULSE_CONNECTION_STATUS_CONNECTED;
+
+    ImGui::PushFont (app.fonts.mono);
+    const float pad_y = std::max (2.0f, (ch - ImGui::GetFontSize ()) / 2);
+    ImGui::PushStyleVar (ImGuiStyleVar_FramePadding, ImVec2 (du (9.0f), pad_y));
+    ImGui::PushStyleVar (ImGuiStyleVar_FrameRounding, du (theme::RadiusControl2));
+    ImGui::PushStyleVar (ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ImGui::PushStyleColor (ImGuiCol_FrameBg, theme::Hex (0xFFFFFF, theme::PanelFillRaised));
+    ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (0xFFFFFF, theme::ControlStroke));
+
+    ImGui::SetCursorScreenPos (ImVec2 (x, ctrl_y));
+    ImGui::SetNextItemWidth (du (208.0f));
+    if (ImGui::InputTextWithHint ("##vmr", registered ? "vmr@server — or search" : "vmr@server", vmr_buf, vmr_sz))
+      app.cfg.vmr = vmr_buf;
+
+    ImVec2 f_min = ImGui::GetItemRectMin (), f_max = ImGui::GetItemRectMax ();
+    const bool field_active = ImGui::IsItemActive ();
+    if (registered)
+      refresh_vmr_hits (app, vmr_buf);
+
+    ImGui::SetCursorScreenPos (ImVec2 (x + du (208.0f) + du (theme::GapTight), ctrl_y));
+    ImGui::SetNextItemWidth (du (62.0f));
+    if (ImGui::InputTextWithHint ("##pin", "PIN", pin_buf, pin_sz, ImGuiInputTextFlags_Password))
+      app.cfg.pin = pin_buf;
+
+    ImGui::PopStyleColor (2);
+    ImGui::PopStyleVar (3);
+    ImGui::PopFont ();
+
+    // Directory search results. The list is kept up while the field is active
+    // OR while the list itself was hovered last frame — never gated on the
+    // field alone, or the click that picks a row unfocuses it first and the
+    // list vanishes before the release lands.
+    bool keep_list = field_active || app.vmr_popup_hovered;
+    if (registered && keep_list && !app.vmr_hits.empty ()) {
+      ImGui::SetNextWindowPos (ImVec2 (f_min.x, f_max.y + du (4.0f)));
+      ImGui::SetNextWindowSize (ImVec2 (f_max.x - f_min.x, 0));
+      ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.98f));
+      ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (du (6.0f), du (6.0f)));
+      ImGui::Begin ("##vmrhits", nullptr,
+                    ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+                      ImGuiWindowFlags_NoFocusOnAppearing);
+      app.vmr_popup_hovered =
+        ImGui::IsWindowHovered (ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_ChildWindows);
+
+      for (size_t i = 0; i < app.vmr_hits.size (); i++) {
+        const App::AliasHit & hit = app.vmr_hits[i];
+        ImGui::PushID ((int) i);
+        std::string row = hit.alias;
+        if (!hit.description.empty ())
+          row += "   " + hit.description;
+        if (ImGui::Selectable (row.c_str ())) {
+          snprintf (vmr_buf, vmr_sz, "%s", hit.alias.c_str ());
+          app.cfg.vmr = hit.alias;
+          app.vmr_last_query = hit.alias;
+          app.vmr_hits.clear ();
+          app.vmr_popup_hovered = false;
+          set_status (app, "Selected " + hit.alias);
+        }
+        ImGui::SameLine ();
+        ImGui::TextDisabled ("%s", hit.is_device ? "device" : "conference");
+        ImGui::PopID ();
+      }
+      ImGui::End ();
+      ImGui::PopStyleVar ();
+      ImGui::PopStyleColor ();
+    } else {
+      app.vmr_popup_hovered = false;
+    }
+
+    x += du (208.0f) + du (theme::GapTight) + du (62.0f) + du (theme::GapTight);
+
+    // Primary action — the only coloured fill in the deck.
+    const int cstat = app.conf_status.load ();
+    ImGui::SetCursorScreenPos (ImVec2 (x, ctrl_y));
+    if (!app.call_started) {
+      const float bw = label_w (app, "SEND TO VMR", 9.5f) + du (12.0f) * 2 + du (12.0f);
+      if (deck_button (app, "send", "SEND TO VMR", ImVec2 (bw, ch), theme::AccentPrimary, Btn::Fill, true, 1))
+        conf_connect (app);
+      x += bw;
+    } else if (cstat != PULSE_CONNECTION_STATUS_CONNECTED) {
+      const float bw = label_w (app, "CONNECTING…", 9.5f) + du (12.0f) * 2;
+      deck_button (app, "conn", "CONNECTING…", ImVec2 (bw, ch), theme::AccentPrimary, Btn::Fill, false);
+      x += bw;
+    } else {
+      const float bw = label_w (app, "STOP SENDING", 9.5f) + du (12.0f) * 2 + du (13.0f);
+      if (deck_button (app, "stop", "STOP SENDING", ImVec2 (bw, ch), theme::StatusError, Btn::Fill, true, 2))
+        conf_disconnect (app);
+      x += bw;
+    }
+  }
+  divider ();
+
+  // ---- LAYOUT -------------------------------------------------------------
+  group_label ("LAYOUT");
+  {
+    static const char * presets[] = {"1-UP", "2×2", "3×3", "PIP"};
+    // The active cell is whichever preset the current tile geometry matches;
+    // a hand-dragged layout matches none, and none lights up.
+    int active = -1;
+    if (!app.tiles.empty ()) {
+      std::vector<int> feeds = placed_feeds (app);
+      auto matches = [&] (const std::vector<Tile> & cand) {
+        if (cand.size () != app.tiles.size ())
+          return false;
+        for (size_t i = 0; i < cand.size (); i++)
+          if (cand[i].feed != app.tiles[i].feed || std::fabs (cand[i].x - app.tiles[i].x) > 1.0f ||
+              std::fabs (cand[i].y - app.tiles[i].y) > 1.0f || std::fabs (cand[i].w - app.tiles[i].w) > 1.0f)
+            return false;
+        return true;
+      };
+      if (matches (grid_tiles (app.cfg, feeds, 1, 1)))
+        active = 0;
+      else if (matches (grid_tiles (app.cfg, feeds, 2, 2)))
+        active = 1;
+      else if (matches (grid_tiles (app.cfg, feeds, 3, 3)))
+        active = 2;
+      else if (matches (pip_tiles (app.cfg, feeds)))
+        active = 3;
+    }
+
+    ImGui::SetCursorScreenPos (ImVec2 (x, ctrl_y));
+    int hit = segmented (app, "layout", presets, 4, active, du (48.0f), ch);
+    if (hit == 0)
+      apply_grid (app, 1, 1);
+    else if (hit == 1)
+      apply_grid (app, 2, 2);
+    else if (hit == 2)
+      apply_grid (app, 3, 3);
+    else if (hit == 3)
+      apply_pip (app);
+    x += du (48.0f) * 4 + du (theme::GapTight);
+
+    // ---- saved slots ------------------------------------------------------
+    const float saved_w = label_w (app, "SAVED", 8.3f);
+    const float chip_w = du (18.0f), chip_h = du (17.0f);
+    const float slots_w = du (9.0f) + saved_w + du (7.0f) + chip_w * 3 + du (4.0f) * 2 + du (9.0f);
+    ImVec2 s0 (x, ctrl_y), s1 (x + slots_w, ctrl_y + ch);
+    dl->AddRectFilled (s0, s1, theme::WhiteU32 (0.06f), du (theme::RadiusControl2));
+    dl->AddRect (s0, s1, theme::WhiteU32 (theme::ControlStroke), du (theme::RadiusControl2), 0, 1.0f);
+    dl->AddText (app.fonts.label, theme::fs (8.3f), ImVec2 (s0.x + du (9.0f), ctrl_y + (ch - theme::fs (8.3f)) / 2),
+                 theme::WhiteU32 (0.30f), "SAVED");
+
+    float chx = s0.x + du (9.0f) + saved_w + du (7.0f);
+    const std::string current = serialise_tiles (app.tiles);
+    for (int i = 0; i < 3; i++) {
+      const std::string & slot = preset_slot (app, i);
+      const bool occupied = !slot.empty ();
+      const bool is_current = occupied && slot == current;
+      ImVec2 c0 (chx, ctrl_y + (ch - chip_h) / 2), c1 (c0.x + chip_w, c0.y + chip_h);
+
+      ImGui::PushID (3100 + i);
+      ImGui::SetCursorScreenPos (c0);
+      ImGui::InvisibleButton ("##slot", ImVec2 (chip_w, chip_h), ImGuiButtonFlags_MouseButtonLeft |
+                                                                   ImGuiButtonFlags_MouseButtonRight);
+      const bool hov = ImGui::IsItemHovered ();
+
+      // Click recalls; press-and-hold (or right-click) stores. Held state is
+      // tracked on the app so the chip can show it filling.
+      if (hov && ImGui::IsMouseClicked (ImGuiMouseButton_Left)) {
+        app.preset_held = i;
+        app.preset_held_since = ImGui::GetTime ();
+      }
+      bool stored = false;
+      if (hov && ImGui::IsMouseClicked (ImGuiMouseButton_Right)) {
+        preset_slot (app, i) = current;
+        save_config (app);
+        stored = true;
+        set_status (app, std::string ("Stored layout ") + (char) ('A' + i));
+      }
+      if (app.preset_held == i && ImGui::IsMouseDown (ImGuiMouseButton_Left) &&
+          ImGui::GetTime () - app.preset_held_since > 0.5) {
+        preset_slot (app, i) = current;
+        save_config (app);
+        stored = true;
+        app.preset_held = -1;
+        set_status (app, std::string ("Stored layout ") + (char) ('A' + i));
+      }
+      if (ImGui::IsMouseReleased (ImGuiMouseButton_Left) && app.preset_held == i) {
+        app.preset_held = -1;
+        if (hov && !stored && occupied) {
+          app.tiles = parse_tiles (slot, (int) app.feeds.size ());
+          app.fullscreen_feed = -1;
+          set_status (app, std::string ("Recalled layout ") + (char) ('A' + i));
+        }
+      }
+
+      ImU32 fill = is_current ? theme::HexU32 (theme::AccentPrimary, 0.92f) : theme::WhiteU32 (0.09f);
+      ImU32 txt = is_current  ? theme::WhiteU32 (1.0f)
+                  : occupied ? theme::WhiteU32 (0.60f)
+                             : theme::WhiteU32 (0.28f);
+      dl->AddRectFilled (c0, c1, fill, du (theme::RadiusChip));
+      if (hov)
+        dl->AddRect (c0, c1, theme::HexU32 (theme::AccentPrimary, 0.6f), du (theme::RadiusChip), 0, 1.0f);
+      const char letter[2] = {(char) ('A' + i), 0};
+      float lw = label_w (app, letter, 9.2f);
+      dl->AddText (app.fonts.label, theme::fs (9.2f),
+                   ImVec2 (c0.x + (chip_w - lw) / 2, c0.y + (chip_h - theme::fs (9.2f)) / 2 - du (0.5f)), txt,
+                   letter);
+      if (hov)
+        ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+      if (hov)
+        ImGui::SetTooltip ("%s", occupied ? "click: recall · hold or right-click: overwrite"
+                                          : "hold or right-click: store the current layout");
+      ImGui::PopID ();
+      chx += chip_w + du (4.0f);
+    }
+    x += slots_w + du (theme::GapTight);
+
+    const float clear_w = label_w (app, "CLEAR", 9.5f) + du (12.0f) * 2;
+    ImGui::SetCursorScreenPos (ImVec2 (x, ctrl_y));
+    if (deck_button (app, "clear", "CLEAR", ImVec2 (clear_w, ch), theme::StatusError, Btn::Outline)) {
+      app.tiles.clear ();
+      app.fullscreen_feed = -1;
+    }
+    x += clear_w;
+  }
+  divider ();
+
+  // ---- SOURCES ------------------------------------------------------------
+  group_label ("SOURCES");
+  {
+    int live = 0;
+    bool any_off = false;
+    for (const Feed & f : app.feeds) {
+      if (f.connected)
+        live++;
+      else
+        any_off = true;
+    }
+
+    const char * lbl = any_off ? "CONNECT ALL" : "DISCONNECT ALL";
+    const float bw = label_w (app, lbl, 9.5f) + du (12.0f) * 2;
+    ImGui::SetCursorScreenPos (ImVec2 (x, ctrl_y));
+    // Constructive gets a fill, destructive only an outline — the quieter of
+    // the two is the one that throws work away.
+    if (deck_button (app, "connall", lbl, ImVec2 (bw, ch), any_off ? theme::StatusOnline : theme::StatusError,
+                     any_off ? Btn::Tinted : Btn::Outline)) {
+      for (Feed & f : app.feeds) {
+        if (any_off) {
+          start_feed (f);
+          if (f.connected)
+            f.connected_at = ImGui::GetTime ();
+        } else {
+          stop_feed (f);
+        }
+      }
+      if (!any_off) {
+        app.tiles.clear ();
+        app.fullscreen_feed = -1;
+      }
+    }
+    x += bw + du (theme::GapTight) + du (3.0f);
+
+    char tally[48];
+    snprintf (tally, sizeof (tally), "%d/%d live", live, (int) app.feeds.size ());
+    draw_mono (app, dl, ImVec2 (x, ctrl_y + (ch - theme::fs (10.5f)) / 2), tally, theme::WhiteU32 (0.45f));
+    x += mono_w (app, tally);
+  }
+
+  // ---- VIEW (right-aligned) -----------------------------------------------
+  {
+    const float sw = label_w (app, "STATS", 9.5f) + du (12.0f) * 2;
+    const float gw = label_w (app, "SETTINGS", 9.5f) + du (12.0f) * 2;
+    float rx = at.x + width - du (theme::GroupPadX) - gw - du (theme::GapTight) - sw;
+    draw_label (app, dl, ImVec2 (rx, label_y), "VIEW", theme::WhiteU32 (theme::TextLabel));
+
+    ImGui::SetCursorScreenPos (ImVec2 (rx, ctrl_y));
+    if (deck_button (app, "stats", "STATS", ImVec2 (sw, ch), theme::AccentPrimary,
+                     app.cfg.show_stats ? Btn::Fill : Btn::Outline))
+      app.cfg.show_stats = !app.cfg.show_stats;
+    rx += sw + du (theme::GapTight);
+    ImGui::SetCursorScreenPos (ImVec2 (rx, ctrl_y));
+    if (deck_button (app, "settings", "SETTINGS", ImVec2 (gw, ch), theme::AccentPrimary,
+                     app.show_settings ? Btn::Fill : Btn::Outline))
+      app.show_settings = !app.show_settings;
+  }
+
+  ImGui::SetCursorScreenPos (at);
+  ImGui::Dummy (ImVec2 (width, h));
+}
+
+// Amber bar between the deck and the body: a feed is connected but has stopped
+// delivering. Returns the height it consumed, so the body below can be sized.
+static float
+ui_alert (App & app, float width)
+{
+  // Worst offender = the stalled feed with the oldest frame.
+  int worst = -1, count = 0;
+  double worst_age = 0;
+  for (int i = 0; i < (int) app.feeds.size (); i++) {
+    if (!feed_stalled (app.feeds[(size_t) i]))
+      continue;
+    count++;
+    double age = ImGui::GetTime () - app.feeds[(size_t) i].last_frame_at;
+    if (age > worst_age) {
+      worst_age = age;
+      worst = i;
+    }
+  }
+  app.alert_feed = worst;
+
+  if (worst < 0) {
+    // Everything recovered: clear the dismissal so a fresh stall re-raises,
+    // and re-arm the cue for the next episode.
+    app.alert_dismissed = false;
+    app.alert_dismissed_feed = -1;
+    app.alert_rang_at = 0.0;
+    return 0.0f;
+  }
+
+  // One cue per stall episode — armed by the recovery above, so a feed that
+  // stays down does not ring every frame.
+  if (!app.cfg.alerts_muted && app.alert_rang_at == 0.0) {
+    play_ring ();
+    app.alert_rang_at = ImGui::GetTime ();
+  }
+
+  if (app.alert_dismissed && app.alert_dismissed_feed == worst)
+    return 0.0f;
+  app.alert_dismissed = false;
+
+  const float h = du (27.0f);
+  ImVec2 at = ImGui::GetCursorScreenPos ();
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 p1 (at.x + width, at.y + h);
+  dl->AddRectFilled (at, p1, theme::HexU32 (theme::StatusWarn, 0.13f), du (theme::RadiusControl2));
+  dl->AddRect (at, p1, theme::HexU32 (theme::StatusWarn, 0.40f), du (theme::RadiusControl2), 0, 1.0f);
+
+  const float cy = at.y + h / 2;
+  float x = at.x + du (10.0f);
+  dl->AddCircleFilled (ImVec2 (x + du (3.5f), cy), du (3.5f), theme::HexU32 (theme::StatusWarn));
+  x += du (7.0f) + du (8.0f);
+  dl->AddText (app.fonts.label, theme::fs (9.5f), ImVec2 (x, cy - theme::fs (9.5f) / 2 - du (1.0f)),
+               theme::HexU32 (theme::StatusWarn), "FEED LOSS");
+  x += label_w (app, "FEED LOSS", 9.5f) + du (8.0f);
+
+  char msg[256];
+  const Feed & wf = app.feeds[(size_t) worst];
+  if (count > 1)
+    snprintf (msg, sizeof (msg), "%s — no frames for %.1fs, still connected  and %d other%s", wf.name.c_str (),
+              worst_age, count - 1, count == 2 ? "" : "s");
+  else
+    snprintf (msg, sizeof (msg), "%s — no frames for %.1fs, still connected", wf.name.c_str (), worst_age);
+  draw_mono (app, dl, ImVec2 (x, cy - theme::fs (10.5f) / 2), msg, theme::WhiteU32 (0.70f));
+
+  const float mw = label_w (app, "MUTE ALERTS", 9.2f) + du (16.0f);
+  const float dw = label_w (app, "DISMISS", 9.2f) + du (16.0f);
+  float rx = at.x + width - du (10.0f) - dw;
+  ImGui::SetCursorScreenPos (ImVec2 (rx, cy - h / 2));
+  if (deck_button (app, "al_dis", "DISMISS", ImVec2 (dw, h), 0xFFFFFF, Btn::Ghost)) {
+    app.alert_dismissed = true;
+    app.alert_dismissed_feed = worst;
+  }
+  rx -= mw;
+  ImGui::SetCursorScreenPos (ImVec2 (rx, cy - h / 2));
+  if (deck_button (app, "al_mute", app.cfg.alerts_muted ? "ALERTS MUTED" : "MUTE ALERTS", ImVec2 (mw, h), 0xFFFFFF,
+                   Btn::Ghost))
+    app.cfg.alerts_muted = !app.cfg.alerts_muted;
+
+  ImGui::SetCursorScreenPos (at);
+  ImGui::Dummy (ImVec2 (width, h));
+  return h;
+}
+
+// Discrete metric cells, rather than a run of concatenated text.
+static void
+ui_footer (App & app, float width)
+{
+  const float h = du (theme::FooterH);
+  ImVec2 at = ImGui::GetCursorScreenPos ();
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 p1 (at.x + width, at.y + h);
+  dl->AddRectFilled (at, p1, theme::WhiteU32 (theme::PanelFill), du (theme::RadiusFooter));
+  dl->AddRect (at, p1, theme::WhiteU32 (theme::PanelStroke), du (theme::RadiusFooter), 0, 1.0f);
+
+  const float cy = at.y + h / 2;
+  float x = at.x;
+  bool first = true;
+
+  auto cell = [&] (const char * label, const char * value, ImU32 vcol, const char * suffix = nullptr) {
+    if (!first)
+      dl->AddRectFilled (ImVec2 (x, at.y + du (8.0f)), ImVec2 (x + 1, p1.y - du (8.0f)), theme::WhiteU32 (0.07f));
+    x += (first ? 0.0f : 1.0f) + du (13.0f);
+    first = false;
+    dl->AddText (app.fonts.microCap, theme::fs (8.5f), ImVec2 (x, cy - theme::fs (8.5f) / 2 - du (0.5f)),
+                 theme::WhiteU32 (0.30f), label);
+    x += app.fonts.microCap->CalcTextSizeA (theme::fs (8.5f), FLT_MAX, 0, label).x + du (7.0f);
+    draw_mono (app, dl, ImVec2 (x, cy - theme::fs (10.5f) / 2), value, vcol);
+    x += mono_w (app, value);
+    if (suffix) {
+      x += du (4.0f);
+      draw_mono (app, dl, ImVec2 (x, cy - theme::fs (9.5f) / 2), suffix, theme::WhiteU32 (0.30f), 9.5f);
+      x += mono_w (app, suffix, 9.5f);
+    }
+    x += du (13.0f);
+  };
+
+  char buf[64], buf2[64];
+  const bool sending = app.input_open;
+  const ImU32 idle_col = theme::WhiteU32 (0.35f);
+
+  if (app.cfg.show_stats) {
+    snprintf (buf, sizeof (buf), "%.0f%%", app.proc_cpu_pct);
+    cell ("CPU", buf, theme::WhiteU32 (0.80f));
+    snprintf (buf, sizeof (buf), "%.0f MB", app.proc_rss_mb);
+    cell ("RSS", buf, theme::WhiteU32 (0.80f));
+
+    if (sending) {
+      snprintf (buf, sizeof (buf), "%.1f ms", app.composite_ms);
+      snprintf (buf2, sizeof (buf2), "/ %.0f budget", 1000.0 / std::max (1, app.cfg.send_fps));
+      cell ("COMPOSITE", buf, theme::WhiteU32 (0.80f), buf2);
+    } else {
+      cell ("COMPOSITE", "idle", idle_col);
+    }
+
+    if (app.tx_valid) {
+      snprintf (buf, sizeof (buf), "%.1f Mbps", app.tx_bitrate / 1e6);
+      cell ("TX", buf, theme::HexU32 (theme::AccentPrimary, 0.95f));
+      snprintf (buf, sizeof (buf), "%.1f%%", app.tx_loss_pct);
+      cell ("LOSS", buf, theme::WhiteU32 (0.80f));
+      snprintf (buf, sizeof (buf), "%.0f ms", app.tx_rtt_ms);
+      cell ("RTT", buf, theme::WhiteU32 (0.80f));
+    } else {
+      cell ("TX", "—", idle_col);
+      cell ("LOSS", "—", idle_col);
+      cell ("RTT", "—", idle_col);
+    }
+  }
+
+  // Right-aligned: today's status line, plus the call duration once up.
+  std::string s = get_status (app);
+  if (app.call_started && app.call_connected_at > 0) {
+    int d = (int) (ImGui::GetTime () - app.call_connected_at);
+    char dur[32];
+    snprintf (dur, sizeof (dur), "%d:%02d:%02d", d / 3600, (d / 60) % 60, d % 60);
+    s = s.empty () ? std::string (dur) : s + "  ·  " + dur;
+  }
+  if (!s.empty ()) {
+    float sw = mono_w (app, s.c_str ());
+    const float room = width - (x - at.x) - du (13.0f);
+    while (!s.empty () && sw > room) {
+      s.erase (s.begin ());
+      sw = mono_w (app, s.c_str ());
+    }
+    draw_mono (app, dl, ImVec2 (p1.x - du (13.0f) - sw, cy - theme::fs (10.5f) / 2), s.c_str (),
+               theme::WhiteU32 (0.35f));
+  }
+
+  ImGui::SetCursorScreenPos (at);
+  ImGui::Dummy (ImVec2 (width, h));
 }
 
 // ----------------------------------------------------------------------------
@@ -1729,6 +3555,10 @@ main (int argc, char ** argv)
     pulse_options_set_conference_state_callback (app.conf, &scb);
     PulseRegistrationStatusCallbackConfig rcb{on_reg_status, &app};
     pulse_options_set_registration_state_callback (app.conf, &rcb);
+    PulsePinCodeRequestCallbackConfig pcb{};
+    pcb.func = on_pin_request;
+    pcb.user_context = &app;
+    pulse_options_set_pin_code_request_callbacks (app.conf, &pcb);
   }
 
   if (app.cfg.reg_auto)
@@ -1829,6 +3659,13 @@ main (int argc, char ** argv)
       set_status (app, "Leaving the current conference for the incoming call…");
     }
 
+    if (app.call_failed.exchange (false) && app.call_started &&
+        app.conf_status.load () != PULSE_CONNECTION_STATUS_CONNECTED) {
+      app.call_started = false;
+      app.floor_taken = false;
+      app.input_open = false;
+    }
+
     // Attach the canvas once the conference is up — dialled or answered.
     if (app.call_started && app.conf_status.load () == PULSE_CONNECTION_STATUS_CONNECTED)
       ensure_canvas_input (app);
@@ -1881,197 +3718,41 @@ main (int argc, char ** argv)
                   ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-    // ---- top bar: VMR + presets ----------------------------------------
-    int cstat = app.conf_status.load ();
-    bool in_conf = cstat == PULSE_CONNECTION_STATUS_CONNECTED;
+    // ---- Instrument chrome ---------------------------------------------
+    ui_tally (app, vp);
 
-    {
-      static char vmr_buf[512], pin_buf[64];
-      static bool primed = false;
-      if (!primed) {
-        snprintf (vmr_buf, sizeof (vmr_buf), "%s", app.cfg.vmr.c_str ());
-        snprintf (pin_buf, sizeof (pin_buf), "%s", app.cfg.pin.c_str ());
-        primed = true;
-      }
-      ImGui::SetNextItemWidth (300);
-      bool registered = app.reg_status.load () == PULSE_CONNECTION_STATUS_CONNECTED;
-      const char * hint = registered ? "vmr@server — or search" : "vmr@server";
-      if (ImGui::InputTextWithHint ("##vmr", hint, vmr_buf, sizeof (vmr_buf)))
-        app.cfg.vmr = vmr_buf;
-
-      // The field degrades to plain entry when not registered: the directory
-      // query only works against a registrar we are registered to.
-      ImVec2 f_min = ImGui::GetItemRectMin (), f_max = ImGui::GetItemRectMax ();
-      bool field_active = ImGui::IsItemActive ();
-      if (registered)
-        refresh_vmr_hits (app, vmr_buf);
-
-      bool keep_list = field_active || app.vmr_popup_hovered;
-      if (registered && keep_list && !app.vmr_hits.empty ()) {
-        ImGui::SetNextWindowPos (ImVec2 (f_min.x, f_max.y + 4));
-        ImGui::SetNextWindowSize (ImVec2 (f_max.x - f_min.x, 0));
-        ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.98f));
-        ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (6, 6));
-        // NoFocusOnAppearing so typing continues uninterrupted while the list
-        // is up; it is still a real window, so its rows remain clickable.
-        ImGui::Begin ("##vmrhits", nullptr,
-                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
-                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
-                        ImGuiWindowFlags_NoFocusOnAppearing);
-        // AllowWhenBlockedByActiveItem: while the text field holds the active
-        // id, a plain hover test reports false and the list would close on the
-        // press rather than the release.
-        app.vmr_popup_hovered =
-          ImGui::IsWindowHovered (ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_ChildWindows);
-
-        for (size_t i = 0; i < app.vmr_hits.size (); i++) {
-          const App::AliasHit & h = app.vmr_hits[i];
-          ImGui::PushID ((int) i);
-          std::string row = h.alias;
-          if (!h.description.empty ())
-            row += "   " + h.description;
-          if (ImGui::Selectable (row.c_str ())) {
-            // Fill the field and stand down; the operator then presses
-            // "Send to VMR" when ready.
-            snprintf (vmr_buf, sizeof (vmr_buf), "%s", h.alias.c_str ());
-            app.cfg.vmr = h.alias;
-            app.vmr_last_query = h.alias; // don't immediately re-query the pick
-            app.vmr_hits.clear ();
-            app.vmr_popup_hovered = false;
-            set_status (app, "Selected " + h.alias);
-          }
-          ImGui::SameLine ();
-          ImGui::TextDisabled ("%s", h.is_device ? "device" : "conference");
-          ImGui::PopID ();
-        }
-        ImGui::End ();
-        ImGui::PopStyleVar ();
-        ImGui::PopStyleColor ();
-      } else {
-        app.vmr_popup_hovered = false;
-      }
-
-      ImGui::SameLine ();
-      ImGui::SetNextItemWidth (110);
-      if (ImGui::InputTextWithHint ("##pin", "PIN", pin_buf, sizeof (pin_buf), ImGuiInputTextFlags_Password))
-        app.cfg.pin = pin_buf;
-    }
-    ImGui::SameLine ();
-    if (!app.call_started) {
-      if (pill_button (app, "Send to VMR", theme::AccentPrimary, ImVec2 (130, 30), true))
-        conf_connect (app);
-    } else {
-      if (pill_button (app, in_conf ? "Stop sending" : "Cancel", theme::StatusError, ImVec2 (130, 30), true))
-        conf_disconnect (app);
+    static char vmr_buf[512], pin_buf[64];
+    static bool primed = false;
+    if (!primed) {
+      snprintf (vmr_buf, sizeof (vmr_buf), "%s", app.cfg.vmr.c_str ());
+      snprintf (pin_buf, sizeof (pin_buf), "%s", app.cfg.pin.c_str ());
+      primed = true;
     }
 
-    ImGui::SameLine ();
-    ImGui::Dummy (ImVec2 (18, 0));
-    ImGui::SameLine ();
-    if (pill_button (app, "1-up", theme::AccentPrimary, ImVec2 (64, 30)))
-      apply_grid (app, 1, 1);
-    ImGui::SameLine ();
-    if (pill_button (app, "2x2", theme::AccentPrimary, ImVec2 (64, 30)))
-      apply_grid (app, 2, 2);
-    ImGui::SameLine ();
-    if (pill_button (app, "3x3", theme::AccentPrimary, ImVec2 (64, 30)))
-      apply_grid (app, 3, 3);
-    ImGui::SameLine ();
-    if (pill_button (app, "PiP", theme::AccentPrimary, ImVec2 (64, 30)))
-      apply_pip (app);
-    ImGui::SameLine ();
-    if (pill_button (app, "Clear", theme::StatusError, ImVec2 (70, 30))) {
-      app.tiles.clear ();
-      app.fullscreen_feed = -1;
-    }
+    const float content_w = ImGui::GetContentRegionAvail ().x;
 
-    ImGui::SameLine ();
-    ImGui::Dummy (ImVec2 (18, 0));
-    ImGui::SameLine ();
-    if (pill_button (app, "Settings", theme::AccentPrimary, ImVec2 (86, 30), app.show_settings))
-      app.show_settings = !app.show_settings;
+    ui_header (app, content_w);
+    ImGui::Dummy (ImVec2 (0, du (theme::Gap)));
 
-    ImGui::SameLine ();
-    if (pill_button (app, app.cfg.show_stats ? "Stats on" : "Stats off", theme::AccentPrimary, ImVec2 (86, 30),
-                     app.cfg.show_stats))
-      app.cfg.show_stats = !app.cfg.show_stats;
-    ImGui::SameLine ();
+    ui_deck (app, content_w, vmr_buf, sizeof (vmr_buf), pin_buf, sizeof (pin_buf));
+    ImGui::Dummy (ImVec2 (0, du (theme::Gap)));
 
-    bool any_off = false;
-    for (Feed & f : app.feeds)
-      if (!f.connected)
-        any_off = true;
-    if (pill_button (app, any_off ? "Connect all" : "Disconnect all",
-                     any_off ? theme::StatusOnline : theme::StatusError, ImVec2 (128, 30))) {
-      for (Feed & f : app.feeds) {
-        if (any_off)
-          start_feed (f);
-        else
-          stop_feed (f);
-      }
-      if (!any_off) {
-        app.tiles.clear ();
-        app.fullscreen_feed = -1;
-      }
-    }
-
-    ImGui::Dummy (ImVec2 (0, 8));
+    if (ui_alert (app, content_w) > 0.0f)
+      ImGui::Dummy (ImVec2 (0, du (theme::Gap)));
 
     // ---- rail + canvas ---------------------------------------------------
-    const float rail_w = 190.0f * theme::scale;
-    float body_h = ImGui::GetContentRegionAvail ().y - 30;
+    const float body_h = ImGui::GetContentRegionAvail ().y - du (theme::FooterH) - du (theme::Gap);
     ui_settings (app);
     ui_incoming (app, vp->Size);
-    ui_feed_rail (app, rail_w, body_h);
-    ImGui::SameLine ();
+    ui_pin (app);
+    ui_feed_error (app, vp->Size);
+
+    ui_feed_rail (app, du (theme::RailW), body_h);
+    ImGui::SameLine (0.0f, du (theme::Gap));
     ui_canvas (app, ImVec2 (ImGui::GetContentRegionAvail ().x, body_h));
 
-    // ---- status ----------------------------------------------------------
-    {
-      std::string s = get_status (app);
-      const char * state = in_conf   ? (app.cfg.send_as_content ? "sending as content" : "sending as main video")
-                           : app.call_started ? "connecting…"
-                                              : "not sending";
-      ImGui::PushFont (app.fonts.small_);
-      ImGui::TextColored (theme::Hex (0xFFFFFF, in_conf ? 0.75f : theme::TextTertiary), "%s%s%s", state,
-                          s.empty () ? "" : "  ·  ", s.c_str ());
-
-      {
-        int rs = app.reg_status.load ();
-        bool registered = rs == PULSE_CONNECTION_STATUS_CONNECTED;
-        ImGui::SameLine ();
-        if (registered)
-          ImGui::TextColored (theme::Hex (theme::StatusOnline, 0.85f), "  ·  registered as %s",
-                              app.cfg.reg_alias.c_str ());
-        else if (!app.cfg.reg_host.empty ())
-          ImGui::TextColored (theme::Hex (0xFFFFFF, theme::TextTertiary), "  ·  not registered");
-      }
-
-      if (app.cfg.show_stats) {
-        int live = 0;
-        for (const Feed & f : app.feeds)
-          if (f.connected)
-            live++;
-
-        ImGui::SameLine ();
-        ImGui::TextColored (theme::Hex (0xFFFFFF, theme::TextTertiary),
-                            "     %d feed%s  ·  CPU %.0f%%  ·  RSS %.0f MB", live, live == 1 ? "" : "s",
-                            app.proc_cpu_pct, app.proc_rss_mb);
-        if (app.input_open) {
-          ImGui::SameLine ();
-          ImGui::TextColored (theme::Hex (0xFFFFFF, theme::TextTertiary), "  ·  composite %.1f ms",
-                              app.composite_ms);
-        }
-        if (app.tx_valid) {
-          ImGui::SameLine ();
-          ImGui::TextColored (theme::Hex (theme::AccentPrimary, 0.9f),
-                              "  ·  tx %.1f Mbps  loss %.1f%%  rtt %.0f ms", app.tx_bitrate / 1e6,
-                              app.tx_loss_pct, app.tx_rtt_ms);
-        }
-      }
-      ImGui::PopFont ();
-    }
-
+    ImGui::Dummy (ImVec2 (0, du (theme::Gap)));
+    ui_footer (app, content_w);
     ImGui::End ();
     ImGui::PopStyleVar ();
     ImGui::Render ();

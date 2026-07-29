@@ -16,20 +16,32 @@ this participant's video — so everyone in the VMR sees the composed picture.
 ```
 
 * **Feed rail** — one card per configured feed with a live thumbnail, a
-  green/amber liveness dot and (with stats on) resolution, frame rate and
-  throughput.
+  state marker, per-feed resolution/frame rate/throughput, and a **connect
+  toggle** so sources can be brought up one at a time.
+* **Feed inspector** — select a card and the foot of the rail shows that
+  source's URL, transport, uptime and last-frame age, with Reconnect and
+  Remove.
 * **Presets** — 1-up, 2x2, 3x3 and picture-in-picture arrange whatever is
   placed; drag a tile to move it, drag its corner to resize (16:9 preserved).
+* **Saved layouts** — three slots (A/B/C). Click to recall, press-and-hold or
+  right-click to store; they persist in `uavwall.conf`.
 * **Double-click** a rail card or a tile to punch that feed full screen;
   double-click again to return to the previous layout.
 * **Send to VMR** — dial `name@server` (with a PIN if needed) and the canvas is
   pushed into the conference, either as this participant's **main video** or as
   **content** (the presentation stream, shown alongside the participants).
+* **Feed-loss alerts** — a connected feed that stops delivering frames raises
+  an amber bar with an audible cue; the rail marker, its placement bar and its
+  canvas tile all go amber, and everything clears itself when frames resume.
 * **Stats** — per-feed rates, plus this process's CPU and memory and, once in
-  a conference, the real transmit bitrate, packet loss and RTT from Pulse.
-* **Settings** — conference details, send resolution and frame rate, RTSP
-  transport and jitter buffer, and an editable feed list. Persisted to
-  `uavwall.conf`.
+  a conference, the real transmit bitrate, packet loss and RTT from Pulse,
+  shown as discrete metric cells along the foot of the window.
+* **Registration** — register to Infinity with a username and password so the
+  wall can be *dialled into*, search the directory for VMRs and devices, and
+  answer incoming calls (including while already in one).
+* **Settings** — conference details, registration, send resolution and frame
+  rate, RTSP transport and jitter buffer, and an editable feed list. Persisted
+  to `uavwall.conf`.
 
 ## Build & run
 
@@ -99,6 +111,15 @@ canvas=1920x1080
 send_fps=30
 send_as=main               # main = our video, content = presentation stream
 
+# Registration, so the wall can be dialled into. Leave reg_host empty to
+# disable. The host is a domain — Pulse resolves _pexapp._tcp SRV itself.
+reg_host=
+reg_alias=uavwall@example.com
+reg_user=
+reg_pass=
+reg_auto=false             # register at startup
+auto_accept=false          # answer incoming calls without asking
+
 # Feed transport. TCP suits most IP cameras; some only offer UDP.
 rtsp_transport=tcp
 rtsp_latency_ms=200
@@ -107,6 +128,11 @@ autoconnect=false          # connect every feed at startup
 # Interface. ui_scale applies on next start.
 ui_scale=1.2
 show_stats=true
+
+# Saved layouts, recalled from the A/B/C slots. feed,x,y,w,h per tile.
+preset_a=
+preset_b=
+preset_c=
 
 # One per feed: feed=NAME|URL
 feed=FEED 01|rtsp://127.0.0.1:8554/uav1
@@ -204,71 +230,115 @@ with ffmpeg's `geq` filter cost 5x that.) This is an artefact of the test rig
 and disappears when real aircraft supply the feeds — run it on a separate
 machine with `-a` when measuring.
 
+## Registration and dial-in
+
+The wall can register to Infinity, which makes it callable: an operator already
+in a conference dials `uavwall@your-domain` and the feeds arrive as a
+participant, rather than the wall having to join a VMR itself. Dialling out
+still works exactly as before — the two are independent.
+
+Turn it on in **Settings → Registration** (host, alias, username, password, and
+whether to register at startup); the footer shows the current state. Scope was
+decided deliberately:
+
+* **Username/password only — no SSO.** A wall is a fixed installation, not a
+  person, so a device credential is the better fit. It also sidesteps two macOS
+  problems: SSO needs an `.app` bundle to receive the `pexip-auth://` callback,
+  and only one application per machine can own that URL scheme — `pexclient`
+  already does.
+* **PINs for VMRs**, not SSO-protected ones. A PIN set in Settings is submitted
+  automatically on dial-out; anything else prompts the operator. If Infinity
+  asks a second time the configured PIN was wrong, so the prompt appears rather
+  than the same PIN being resubmitted forever.
+
+What registration enables:
+
+* **Incoming calls.** A banner offers accept/decline, with an audible ring, a
+  Dock bounce and a window raise. **Auto-accept** is available for an
+  unattended wall.
+
+  **When the wall is already in a call**, the banner instead offers *Disconnect
+  and accept* or *Reject* — auto-accept deliberately does not apply here, since
+  dropping a conference in progress is the operator's decision. Note the
+  ordering hazard behind it: Pulse's incoming callback blocks a worker thread
+  until it returns, and leaving a conference is itself asynchronous, so
+  accepting means starting the disconnect on the UI thread, waiting (bounded)
+  for the conference to reach DISCONNECTED, and only then returning `true`.
+* **Directory search.** Typing in the VMR field queries
+  `pulse_registrations_query_alias()` and offers matching services and devices;
+  picking one fills the field, ready to send. Unregistered, the field is plain
+  text entry rather than appearing broken.
+
+Registration belongs to a single Pulse instance, and an incoming call is
+answered on that same one — so the long-lived instance that keeps global
+GStreamer state alive is also the conference instance, rather than one being
+created per call.
+
 ## Planned
 
-**Register to Infinity so the wall can be dialled** — the goal is dial-*in*:
-an operator already in a conference calls `uavwall@your-domain` and the feeds
-appear as a participant, rather than the wall joining a VMR itself. Dialling
-out to a VMR (with a PIN where needed) stays as it is today.
+**Recording.** The operator marks one or more feeds and each is written to its
+own MP4, independently of whether that feed is on the canvas.
 
-Scope, decided deliberately:
+Pulse cannot do this: `pulse_file_session.h` is playback only, and while the
+dylib exports an internal `_pmx_data_session_add_file_output`, no public API
+reaches it. The plan is instead one `ffmpeg` subprocess per recorded feed:
 
-* **Username/password registration only — no SSO.** A wall is a fixed
-  installation, not a person, so a device credential is the better fit. It also
-  avoids two macOS problems: SSO would require an `.app` bundle to receive the
-  `pexip-auth://` callback, and only one application on a machine can own that
-  URL scheme — `pexclient` already does. If a customer VMR ever forces SSO,
-  the fallback is a script that repoints the scheme at whichever app is being
-  demonstrated.
-* **PINs for VMRs**, which pexclient's `pin_code_request` callback already
-  covers.
+```
+ffmpeg -rtsp_transport tcp -i <feed url> -c copy -movflags +faststart out.mp4
+```
 
-The pieces, all ported from [`pexclient`](../pexclient/):
+`-c copy` never decodes, so it measured **0.3% CPU and ~36 MB RSS** per
+recorder — negligible beside the ~8.6%/feed compositing — and it captures the
+original stream rather than the downscaled canvas tile. Budget roughly
+900 MB/hour/feed at 2 Mbps.
 
-* `pulse_register_async()` with a `PulseRegistrationRequest` (`use_sso=false`),
-  plus the registration-state callback for status in the footer.
-* `pulse_options_set_registrations_events_callbacks()` for incoming calls —
-  a parked-callback flow, where the Pulse worker blocks until the UI accepts or
-  declines. An unattended wall wants an auto-accept option.
+Stopping is the part that needs care, all of this measured rather than assumed:
 
-  **When the wall is already in a call**, an incoming call must not be silently
-  dropped: ring (audible, plus a Dock bounce and window raise, as pexclient
-  does) and put the choice to the operator —
+* `SIGINT` **hangs** on an RTSP input — a test sat for two minutes.
+* `SIGKILL` leaves no moov atom and an unplayable file. Fragmented MP4 does not
+  save it: with `+frag_keyframe+empty_moov`, `-frag_duration` and
+  `-flush_packets 1`, seven seconds of recording had put between 28 and 1267
+  bytes on disk. MPEG-TS and Matroska wrote nothing at all.
+* **Writing `q` to stdin exits cleanly** and yields a valid file. So spawn with
+  stdin as a pipe, send `q\n`, wait bounded — and stop every recorder on app
+  exit, since a force-quit costs the in-progress files either way.
 
-  * *Disconnect and take the incoming call* — leave the current conference,
-    then answer.
-  * *Reject* — decline and stay where we are.
+Open: where the toggle lives. A per-feed control in the rail was tried before
+for connect/disconnect and got in the way, so the alternative is the Settings
+feed list. Note also that this makes `ffmpeg` a **runtime** dependency, where
+today it is only needed to generate test feeds — the control should degrade
+when it is absent rather than fail silently.
 
-  Note the ordering hazard: Pulse's incoming callback blocks a worker thread
-  until it returns, and leaving the current conference is itself asynchronous.
-  Accepting therefore means initiating the disconnect, waiting for the
-  conference state to reach DISCONNECTED, and only then returning `true` — all
-  without deadlocking against the UI thread that owns the answer. Worth
-  prototyping that sequence before building the dialog around it.
-* **Directory search**, once registered: `pulse_registrations_query_alias()`
-  returns matching conference (VMR) and device aliases, so the VMR field
-  autocompletes as the operator types instead of requiring the address to be
-  known and typed exactly. It is only available while registered — the call
-  fails otherwise — so the field should degrade to plain text entry when the
-  wall is not registered, rather than appearing broken. pexclient drives the
-  same call per keystroke, with separate result limits for devices and
-  services.
-* Config: registration host, alias, username, password, and whether to register
-  on startup.
+Recording the composed canvas is a separate mechanism, since there is no source
+stream to copy: pipe the RGBA buffer to an ffmpeg stdin and encode, which
+`h264_videotoolbox` does in hardware on macOS.
 
-One structural note: registration belongs to a single Pulse instance, and the
-incoming call is answered on that same instance. uavwall should therefore
-register its **keepalive** instance — which already lives for the whole run —
-and use it as the conference instance, instead of creating one per call in
-`conf_connect()`.
+## Also planned
 
-## Where things live## Where things live
+* **SSO-protected VMRs**, if a demonstration ever needs one. The blocker is the
+  macOS URL-scheme arbitration above, and the fallback is a script that
+  repoints `pexip-auth://` at whichever app is being demonstrated.
+
+## Where things live
 
 ```
 src/main.cpp   The whole demo: feed instances, compositor, canvas UI, VMR send.
-src/Theme.h    Design tokens, shared with pexclient.
-assets/fonts/  DM Sans (SIL OFL).
+src/Theme.h    Design tokens — Dark Frosted, plus the Instrument additions.
+assets/fonts/  DM Sans and IBM Plex Mono (both SIL OFL).
+design_handoff_uavwall_instrument/
+               The "Instrument" UI spec this build implements, with the HTML
+               mock it was measured from.
 ```
+
+## Interface
+
+The UI follows the **Instrument** direction from
+[`design_handoff_uavwall_instrument/`](design_handoff_uavwall_instrument/):
+controls collected into four labelled groups (destination, layout, sources,
+view) rather than one row of pills; every number in a monospace face; and the
+sending state signalled in three places at once — a red strip along the top
+edge of the window, an ON AIR readout in the header, and red corner ticks on
+the canvas — so it is unmissable from across a room.
 
 ## How it works
 
