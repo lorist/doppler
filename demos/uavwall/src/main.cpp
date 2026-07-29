@@ -34,6 +34,7 @@
 #include <pexpulse/pulse_data_session.h>
 #include <pexpulse/pulse_options.h>
 #include <pexpulse/pulse_participant_control.h>
+#include <pexpulse/pulse_registrations.h>
 #include <pexpulse/pulse_media_stats.h>
 #include <pexpulse/pulse_rtsp_session.h>
 
@@ -79,6 +80,15 @@ struct Config
   // camera), or as content/presentation — the second stream, which most
   // endpoints show alongside the people rather than instead of one.
   bool send_as_content = false;
+
+  // Registration. The wall registers as a device so a conference can dial it,
+  // and so the VMR field can search the directory. Password only — see the
+  // Planned section of the README for why SSO is out of scope.
+  std::string reg_host;      // domain; Pulse resolves _pexapp._tcp SRV
+  std::string reg_alias;     // this device's alias on Infinity
+  std::string reg_user;
+  std::string reg_pass;
+  bool reg_auto = false;
 
   // Feeds
   bool rtsp_tcp = true;                  // TCP suits most IP cameras
@@ -139,7 +149,11 @@ struct App
   std::vector<Feed> feeds;
   std::vector<Tile> tiles;
 
-  // Conference (the VMR we push the canvas into).
+  // The conference instance. Created once at startup and freed at exit, rather
+  // than per call, for two reasons: registration and answering an incoming call
+  // both belong to a single instance that must outlive any one conference; and
+  // a process that drops to *zero* Pulse instances crashes inside the next
+  // pulse_new() (global GStreamer state is torn down with the last instance).
   Pulse * conf = nullptr;
   std::atomic<int> conf_status{PULSE_CONNECTION_STATUS_DISCONNECTED};
   std::mutex status_mutex;
@@ -160,12 +174,30 @@ struct App
   std::vector<Tile> saved_tiles;
   int fullscreen_feed = -1;
 
-  // A Pulse instance held for the whole run. The first pulse_new() performs
-  // global (GStreamer) initialisation and the last pulse_free() tears it back
-  // down — so a process that drops to zero instances and then creates another
-  // crashes inside pulse_new(). Keeping one alive makes that impossible.
-  // videowall does the same thing with its device-enumeration instance.
-  Pulse * keepalive = nullptr;
+  // True once a call has been started (dialled out, or later, answered) and
+  // until it is torn down. app.conf outlives any single call, so it can no
+  // longer serve as the "are we in a call" test.
+  bool call_started = false;
+
+  // Registration lives on app.conf, the one instance that outlives any call.
+  std::atomic<int> reg_status{PULSE_CONNECTION_STATUS_DISCONNECTED};
+  // reg_status only moves when Pulse's state callback fires, which is too late
+  // to stop a second Register press from hitting the handle (pexclient's bug).
+  std::atomic<bool> reg_in_flight{false};
+
+  // Directory search results for the VMR field. Only populated while
+  // registered — pulse_registrations_query_alias fails otherwise.
+  struct AliasHit
+  {
+    std::string alias, description;
+    bool is_device = false;
+  };
+  std::vector<AliasHit> vmr_hits;
+  std::string vmr_last_query = "\x01"; // never matches, so the first edit queries
+  // Clicking a row deactivates the input field, so the list cannot be gated on
+  // the field alone or it vanishes before the click lands. Remember whether the
+  // list itself was hovered last frame and keep it up in that case.
+  bool vmr_popup_hovered = false;
 
   // Benchmark mode (--bench): connect everything, lay it out, force the
   // compositor to run as if sending, sample for N seconds and print a row.
@@ -264,6 +296,16 @@ load_config (App & app)
       app.cfg.pin = v;
     else if (k == "display_name")
       app.cfg.display_name = v;
+    else if (k == "reg_host")
+      app.cfg.reg_host = v;
+    else if (k == "reg_alias")
+      app.cfg.reg_alias = v;
+    else if (k == "reg_user")
+      app.cfg.reg_user = v;
+    else if (k == "reg_pass")
+      app.cfg.reg_pass = v;
+    else if (k == "reg_auto")
+      app.cfg.reg_auto = (v == "true");
     else if (k == "canvas") {
       int w = 0, h = 0;
       if (sscanf (v.c_str (), "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
@@ -319,6 +361,13 @@ save_config (App & app)
   ofs << "vmr=" << app.cfg.vmr << "\n";
   ofs << "pin=" << app.cfg.pin << "\n";
   ofs << "display_name=" << app.cfg.display_name << "\n\n";
+  ofs << "# Register as a device so a conference can dial the wall, and so the\n";
+  ofs << "# VMR field can search the directory. Password is stored in clear.\n";
+  ofs << "reg_host=" << app.cfg.reg_host << "\n";
+  ofs << "reg_alias=" << app.cfg.reg_alias << "\n";
+  ofs << "reg_user=" << app.cfg.reg_user << "\n";
+  ofs << "reg_pass=" << app.cfg.reg_pass << "\n";
+  ofs << "reg_auto=" << (app.cfg.reg_auto ? "true" : "false") << "\n\n";
   ofs << "# What the far end receives. 1280x720 roughly halves compositing cost.\n";
   ofs << "canvas=" << app.cfg.canvas_w << "x" << app.cfg.canvas_h << "\n";
   ofs << "send_fps=" << app.cfg.send_fps << "\n";
@@ -717,6 +766,106 @@ on_conf_progress (const PulseOperationProgressInfo * info, void * ctx)
   set_status (*static_cast<App *> (ctx), info->desc ? info->desc : "");
 }
 
+// ----------------------------------------------------------------------------
+//  Registration
+// ----------------------------------------------------------------------------
+
+static void
+on_reg_status (const PulseRegistrationStatusInfo * info, void * ctx)
+{
+  static_cast<App *> (ctx)->reg_status.store ((int) info->status);
+}
+
+static void
+on_reg_result (const PulseError err, void * ctx)
+{
+  auto * app = static_cast<App *> (ctx);
+  app->reg_in_flight.store (false);
+  if (err == PULSE_SUCCESS) {
+    set_status (*app, "");
+    return;
+  }
+  std::fprintf (stderr, "[uavwall] registration failed: %s\n", pulse_strerror (err));
+  set_status (*app, err == PULSE_ERROR_HANDLE_IN_USE
+                      ? "Registration busy — is another uavwall running?"
+                      : std::string ("registration: ") + pulse_strerror (err));
+}
+
+static void
+on_reg_progress (const PulseOperationProgressInfo * info, void * ctx)
+{
+  set_status (*static_cast<App *> (ctx), info->desc ? info->desc : "");
+}
+
+static void
+start_register (App & app)
+{
+  if (!app.conf)
+    return;
+  if (app.cfg.reg_host.empty () || app.cfg.reg_alias.empty ()) {
+    set_status (app, "Set a registration host and alias in Settings.");
+    return;
+  }
+  if (app.reg_in_flight.exchange (true)) {
+    set_status (app, "Registration already in progress…");
+    return;
+  }
+
+  PulseRegistrationRequest req{};
+  req.host = app.cfg.reg_host.c_str ();
+  req.alias = app.cfg.reg_alias.c_str ();
+  req.username = app.cfg.reg_user.empty () ? nullptr : app.cfg.reg_user.c_str ();
+  req.password = app.cfg.reg_pass.empty () ? nullptr : app.cfg.reg_pass.c_str ();
+  req.use_sso = false;
+
+  PulseAsyncOperationResultCallbackConfig rcb{on_reg_result, &app};
+  PulseOperationProgressCallbackConfig pcb{on_reg_progress, &app};
+  PulseError err = pulse_register_async (app.conf, &req, &rcb, &pcb);
+  if (err != PULSE_SUCCESS) {
+    app.reg_in_flight.store (false);
+    on_reg_result (err, &app);
+  }
+}
+
+static void
+start_deregister (App & app)
+{
+  if (!app.conf)
+    return;
+  PulseAsyncOperationResultCallbackConfig rcb{on_reg_result, &app};
+  pulse_deregister_async (app.conf, &rcb, nullptr);
+}
+
+// Ask the registrar for aliases matching what has been typed. Blocking, but
+// it is a small query against the node we are registered to, and this is the
+// same per-keystroke pattern pexclient uses.
+static void
+refresh_vmr_hits (App & app, const std::string & query)
+{
+  if (query == app.vmr_last_query)
+    return;
+  app.vmr_last_query = query;
+  app.vmr_hits.clear ();
+
+  if (!app.conf || app.reg_status.load () != PULSE_CONNECTION_STATUS_CONNECTED || query.empty ())
+    return;
+
+  PulseRegistrationAliasList * result = nullptr;
+  // Conferences first — a wall usually dials a VMR — but devices are useful
+  // too, for calling an endpoint directly.
+  if (pulse_registrations_query_alias (app.conf, query.c_str (), 4, 8, &result) == PULSE_SUCCESS && result) {
+    for (size_t i = 0; i < result->size; i++) {
+      App::AliasHit h;
+      h.alias = result->list[i]->alias ? result->list[i]->alias : "";
+      h.description = result->list[i]->description ? result->list[i]->description : "";
+      h.is_device = result->list[i]->type == PULSE_REGISTRATION_ALIAS_DEVICE;
+      if (!h.alias.empty ())
+        app.vmr_hits.push_back (std::move (h));
+    }
+  }
+  pulse_registration_alias_list_free (result);
+}
+
 static bool
 split_vmr (const std::string & id, std::string & conf, std::string & server)
 {
@@ -737,18 +886,14 @@ conf_connect (App & app)
     return;
   }
 
-  app.conf = pulse_new ();
   if (!app.conf) {
-    set_status (app, "pulse_new() failed");
+    set_status (app, "no Pulse instance");
     return;
   }
-  pulse_options_set_self_view_window_handle (app.conf, nullptr);
-  pulse_options_set_remote_video_window_handle (app.conf, nullptr);
-  pulse_options_set_presentation_video_window_handle (app.conf, nullptr);
-  pulse_options_set_application_user_agent_string (app.conf, "uavwall/0.1");
-
-  PulseConferenceStatusCallbackConfig scb{on_conf_status, &app};
-  pulse_options_set_conference_state_callback (app.conf, &scb);
+  if (app.call_started) {
+    set_status (app, "already in a call");
+    return;
+  }
 
   PulseRestConnectionConfig cfg{};
   cfg.server_address = server.c_str ();
@@ -761,10 +906,9 @@ conf_connect (App & app)
   PulseError err = pulse_connect_with_rest_async (app.conf, &cfg, &rcb, &pcb);
   if (err != PULSE_SUCCESS) {
     set_status (app, std::string ("connect: ") + pulse_strerror (err));
-    pulse_free (app.conf);
-    app.conf = nullptr;
-    return;
+    return; // the instance stays; only this call attempt failed
   }
+  app.call_started = true;
 
   // Open the push side now, so the moment a canvas is composited it can go
   // out. Content goes on the PRESENTATION slot, which additionally needs the
@@ -783,7 +927,7 @@ conf_connect (App & app)
 static void
 conf_disconnect (App & app)
 {
-  if (!app.conf)
+  if (!app.conf || !app.call_started)
     return;
   if (app.floor_taken) {
     pulse_participant_control_release_floor (app.conf, nullptr);
@@ -794,9 +938,7 @@ conf_disconnect (App & app)
     app.input_open = false;
   }
   pulse_disconnect (app.conf, nullptr);
-  pulse_options_set_conference_state_callback (app.conf, nullptr);
-  pulse_free (app.conf);
-  app.conf = nullptr;
+  app.call_started = false;
   app.conf_status.store (PULSE_CONNECTION_STATUS_DISCONNECTED);
   set_status (app, "");
 }
@@ -989,7 +1131,7 @@ ui_settings (App & app)
                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
                   ImGuiWindowFlags_AlwaysAutoResize);
 
-  const bool live = app.conf != nullptr;
+  const bool live = app.call_started;
 
   // ---- Conference -------------------------------------------------------
   ImGui::TextDisabled ("CONFERENCE");
@@ -1010,6 +1152,52 @@ ui_settings (App & app)
     ImGui::EndDisabled ();
     if (live)
       ImGui::TextDisabled ("Stop sending to change these.");
+  }
+
+  // ---- Registration -----------------------------------------------------
+  ImGui::Dummy (ImVec2 (0, 8));
+  ImGui::TextDisabled ("REGISTRATION");
+  {
+    static char host[256], alias[256], user[256], pass[256];
+    if (ImGui::IsWindowAppearing ()) {
+      snprintf (host, sizeof (host), "%s", app.cfg.reg_host.c_str ());
+      snprintf (alias, sizeof (alias), "%s", app.cfg.reg_alias.c_str ());
+      snprintf (user, sizeof (user), "%s", app.cfg.reg_user.c_str ());
+      snprintf (pass, sizeof (pass), "%s", app.cfg.reg_pass.c_str ());
+    }
+
+    int rs = app.reg_status.load ();
+    bool registered = rs == PULSE_CONNECTION_STATUS_CONNECTED;
+    bool busy = app.reg_in_flight.load () || rs == PULSE_CONNECTION_STATUS_CONNECTING ||
+                rs == PULSE_CONNECTION_STATUS_DISCONNECTING;
+
+    ImGui::BeginDisabled (registered || busy);
+    if (ImGui::InputText ("Host / domain", host, sizeof (host)))
+      app.cfg.reg_host = host;
+    if (ImGui::InputText ("Device alias", alias, sizeof (alias)))
+      app.cfg.reg_alias = alias;
+    if (ImGui::InputText ("Username", user, sizeof (user)))
+      app.cfg.reg_user = user;
+    if (ImGui::InputText ("Password", pass, sizeof (pass), ImGuiInputTextFlags_Password))
+      app.cfg.reg_pass = pass;
+    ImGui::EndDisabled ();
+
+    ImGui::Checkbox ("Register on startup", &app.cfg.reg_auto);
+
+    ImGui::BeginDisabled (busy);
+    if (registered) {
+      if (pill_button (app, "Deregister", theme::StatusError, ImVec2 (110, 26), true))
+        start_deregister (app);
+    } else {
+      if (pill_button (app, "Register", theme::AccentPrimary, ImVec2 (110, 26), true)) {
+        save_config (app);
+        start_register (app);
+      }
+    }
+    ImGui::EndDisabled ();
+    ImGui::SameLine ();
+    ImGui::TextDisabled ("%s", registered ? "registered" : busy ? "working…" : "not registered");
+    ImGui::TextDisabled ("Lets a conference dial the wall, and enables directory search.");
   }
 
   // ---- Canvas & sending -------------------------------------------------
@@ -1239,6 +1427,17 @@ ui_canvas (App & app, ImVec2 size)
 //  main
 // ----------------------------------------------------------------------------
 
+// Registration requires a handle built by pulse_new_with_internal_sso_handling()
+// on macOS/Linux — plain pulse_new() fails with "missing sso callbacks" even for
+// password auth. We never start an SSO flow (this returns -1, "no provider
+// chosen"), so no pexip-auth:// callback is ever expected and no .app bundle is
+// needed. See the README's Planned section.
+static int
+on_sso_select (PulseSSOProviderList *, void *)
+{
+  return -1;
+}
+
 int
 main (int argc, char ** argv)
 {
@@ -1299,10 +1498,30 @@ main (int argc, char ** argv)
   g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
   g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
 
-  // Before any other instance — see App::keepalive.
-  app.keepalive = pulse_new ();
-  if (!app.keepalive)
-    std::fprintf (stderr, "[uavwall] warning: keepalive pulse_new() failed\n");
+  // Created before any feed instance and freed last: this is both the
+  // conference instance and the one that keeps Pulse's global state alive.
+#if defined(HOST_WINDOWS)
+  app.conf = pulse_new ();
+#else
+  app.conf = pulse_new_with_internal_sso_handling (argc, (const char **) argv, on_sso_select, &app);
+#endif
+  if (!app.conf) {
+    std::fprintf (stderr, "[uavwall] pulse_new() failed — cannot continue\n");
+    return 1;
+  }
+  pulse_options_set_self_view_window_handle (app.conf, nullptr);
+  pulse_options_set_remote_video_window_handle (app.conf, nullptr);
+  pulse_options_set_presentation_video_window_handle (app.conf, nullptr);
+  pulse_options_set_application_user_agent_string (app.conf, "uavwall/0.1");
+  {
+    PulseConferenceStatusCallbackConfig scb{on_conf_status, &app};
+    pulse_options_set_conference_state_callback (app.conf, &scb);
+    PulseRegistrationStatusCallbackConfig rcb{on_reg_status, &app};
+    pulse_options_set_registration_state_callback (app.conf, &rcb);
+  }
+
+  if (app.cfg.reg_auto)
+    start_register (app);
 
   float xscale = 1.0f, yscale = 1.0f;
   glfwGetWindowContentScale (window, &xscale, &yscale);
@@ -1359,7 +1578,7 @@ main (int argc, char ** argv)
     }
 
     // Presenting requires the floor, and only once the call is established.
-    if (app.conf && app.cfg.send_as_content && !app.floor_taken &&
+    if (app.call_started && app.cfg.send_as_content && !app.floor_taken &&
         app.conf_status.load () == PULSE_CONNECTION_STATUS_CONNECTED) {
       pulse_participant_control_take_floor (app.conf, nullptr);
       app.floor_taken = true;
@@ -1419,15 +1638,70 @@ main (int argc, char ** argv)
         primed = true;
       }
       ImGui::SetNextItemWidth (300);
-      if (ImGui::InputTextWithHint ("##vmr", "vmr@server", vmr_buf, sizeof (vmr_buf)))
+      bool registered = app.reg_status.load () == PULSE_CONNECTION_STATUS_CONNECTED;
+      const char * hint = registered ? "vmr@server — or search" : "vmr@server";
+      if (ImGui::InputTextWithHint ("##vmr", hint, vmr_buf, sizeof (vmr_buf)))
         app.cfg.vmr = vmr_buf;
+
+      // The field degrades to plain entry when not registered: the directory
+      // query only works against a registrar we are registered to.
+      ImVec2 f_min = ImGui::GetItemRectMin (), f_max = ImGui::GetItemRectMax ();
+      bool field_active = ImGui::IsItemActive ();
+      if (registered)
+        refresh_vmr_hits (app, vmr_buf);
+
+      bool keep_list = field_active || app.vmr_popup_hovered;
+      if (registered && keep_list && !app.vmr_hits.empty ()) {
+        ImGui::SetNextWindowPos (ImVec2 (f_min.x, f_max.y + 4));
+        ImGui::SetNextWindowSize (ImVec2 (f_max.x - f_min.x, 0));
+        ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.98f));
+        ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (6, 6));
+        // NoFocusOnAppearing so typing continues uninterrupted while the list
+        // is up; it is still a real window, so its rows remain clickable.
+        ImGui::Begin ("##vmrhits", nullptr,
+                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize |
+                        ImGuiWindowFlags_NoFocusOnAppearing);
+        // AllowWhenBlockedByActiveItem: while the text field holds the active
+        // id, a plain hover test reports false and the list would close on the
+        // press rather than the release.
+        app.vmr_popup_hovered =
+          ImGui::IsWindowHovered (ImGuiHoveredFlags_AllowWhenBlockedByActiveItem | ImGuiHoveredFlags_ChildWindows);
+
+        for (size_t i = 0; i < app.vmr_hits.size (); i++) {
+          const App::AliasHit & h = app.vmr_hits[i];
+          ImGui::PushID ((int) i);
+          std::string row = h.alias;
+          if (!h.description.empty ())
+            row += "   " + h.description;
+          if (ImGui::Selectable (row.c_str ())) {
+            // Fill the field and stand down; the operator then presses
+            // "Send to VMR" when ready.
+            snprintf (vmr_buf, sizeof (vmr_buf), "%s", h.alias.c_str ());
+            app.cfg.vmr = h.alias;
+            app.vmr_last_query = h.alias; // don't immediately re-query the pick
+            app.vmr_hits.clear ();
+            app.vmr_popup_hovered = false;
+            set_status (app, "Selected " + h.alias);
+          }
+          ImGui::SameLine ();
+          ImGui::TextDisabled ("%s", h.is_device ? "device" : "conference");
+          ImGui::PopID ();
+        }
+        ImGui::End ();
+        ImGui::PopStyleVar ();
+        ImGui::PopStyleColor ();
+      } else {
+        app.vmr_popup_hovered = false;
+      }
+
       ImGui::SameLine ();
       ImGui::SetNextItemWidth (110);
       if (ImGui::InputTextWithHint ("##pin", "PIN", pin_buf, sizeof (pin_buf), ImGuiInputTextFlags_Password))
         app.cfg.pin = pin_buf;
     }
     ImGui::SameLine ();
-    if (!app.conf) {
+    if (!app.call_started) {
       if (pill_button (app, "Send to VMR", theme::AccentPrimary, ImVec2 (130, 30), true))
         conf_connect (app);
     } else {
@@ -1499,11 +1773,22 @@ main (int argc, char ** argv)
     {
       std::string s = get_status (app);
       const char * state = in_conf   ? (app.cfg.send_as_content ? "sending as content" : "sending as main video")
-                           : app.conf ? "connecting…"
-                                      : "not sending";
+                           : app.call_started ? "connecting…"
+                                              : "not sending";
       ImGui::PushFont (app.fonts.small_);
       ImGui::TextColored (theme::Hex (0xFFFFFF, in_conf ? 0.75f : theme::TextTertiary), "%s%s%s", state,
                           s.empty () ? "" : "  ·  ", s.c_str ());
+
+      {
+        int rs = app.reg_status.load ();
+        bool registered = rs == PULSE_CONNECTION_STATUS_CONNECTED;
+        ImGui::SameLine ();
+        if (registered)
+          ImGui::TextColored (theme::Hex (theme::StatusOnline, 0.85f), "  ·  registered as %s",
+                              app.cfg.reg_alias.c_str ());
+        else if (!app.cfg.reg_host.empty ())
+          ImGui::TextColored (theme::Hex (0xFFFFFF, theme::TextTertiary), "  ·  not registered");
+      }
 
       if (app.cfg.show_stats) {
         int live = 0;
@@ -1548,8 +1833,16 @@ main (int argc, char ** argv)
   conf_disconnect (app);
   for (Feed & f : app.feeds)
     stop_feed (f);
-  if (app.keepalive)
-    pulse_free (app.keepalive); // last one out
+  if (app.conf) {
+    // Drop the registration so the registrar releases the alias immediately
+    // rather than waiting for it to expire. Blocking on purpose.
+    if (app.reg_status.load () == PULSE_CONNECTION_STATUS_CONNECTED)
+      pulse_deregister (app.conf, nullptr);
+    pulse_options_set_registration_state_callback (app.conf, nullptr);
+    pulse_options_set_conference_state_callback (app.conf, nullptr);
+    pulse_free (app.conf); // last one out
+    app.conf = nullptr;
+  }
 
   ImGui_ImplOpenGL3_Shutdown ();
   ImGui_ImplGlfw_Shutdown ();
