@@ -213,6 +213,13 @@ struct App
   std::string incoming_from, incoming_alias;
   bool ringing = false;
   double ring_next_at = 0.0;
+  // The incoming call arrived while we were already in a conference, so the
+  // operator is being asked whether to drop it.
+  std::atomic<bool> incoming_busy{false};
+  // Set by the parked callback, actioned by the UI thread: leave the current
+  // conference so the incoming call can be answered. The callback cannot do
+  // this itself — it is running on a Pulse worker thread.
+  std::atomic<bool> hangup_for_incoming{false};
 
   // Benchmark mode (--bench): connect everything, lay it out, force the
   // compositor to run as if sending, sample for N seconds and print a row.
@@ -835,15 +842,14 @@ on_incoming (const PulseRegistrationsEventIncoming * event, void * ctx,
   }
   std::fprintf (stderr, "[uavwall] incoming call from %s\n", app->incoming_from.c_str ());
 
-  // Already in a conference: one Pulse instance can only be in one call.
-  // Declining is the interim behaviour — offering the operator the choice to
-  // drop the current call is the next item of work.
-  if (app->call_started) {
-    set_status (*app, "Incoming call rejected — already in a conference");
-    return false;
-  }
+  // One Pulse instance can only be in one conference, so answering while
+  // already in a call means leaving that one first. Auto-accept deliberately
+  // does NOT apply here: dropping a call in progress is the operator's
+  // decision, never the software's.
+  const bool busy = app->call_started;
+  app->incoming_busy.store (busy);
 
-  if (app->cfg.auto_accept) {
+  if (!busy && app->cfg.auto_accept) {
     app->incoming_answer.store (1);
   } else {
     app->incoming_answer.store (-1);
@@ -854,6 +860,27 @@ on_incoming (const PulseRegistrationsEventIncoming * event, void * ctx,
   }
 
   bool accept = app->incoming_answer.load () == 1;
+
+  if (accept && busy) {
+    // Ask the UI thread to tear the current conference down, then wait for it
+    // to actually reach DISCONNECTED before accepting — Pulse will not put us
+    // into a second conference while the first is still up. Bounded, so a
+    // disconnect that never completes cannot strand this worker thread.
+    app->hangup_for_incoming.store (true);
+    const int kTimeoutMs = 10000;
+    int waited = 0;
+    while (app->conf_status.load () != PULSE_CONNECTION_STATUS_DISCONNECTED && waited < kTimeoutMs) {
+      std::this_thread::sleep_for (std::chrono::milliseconds (100));
+      waited += 100;
+    }
+    if (app->conf_status.load () != PULSE_CONNECTION_STATUS_DISCONNECTED) {
+      std::fprintf (stderr, "[uavwall] gave up waiting for the current call to end\n");
+      set_status (*app, "Could not leave the current conference — incoming call rejected");
+      app->hangup_for_incoming.store (false);
+      accept = false;
+    }
+  }
+  app->incoming_busy.store (false);
   if (accept) {
     result_cb->func = on_conf_result;
     result_cb->user_context = app;
@@ -1480,7 +1507,7 @@ ui_incoming (App & app, ImVec2 win_size)
 
   ImVec2 vp = ImGui::GetMainViewport ()->Pos;
   ImGui::SetNextWindowPos (ImVec2 (vp.x + win_size.x / 2, vp.y + 70), ImGuiCond_Always, ImVec2 (0.5f, 0.0f));
-  ImGui::SetNextWindowSize (ImVec2 (400 * theme::scale, 0));
+  ImGui::SetNextWindowSize (ImVec2 ((app.incoming_busy.load () ? 460.0f : 400.0f) * theme::scale, 0));
   ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.98f));
   ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (theme::AccentPrimary, 0.5f));
   ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (18, 16));
@@ -1489,17 +1516,29 @@ ui_incoming (App & app, ImVec2 win_size)
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
 
+  bool busy = app.incoming_busy.load ();
+
   ImGui::PushFont (app.fonts.bodyBold);
-  ImGui::TextUnformatted ("Incoming call");
+  ImGui::TextUnformatted (busy ? "Incoming call — already in a conference" : "Incoming call");
   ImGui::PopFont ();
   ImGui::TextDisabled ("%s%s%s", from.c_str (), alias.empty () ? "" : "  ·  ", alias.c_str ());
+  if (busy)
+    ImGui::TextDisabled ("Accepting will leave the conference the wall is in now.");
   ImGui::Dummy (ImVec2 (0, 8));
 
-  if (pill_button (app, "Accept", theme::StatusOnline, ImVec2 (120, 30), true))
-    app.incoming_answer.store (1);
-  ImGui::SameLine ();
-  if (pill_button (app, "Decline", theme::StatusError, ImVec2 (120, 30), true))
-    app.incoming_answer.store (0);
+  if (busy) {
+    if (pill_button (app, "Disconnect and accept", theme::StatusError, ImVec2 (220, 30), true))
+      app.incoming_answer.store (1);
+    ImGui::SameLine ();
+    if (pill_button (app, "Reject", theme::AccentPrimary, ImVec2 (120, 30), true))
+      app.incoming_answer.store (0);
+  } else {
+    if (pill_button (app, "Accept", theme::StatusOnline, ImVec2 (120, 30), true))
+      app.incoming_answer.store (1);
+    ImGui::SameLine ();
+    if (pill_button (app, "Decline", theme::StatusError, ImVec2 (120, 30), true))
+      app.incoming_answer.store (0);
+  }
 
   ImGui::End ();
   ImGui::PopStyleVar (2);
@@ -1770,6 +1809,24 @@ main (int argc, char ** argv)
         play_ring ();
         app.ring_next_at = now + 2.6;
       }
+    }
+
+    // A parked incoming call is waiting for us to leave the current
+    // conference. Async, so the UI keeps drawing; the callback is watching
+    // conf_status for the transition.
+    if (app.hangup_for_incoming.exchange (false)) {
+      if (app.floor_taken) {
+        pulse_participant_control_release_floor (app.conf, nullptr);
+        app.floor_taken = false;
+      }
+      if (app.input_open) {
+        pulse_data_session_disconnect (app.conf, PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT, app.input_content);
+        app.input_open = false;
+      }
+      PulseAsyncOperationResultCallbackConfig rcb{on_conf_result, &app};
+      pulse_disconnect_async (app.conf, &rcb, nullptr);
+      app.call_started = false;
+      set_status (app, "Leaving the current conference for the incoming call…");
     }
 
     // Attach the canvas once the conference is up — dialled or answered.
