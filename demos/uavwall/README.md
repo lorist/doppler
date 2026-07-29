@@ -229,7 +229,22 @@ The pieces, all ported from [`pexclient`](../pexclient/):
   plus the registration-state callback for status in the footer.
 * `pulse_options_set_registrations_events_callbacks()` for incoming calls —
   a parked-callback flow, where the Pulse worker blocks until the UI accepts or
-  declines. A demo wall probably wants an auto-accept option.
+  declines. An unattended wall wants an auto-accept option.
+
+  **When the wall is already in a call**, an incoming call must not be silently
+  dropped: ring (audible, plus a Dock bounce and window raise, as pexclient
+  does) and put the choice to the operator —
+
+  * *Disconnect and take the incoming call* — leave the current conference,
+    then answer.
+  * *Reject* — decline and stay where we are.
+
+  Note the ordering hazard: Pulse's incoming callback blocks a worker thread
+  until it returns, and leaving the current conference is itself asynchronous.
+  Accepting therefore means initiating the disconnect, waiting for the
+  conference state to reach DISCONNECTED, and only then returning `true` — all
+  without deadlocking against the UI thread that owns the answer. Worth
+  prototyping that sequence before building the dialog around it.
 * Config: registration host, alias, username, password, and whether to register
   on startup.
 
