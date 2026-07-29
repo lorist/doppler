@@ -15,5 +15,14 @@ imgui.ini
 # Local client configuration — contains registration credentials, never commit
 pexninja-config.txt
 pexclient-config.txt
+uavwall-feeds.txt
+uavwall.conf
+
+# Editor / agent settings
 .claude/
+
+# macOS
 .DS_Store
+
+# Demo footage — large binaries, and usually not ours to redistribute
+UAV_footage/

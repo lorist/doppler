@@ -46,6 +46,7 @@ option(BUILD_PEXNINJA    "Build the larger pexninja reference client"       OFF)
 option(BUILD_DOPPLER_SIP "Build the SIP-signalling demo (needs PJSIP)"      OFF)
 option(BUILD_VIDEOWALL   "Build the videowall multi-Pulse compositor"       ON)
 option(BUILD_PEXCLIENT   "Build the pexclient home-screen client"           ON)
+option(BUILD_UAVWALL     "Build the uavwall UAV-feeds-to-VMR demo"          ON)
 
 if(BUILD_DOPPLER)
     add_subdirectory(demos/doppler)
@@ -69,4 +70,8 @@ endif()
 
 if(BUILD_PEXCLIENT)
     add_subdirectory(demos/pexclient)
+endif()
+
+if(BUILD_UAVWALL)
+    add_subdirectory(demos/uavwall)
 endif()
