@@ -274,6 +274,20 @@ What registration enables:
   picking one fills the field, ready to send. Unregistered, the field is plain
   text entry rather than appearing broken.
 
+**One instance per alias.** Infinity allows a device alias to be registered
+once; starting a second uavwall with the same `reg_alias` displaces the first,
+and the displaced one then logs
+
+```
+Failed to refresh registrations(<alias>) token: Unexpected reply from server.
+```
+
+once a second until it gives up. The same thing happens after an unclean stop,
+because the registration survives on the server until it expires — so the app
+handles SIGINT and SIGTERM and runs its normal shutdown (deregister, stop
+recordings, disconnect) rather than dying where it stands. Ctrl-C is safe;
+`kill -9` is not, and neither is running two copies against one alias.
+
 Registration belongs to a single Pulse instance, and an incoming call is
 answered on that same one — so the long-lived instance that keeps global
 GStreamer state alive is also the conference instance, rather than one being

@@ -4086,6 +4086,20 @@ ui_footer (App & app, float width)
 //  main
 // ----------------------------------------------------------------------------
 
+// Ctrl-C is how this gets stopped in a terminal, and dying on the spot leaves
+// the device alias registered on Infinity until it expires — after which the
+// next run is a *second* registration of the same alias, which displaces the
+// first and leaves whichever lost the race retrying its token refresh once a
+// second. So the signal only asks the loop to finish, and the normal shutdown
+// (deregister, stop recordings, disconnect) runs as if the window was closed.
+static volatile sig_atomic_t g_quit = 0;
+
+static void
+on_signal (int)
+{
+  g_quit = 1; // async-signal-safe: set a flag, nothing else
+}
+
 // Registration requires a handle built by pulse_new_with_internal_sso_handling()
 // on macOS/Linux — plain pulse_new() fails with "missing sso callbacks" even for
 // password auth. We never start an SSO flow (this returns -1, "no provider
@@ -4157,6 +4171,9 @@ main (int argc, char ** argv)
   // Resolved once, for both normal and bench starts.
   find_ffmpeg ();
 
+  signal (SIGINT, on_signal);
+  signal (SIGTERM, on_signal);
+
   g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
   g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
 
@@ -4216,7 +4233,7 @@ main (int argc, char ** argv)
                   app.bench_seconds);
   }
 
-  while (!glfwWindowShouldClose (window)) {
+  while (!glfwWindowShouldClose (window) && !g_quit) {
     glfwPollEvents ();
 
 
