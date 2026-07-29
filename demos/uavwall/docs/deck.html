@@ -111,15 +111,19 @@
               one feed full screen, or nine at a glance, changed live.</li>
           <li><b>Delivered as a normal Pexip participant</b> — no special
               client, no plugin. Anyone already able to join the meeting can see it.</li>
+          <li><b>Dialled out, or dialled into</b> — the wall registers to
+              Infinity, so a conference can call it up on demand.</li>
         </ul>
       </div>
       <div>
         <ul>
           <li><b>Main video or content</b> — replace the camera, or send it
               on the presentation stream alongside the participants.</li>
+          <li><b>Recorded locally</b> — any feed at source quality, and the
+              composed wall, straight to MP4.</li>
           <li><b>Runs on a small PC</b> — measured, not estimated; see the
               sizing slide.</li>
-          <li><b>Built on the Pulse SDK</b> — roughly 1,400 lines, one file.</li>
+          <li><b>Built on the Pulse SDK</b> — roughly 4,500 lines, one file.</li>
         </ul>
       </div>
     </div>
@@ -211,8 +215,8 @@
 
       <!-- note -->
       <rect x="600" y="330" width="530" height="72" rx="12" fill="rgba(255,255,255,0.04)" stroke="rgba(255,255,255,0.07)"/>
-      <text class="n-sub" x="622" y="358" style="font-size:15px">The wall is a normal conference participant — so recording,</text>
-      <text class="n-sub" x="622" y="380" style="font-size:15px">streaming and access control are whatever Pexip already enforces.</text>
+      <text class="n-sub" x="622" y="358" style="font-size:15px">The wall is a normal conference participant — so streaming, recording</text>
+      <text class="n-sub" x="622" y="380" style="font-size:15px">and access control remain whatever Pexip already enforces centrally.</text>
     </svg>
   </div>
   <div class="foot"><span>uavwall · operational architecture</span><span>3</span></div>
@@ -303,7 +307,7 @@
 <section class="slide">
   <div class="inner">
     <div class="kicker">Operating it</div>
-    <h2>Four actions, no training</h2>
+    <h2>Five actions, no training</h2>
     <div class="rule"></div>
     <div class="two" style="gap:28px; margin-top:6px">
       <div class="card">
@@ -326,13 +330,19 @@
       </div>
       <div class="card">
         <h3>4 · Send</h3>
-        <p>Enter the VMR and send. The canvas becomes the participant's video —
-           or its content stream — and updates live as the wall is rearranged.</p>
+        <p>Enter the VMR and send — or let the conference dial the wall. The
+           canvas becomes the participant's video, or its content stream.</p>
+      </div>
+      <div class="card">
+        <h3>5 · Record</h3>
+        <p>Arm any feed, or the wall itself, at any time. Feeds are captured at
+           <b>source</b> quality, independently of what is on the canvas.</p>
       </div>
     </div>
     <p class="sub" style="font-size:20px; margin-top:34px">
       Everything is live: rearranging the wall changes what the meeting sees
-      immediately, with no renegotiation and no interruption.
+      immediately, with no renegotiation and no interruption. Layouts can be
+      saved to three slots and recalled with one click.
     </p>
   </div>
   <div class="foot"><span>uavwall · operator workflow</span><span>5</span></div>
@@ -348,26 +358,33 @@
       <div>
         <ul>
           <li><b>Any number of RTSP feeds</b>, named with callsigns, TCP or UDP,
-              configurable jitter buffer.</li>
-          <li><b>Live status per feed</b> — receiving, stalled, failed — with the
-              underlying error surfaced, not swallowed.</li>
-          <li><b>Layout presets and free positioning</b>, with full-screen punch
-              and restore.</li>
+              connected individually or all at once.</li>
+          <li><b>Live status per feed</b> — receiving, stalled, failed — with an
+              inspector giving URL, transport, uptime and last-frame age, and the
+              underlying error surfaced rather than swallowed.</li>
+          <li><b>Feed-loss alerts</b> — a source that stops delivering raises an
+              audible and visual alarm, and clears itself when frames resume.</li>
+          <li><b>Layout presets, free positioning and three saved layouts</b>,
+              with full-screen punch and restore.</li>
           <li><b>Send as main video or as content</b>, taking the conference
               floor automatically for content.</li>
         </ul>
       </div>
       <div>
         <ul>
+          <li><b>Registered to Infinity</b> — the wall can be dialled, searches
+              the directory for VMRs, and answers incoming calls; if it is
+              already in a conference the operator is asked before it leaves.</li>
+          <li><b>Local recording</b> — feeds captured by stream copy at source
+              quality for 0.3% of a core, and the composed wall encoded in
+              hardware.</li>
           <li><b>Send resolution and frame rate</b> selectable — the two levers
               that decide the hardware you need.</li>
-          <li><b>Live instrumentation</b> — per-feed resolution and frame rate,
-              process CPU and memory, and the real transmit bitrate, packet loss
-              and round-trip time from Pulse.</li>
+          <li><b>Live instrumentation</b> — per-feed rates, process CPU and
+              memory, and the real transmit bitrate, loss and round-trip time
+              from Pulse.</li>
           <li><b>Reproducible benchmark</b> built in, so capacity can be measured
               on any candidate machine.</li>
-          <li><b>Self-contained demo rig</b> — synthetic or real footage, no
-              aircraft and no internet required.</li>
         </ul>
       </div>
     </div>
@@ -375,7 +392,77 @@
   <div class="foot"><span>uavwall · features</span><span>6</span></div>
 </section>
 
-<!-- 7 ─ Performance ------------------------------------------------------- -->
+<!-- 7 ─ Reachability + recording ----------------------------------------- -->
+<section class="slide">
+  <div class="inner">
+    <div class="kicker">Reach &amp; evidence</div>
+    <h2>Called on demand, and kept afterwards</h2>
+    <div class="rule" style="margin-bottom:18px"></div>
+
+    <div class="two" style="gap:48px">
+      <div>
+        <svg width="660" height="300" viewBox="0 0 660 300">
+          <defs>
+            <marker id="ar3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+              <path d="M0,0 L10,5 L0,10 z" fill="#5B6CE8"/>
+            </marker>
+          </defs>
+
+          <rect x="10" y="30" width="230" height="86" rx="14" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.09)"/>
+          <text class="n-label" x="32" y="62">Command HQ</text>
+          <text class="n-sub" x="32" y="86">dials fob.sydney@…</text>
+
+          <rect x="380" y="30" width="250" height="86" rx="14" fill="rgba(91,108,232,0.16)" stroke="#5B6CE8" stroke-width="2"/>
+          <text class="n-label" x="404" y="62">uavwall</text>
+          <text class="n-sub" x="404" y="86">registered device</text>
+
+          <path d="M240,73 L380,73" stroke="#5B6CE8" stroke-width="2" fill="none" marker-end="url(#ar3)"/>
+          <text class="e-label" x="256" y="60">incoming call</text>
+
+          <rect x="10" y="170" width="230" height="86" rx="14" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.09)"/>
+          <text class="n-label" x="32" y="202">Any VMR</text>
+          <text class="n-sub" x="32" y="226">found by directory search</text>
+
+          <path d="M380,213 L240,213" stroke="#5B6CE8" stroke-width="2" fill="none" marker-end="url(#ar3)"/>
+          <text class="e-label" x="256" y="200">dials out, with PIN</text>
+
+          <rect x="380" y="170" width="250" height="86" rx="14" fill="rgba(91,108,232,0.16)" stroke="#5B6CE8" stroke-width="2"/>
+          <text class="n-label" x="404" y="202">uavwall</text>
+          <text class="n-sub" x="404" y="226">operator initiates</text>
+        </svg>
+        <p class="sub" style="font-size:18px; margin-top:4px">
+          Registered with a device credential — no per-person sign-in on an
+          unattended wall. A call arriving while it is already engaged is the
+          operator's decision, never a silent drop.
+        </p>
+      </div>
+
+      <div>
+        <div class="card" style="margin-bottom:18px">
+          <h3>Feeds — captured at source</h3>
+          <p>ffmpeg copies the RTSP stream without decoding it: <b>0.3% of a
+             core</b> per recording, and the file holds the original picture, not
+             the downscaled wall tile. Independent of what is on the canvas, or
+             even connected.</p>
+        </div>
+        <div class="card" style="margin-bottom:18px">
+          <h3>The wall — exactly what was sent</h3>
+          <p>The same composed frames that go to the meeting are encoded in
+             hardware to a second file, so the recording is the programme, not a
+             re-creation of it.</p>
+        </div>
+        <div class="card">
+          <h3>Named for the record</h3>
+          <p><span class="mono">HAWKEYE-21_20260729T085346Z.mp4</span> — callsign
+             and UTC start, into a folder of your choosing.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span>uavwall · reach and recording</span><span>7</span></div>
+</section>
+
+<!-- 8 ─ Performance ------------------------------------------------------- -->
 <section class="slide">
   <div class="inner">
     <div class="kicker">Sizing · measured, not estimated</div>
@@ -412,10 +499,10 @@
       </div>
     </div>
   </div>
-  <div class="foot"><span>uavwall · sizing</span><span>7</span></div>
+  <div class="foot"><span>uavwall · sizing</span><span>8</span></div>
 </section>
 
-<!-- 8 ─ Running it -------------------------------------------------------- -->
+<!-- 9 ─ Running it -------------------------------------------------------- -->
 <section class="slide">
   <div class="inner">
     <div class="kicker">Running the demonstration</div>
@@ -438,11 +525,11 @@
       <h3>Built on the Pexip Pulse SDK</h3>
       <p>One Pulse instance per feed pulls and decodes RTSP; a further instance
          joins the conference and accepts the composed frames. The same SDK
-         underlying Pexip's own clients — approximately 1,400 lines of
+         underlying Pexip's own clients — approximately 4,500 lines of
          application code.</p>
     </div>
   </div>
-  <div class="foot"><span>uavwall</span><span>8</span></div>
+  <div class="foot"><span>uavwall</span><span>9</span></div>
 </section>
 
 </body>
