@@ -204,6 +204,33 @@ with ffmpeg's `geq` filter cost 5x that.) This is an artefact of the test rig
 and disappears when real aircraft supply the feeds — run it on a separate
 machine with `-a` when measuring.
 
+## Planned
+
+Features to borrow from [`pexclient`](../pexclient/), which already implements
+each of them against a live Infinity deployment:
+
+* **Register to Infinity**, with username/password or SSO, so the wall is a
+  known device rather than an anonymous guest — and so it can be called.
+  pexclient's `start_register()` and its registration-state callback port
+  directly.
+* **Join SSO-protected VMRs**, including the PIN-then-SSO sequence. Both are
+  parked-callback flows in Pulse (the worker thread blocks until the UI
+  answers), the same shape as pexclient's PIN and provider-chooser modals.
+* **An `.app` bundle**, which is a *prerequisite* for either of the above on
+  macOS: Infinity returns the IdP token as a `pexip-auth://` URL, and macOS only
+  delivers custom URL schemes to bundles that declare one. See pexclient's
+  `make-bundle.sh` and the SSO prerequisites table in its README.
+
+Two implementation notes for whoever picks this up:
+
+* The conference instance must be created with
+  `pulse_new_with_internal_sso_handling()` rather than `pulse_new()` — on macOS
+  registration fails without it even for password auth. Whether the per-feed
+  instances and the keepalive can remain plain `pulse_new()` needs checking,
+  since the first instance created performs global initialisation.
+* Registration is a property of one Pulse instance. uavwall runs many, so the
+  registered identity should live on the conference instance only.
+
 ## Where things live
 
 ```
