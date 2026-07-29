@@ -18,5 +18,12 @@ target_link_libraries(uavwall PRIVATE
     pexip::pulse
     Threads::Threads)
 
+# AudioToolbox: the incoming-call ring tone (a macOS system sound).
+if(APPLE)
+    find_library(AUDIOTOOLBOX_LIBRARY AudioToolbox REQUIRED)
+    find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+    target_link_libraries(uavwall PRIVATE ${AUDIOTOOLBOX_LIBRARY} ${COREFOUNDATION_LIBRARY})
+endif()
+
 pulse_demo_rpath(uavwall)
 pulse_demo_launcher(uavwall run-uavwall.sh)

@@ -35,10 +35,12 @@
 #include <pexpulse/pulse_options.h>
 #include <pexpulse/pulse_participant_control.h>
 #include <pexpulse/pulse_registrations.h>
+#include <pexpulse/pulse_registrations_event.h>
 #include <pexpulse/pulse_media_stats.h>
 #include <pexpulse/pulse_rtsp_session.h>
 
 #if defined(__APPLE__)
+#include <AudioToolbox/AudioToolbox.h>
 #include <mach/mach.h>
 #endif
 #include <sys/resource.h>
@@ -50,6 +52,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <thread>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -89,6 +92,9 @@ struct Config
   std::string reg_user;
   std::string reg_pass;
   bool reg_auto = false;
+  // An unattended wall should answer without anyone present. Off by default so
+  // a demo machine does not surprise its operator.
+  bool auto_accept = false;
 
   // Feeds
   bool rtsp_tcp = true;                  // TCP suits most IP cameras
@@ -199,6 +205,15 @@ struct App
   // list itself was hovered last frame and keep it up in that case.
   bool vmr_popup_hovered = false;
 
+  // Incoming calls. Pulse's callback blocks one of its worker threads until we
+  // answer, so it parks on `pending` and polls `answer` while the UI decides.
+  std::atomic<bool> incoming_pending{false};
+  std::atomic<int> incoming_answer{-1}; // -1 undecided, 0 decline, 1 accept
+  std::mutex incoming_mutex;
+  std::string incoming_from, incoming_alias;
+  bool ringing = false;
+  double ring_next_at = 0.0;
+
   // Benchmark mode (--bench): connect everything, lay it out, force the
   // compositor to run as if sending, sample for N seconds and print a row.
   // Exists so capacity numbers are reproducible without anyone clicking.
@@ -306,6 +321,8 @@ load_config (App & app)
       app.cfg.reg_pass = v;
     else if (k == "reg_auto")
       app.cfg.reg_auto = (v == "true");
+    else if (k == "auto_accept")
+      app.cfg.auto_accept = (v == "true");
     else if (k == "canvas") {
       int w = 0, h = 0;
       if (sscanf (v.c_str (), "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
@@ -367,7 +384,8 @@ save_config (App & app)
   ofs << "reg_alias=" << app.cfg.reg_alias << "\n";
   ofs << "reg_user=" << app.cfg.reg_user << "\n";
   ofs << "reg_pass=" << app.cfg.reg_pass << "\n";
-  ofs << "reg_auto=" << (app.cfg.reg_auto ? "true" : "false") << "\n\n";
+  ofs << "reg_auto=" << (app.cfg.reg_auto ? "true" : "false") << "\n";
+  ofs << "auto_accept=" << (app.cfg.auto_accept ? "true" : "false") << "\n\n";
   ofs << "# What the far end receives. 1280x720 roughly halves compositing cost.\n";
   ofs << "canvas=" << app.cfg.canvas_w << "x" << app.cfg.canvas_h << "\n";
   ofs << "send_fps=" << app.cfg.send_fps << "\n";
@@ -767,6 +785,99 @@ on_conf_progress (const PulseOperationProgressInfo * info, void * ctx)
 }
 
 // ----------------------------------------------------------------------------
+//  Incoming calls
+// ----------------------------------------------------------------------------
+
+#if defined(__APPLE__)
+static void
+play_ring ()
+{
+  static SystemSoundID sound = 0;
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    CFURLRef url = CFURLCreateWithFileSystemPath (kCFAllocatorDefault, CFSTR ("/System/Library/Sounds/Funk.aiff"),
+                                                  kCFURLPOSIXPathStyle, false);
+    if (url) {
+      if (AudioServicesCreateSystemSoundID (url, &sound) != kAudioServicesNoError)
+        sound = 0;
+      CFRelease (url);
+    }
+  }
+  if (sound)
+    AudioServicesPlaySystemSound (sound);
+  else
+    AudioServicesPlayAlertSound (kSystemSoundID_UserPreferredAlert);
+}
+#else
+static void
+play_ring ()
+{
+}
+#endif
+
+// A conference is dialling the wall. This runs on a Pulse worker thread and
+// blocks it until we return, so the decision is parked here while the UI (or
+// the auto-accept setting) makes it. Returning true accepts; Pulse then runs
+// the usual connect flow through the callbacks we fill in.
+static bool
+on_incoming (const PulseRegistrationsEventIncoming * event, void * ctx,
+             PulseAsyncOperationResultCallbackConfig * result_cb, PulseOperationProgressCallbackConfig * progress_cb)
+{
+  auto * app = static_cast<App *> (ctx);
+
+  {
+    std::lock_guard<std::mutex> lock (app->incoming_mutex);
+    app->incoming_from = (event->remote_display_name && event->remote_display_name[0])
+                           ? event->remote_display_name
+                           : (event->remote_alias ? event->remote_alias : "unknown");
+    app->incoming_alias = event->conference_alias ? event->conference_alias : "";
+  }
+  std::fprintf (stderr, "[uavwall] incoming call from %s\n", app->incoming_from.c_str ());
+
+  // Already in a conference: one Pulse instance can only be in one call.
+  // Declining is the interim behaviour — offering the operator the choice to
+  // drop the current call is the next item of work.
+  if (app->call_started) {
+    set_status (*app, "Incoming call rejected — already in a conference");
+    return false;
+  }
+
+  if (app->cfg.auto_accept) {
+    app->incoming_answer.store (1);
+  } else {
+    app->incoming_answer.store (-1);
+    app->incoming_pending.store (true);
+    while (app->incoming_answer.load () == -1)
+      std::this_thread::sleep_for (std::chrono::milliseconds (100));
+    app->incoming_pending.store (false);
+  }
+
+  bool accept = app->incoming_answer.load () == 1;
+  if (accept) {
+    result_cb->func = on_conf_result;
+    result_cb->user_context = app;
+    progress_cb->func = on_conf_progress;
+    progress_cb->user_context = app;
+    // The canvas input session is opened when the conference reports CONNECTED
+    // (see the frame loop), which serves dial-in and dial-out alike.
+    app->call_started = true;
+    app->floor_taken = false;
+    app->input_content = app->cfg.send_as_content ? PULSE_MEDIA_CONTENT_PRESENTATION : PULSE_MEDIA_CONTENT_MAIN;
+  }
+  return accept;
+}
+
+static void
+on_incoming_cancelled (const PulseRegistrationsEventIncomingCancelled *, void * ctx)
+{
+  auto * app = static_cast<App *> (ctx);
+  if (app->incoming_pending.load ())
+    app->incoming_answer.store (0); // caller gave up; release the parked worker
+  set_status (*app, "Incoming call cancelled");
+}
+
+// ----------------------------------------------------------------------------
 //  Registration
 // ----------------------------------------------------------------------------
 
@@ -817,6 +928,15 @@ start_register (App & app)
   req.username = app.cfg.reg_user.empty () ? nullptr : app.cfg.reg_user.c_str ();
   req.password = app.cfg.reg_pass.empty () ? nullptr : app.cfg.reg_pass.c_str ();
   req.use_sso = false;
+
+  // Must be installed before registering: this is how Pulse delivers, and
+  // lets us answer, calls made to our alias.
+  PulseRegistrationsEventCallbackConfig ev{};
+  ev.registrations_event_incoming_callback = on_incoming;
+  ev.registrations_event_incoming_callback_user_context = &app;
+  ev.registrations_event_incoming_cancelled_callback = on_incoming_cancelled;
+  ev.registrations_event_incoming_cancelled_callback_user_context = &app;
+  pulse_options_set_registrations_events_callbacks (app.conf, &ev);
 
   PulseAsyncOperationResultCallbackConfig rcb{on_reg_result, &app};
   PulseOperationProgressCallbackConfig pcb{on_reg_progress, &app};
@@ -910,11 +1030,19 @@ conf_connect (App & app)
   }
   app.call_started = true;
 
-  // Open the push side now, so the moment a canvas is composited it can go
-  // out. Content goes on the PRESENTATION slot, which additionally needs the
-  // floor to be taken once the call is up (see the status handling below).
+  // The push side is opened when the conference reports CONNECTED, in the
+  // frame loop — the same path an answered incoming call takes.
   app.input_content = app.cfg.send_as_content ? PULSE_MEDIA_CONTENT_PRESENTATION : PULSE_MEDIA_CONTENT_MAIN;
   app.floor_taken = false;
+}
+
+// Attach the canvas to whichever conference we are now in, however we got
+// there (dialled out, or answered). Idempotent.
+static void
+ensure_canvas_input (App & app)
+{
+  if (!app.conf || app.input_open)
+    return;
   PulseDataSessionConfig * icfg = make_rgba_input_config (app.cfg.canvas_w, app.cfg.canvas_h);
   if (pulse_data_session_connect_input (app.conf, icfg, app.input_content) == PULSE_SUCCESS) {
     app.input_open = true;
@@ -1183,6 +1311,7 @@ ui_settings (App & app)
     ImGui::EndDisabled ();
 
     ImGui::Checkbox ("Register on startup", &app.cfg.reg_auto);
+    ImGui::Checkbox ("Answer incoming calls automatically", &app.cfg.auto_accept);
 
     ImGui::BeginDisabled (busy);
     if (registered) {
@@ -1332,6 +1461,49 @@ ui_settings (App & app)
   ImGui::End ();
   ImGui::PopStyleVar ();
   ImGui::PopStyleColor ();
+}
+
+// Incoming-call banner. A real window, top-centre, so its buttons are reliably
+// clickable above the shell and the canvas.
+static void
+ui_incoming (App & app, ImVec2 win_size)
+{
+  if (!app.incoming_pending.load ())
+    return;
+
+  std::string from, alias;
+  {
+    std::lock_guard<std::mutex> lock (app.incoming_mutex);
+    from = app.incoming_from;
+    alias = app.incoming_alias;
+  }
+
+  ImVec2 vp = ImGui::GetMainViewport ()->Pos;
+  ImGui::SetNextWindowPos (ImVec2 (vp.x + win_size.x / 2, vp.y + 70), ImGuiCond_Always, ImVec2 (0.5f, 0.0f));
+  ImGui::SetNextWindowSize (ImVec2 (400 * theme::scale, 0));
+  ImGui::PushStyleColor (ImGuiCol_WindowBg, theme::Hex (theme::WindowBgMid, 0.98f));
+  ImGui::PushStyleColor (ImGuiCol_Border, theme::Hex (theme::AccentPrimary, 0.5f));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowPadding, ImVec2 (18, 16));
+  ImGui::PushStyleVar (ImGuiStyleVar_WindowBorderSize, 1.0f);
+  ImGui::Begin ("##incoming", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                  ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize);
+
+  ImGui::PushFont (app.fonts.bodyBold);
+  ImGui::TextUnformatted ("Incoming call");
+  ImGui::PopFont ();
+  ImGui::TextDisabled ("%s%s%s", from.c_str (), alias.empty () ? "" : "  ·  ", alias.c_str ());
+  ImGui::Dummy (ImVec2 (0, 8));
+
+  if (pill_button (app, "Accept", theme::StatusOnline, ImVec2 (120, 30), true))
+    app.incoming_answer.store (1);
+  ImGui::SameLine ();
+  if (pill_button (app, "Decline", theme::StatusError, ImVec2 (120, 30), true))
+    app.incoming_answer.store (0);
+
+  ImGui::End ();
+  ImGui::PopStyleVar (2);
+  ImGui::PopStyleColor (2);
 }
 
 // The send canvas: what the VMR receives, drawn to scale.
@@ -1577,6 +1749,33 @@ main (int argc, char ** argv)
       }
     }
 
+    // Ring while an incoming call is waiting on the operator, and bring the
+    // window forward so the banner is actually seen. GLFW window calls must
+    // come from this thread, not the Pulse worker that is parked in the
+    // callback.
+    {
+      bool pending = app.incoming_pending.load ();
+      double now = ImGui::GetTime ();
+      if (pending && !app.ringing) {
+        app.ringing = true;
+        app.ring_next_at = 0.0;
+        glfwRequestWindowAttention (window);
+        if (glfwGetWindowAttrib (window, GLFW_ICONIFIED))
+          glfwRestoreWindow (window);
+        glfwFocusWindow (window);
+      } else if (!pending && app.ringing) {
+        app.ringing = false;
+      }
+      if (app.ringing && now >= app.ring_next_at) {
+        play_ring ();
+        app.ring_next_at = now + 2.6;
+      }
+    }
+
+    // Attach the canvas once the conference is up — dialled or answered.
+    if (app.call_started && app.conf_status.load () == PULSE_CONNECTION_STATUS_CONNECTED)
+      ensure_canvas_input (app);
+
     // Presenting requires the floor, and only once the call is established.
     if (app.call_started && app.cfg.send_as_content && !app.floor_taken &&
         app.conf_status.load () == PULSE_CONNECTION_STATUS_CONNECTED) {
@@ -1765,6 +1964,7 @@ main (int argc, char ** argv)
     const float rail_w = 190.0f * theme::scale;
     float body_h = ImGui::GetContentRegionAvail ().y - 30;
     ui_settings (app);
+    ui_incoming (app, vp->Size);
     ui_feed_rail (app, rail_w, body_h);
     ImGui::SameLine ();
     ui_canvas (app, ImVec2 (ImGui::GetContentRegionAvail ().x, body_h));
