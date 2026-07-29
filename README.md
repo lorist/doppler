@@ -90,6 +90,7 @@ echo /opt/pexip/lib | sudo tee /etc/ld.so.conf.d/pexip.conf && sudo ldconfig
 ```
 demos/      One folder per demo (source + README + CMakeLists).
 sdk/        The Pulse SDK artifacts: linux/ (debs + extracted), macos/, windows/.
+            Note the architecture limits — see docs/porting.md.
 cmake/      Shared CMake helpers (PulseDemo.cmake).
 docs/       adding-a-demo.md, a DEMO_TEMPLATE/ skeleton, and api/ — the
             generated Pulse C API reference (open docs/api/index.html).

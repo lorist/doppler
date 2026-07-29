@@ -56,6 +56,10 @@ cmake --build build -j --target uavwall
 ./build/run-uavwall.sh
 ```
 
+Linux should build as-is (the SDK is x86-64 only, and the incoming-call and
+feed-loss sounds are silent there); Windows needs the recording layer ported off
+POSIX. [`docs/porting.md`](../../docs/porting.md) has the detail.
+
 ## Test feeds
 
 There is no need for real drone hardware to demonstrate this.
