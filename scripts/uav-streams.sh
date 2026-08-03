@@ -22,6 +22,21 @@
 #   ./scripts/uav-streams.sh -a              # advertise LAN URLs (two-machine
 #                                            #   setup: run this on box B, point
 #                                            #   uavwall on box A at the output)
+#
+# Real devices can push *into* the same server, alongside (or instead of) the
+# synthetic feeds — one mediamtx serves both, so there is only ever one process:
+#
+#   ./scripts/uav-streams.sh -i 2            # 4 synthetic + 2 slots for wearables
+#   ./scripts/uav-streams.sh -n 0 -i 4       # ingest only, no synthetic feeds
+#   ./scripts/uav-streams.sh -I alpha,bravo  # name the ingest slots
+#   ./scripts/uav-streams.sh -i 2 -u op:s3c  # set the publish credential
+#   ./scripts/uav-streams.sh -i 2 -o         # open ingest, no credential
+#
+# Ingest accepts RTMP, SRT, RTSP-push and WebRTC/WHIP on one port each, with a
+# path per device, and re-serves every one as RTSP — which is all uavwall pulls.
+# SRT matters: it is what most LTE-bonded wearables use, and Pulse cannot speak
+# it, which is the reason this is a separate service rather than something the
+# app listens for itself.
 #   Ctrl-C                                   # stops the server and every feed
 #
 # NOTE on imagery: the synthetic styles are deliberately abstract. ffmpeg can
@@ -34,6 +49,14 @@
 set -e
 
 FEEDS=4
+INGEST=0
+INGEST_NAMES=""
+PUB_USER="uav"
+PUB_PASS="uav"
+OPEN_INGEST=0
+RTMP_PORT=1935
+SRT_PORT=8890
+WEBRTC_PORT=8889
 WIDTH=1280
 HEIGHT=720
 FPS=25
@@ -62,6 +85,10 @@ while [ $# -gt 0 ]; do
         -t) STYLE="$2"; shift 2 ;;
         -l) LOOPLEN="$2"; shift 2 ;;
         -a) ADVERTISE=1; shift ;;
+        -i) INGEST="$2"; shift 2 ;;
+        -I) INGEST_NAMES="$2"; shift 2 ;;
+        -u) PUB_USER="${2%%:*}"; PUB_PASS="${2#*:}"; shift 2 ;;
+        -o) OPEN_INGEST=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 1 ;;
     esac
@@ -73,19 +100,66 @@ command -v ffmpeg   >/dev/null || { echo "ffmpeg not found — brew install ffmp
 WORKDIR=$(mktemp -d)
 trap 'echo; echo "stopping…"; kill 0 2>/dev/null; rm -rf "$WORKDIR"; exit 0' INT TERM
 
+# --- ingest slots -----------------------------------------------------------
+# Named paths that real devices push to. Declared rather than open, so a device
+# cannot invent a stream name and the wall's feed list stays a fixed set.
+if [ -n "$INGEST_NAMES" ]; then
+    SLUGS=$(printf "%s" "$INGEST_NAMES" | tr ',' '\n' | tr '[:upper:] ' '[:lower:]-')
+elif [ "$INGEST" -gt 0 ] 2>/dev/null; then
+    SLUGS=$(printf "%s\n" hawkeye-21 kestrel-33 nomad-14 osprey-12 sentinel-07 \
+                          talon-26 merlin-18 vigil-05 lancer-41 goshawk-09 \
+            | sed -n "1,${INGEST}p")
+else
+    SLUGS=""
+fi
+[ -n "$SLUGS" ] && INGEST=1 || INGEST=0
+
 # --- RTSP server ------------------------------------------------------------
-# Publishers create paths on demand, so no per-feed configuration is needed.
-cat > "$WORKDIR/mediamtx.yml" <<YML
-logLevel: error
-rtsp: yes
-rtspAddress: :$PORT
-rtmp: no
-hls: no
-webrtc: no
-srt: no
-paths:
-  all_others:
-YML
+# Synthetic publishers create their paths on demand; ingest paths are declared.
+# One mediamtx serves both, so a demo can mix generated feeds and real devices
+# without a second process or a second port to explain.
+{
+    echo "logLevel: error"
+    echo "rtsp: yes"
+    echo "rtspAddress: :$PORT"
+    echo "hls: no"
+    if [ "$INGEST" -eq 1 ]; then
+        echo "rtmp: yes"
+        echo "rtmpAddress: 0.0.0.0:$RTMP_PORT"
+        echo "srt: yes"
+        # A bare ":port" binds IPv6-only on macOS, and the SRT handshake from an
+        # IPv4 device then never arrives — with nothing logged at either end.
+        echo "srtAddress: 0.0.0.0:$SRT_PORT"
+        echo "webrtc: yes"
+        echo "webrtcAddress: 0.0.0.0:$WEBRTC_PORT"
+        echo ""
+        if [ "$OPEN_INGEST" -eq 0 ]; then
+            echo "authInternalUsers:"
+            # A credential is needed to publish from anywhere else; this machine
+            # can publish and read without one, which is what the synthetic
+            # ffmpeg publishers and uavwall itself need.
+            echo "  - user: $PUB_USER"
+            echo "    pass: $PUB_PASS"
+            echo "    ips: []"
+            echo "    permissions: [{action: publish}, {action: read}]"
+            echo "  - user: any"
+            echo "    ips: [\"127.0.0.1\", \"::1\"]"
+            echo "    permissions: [{action: publish}, {action: read}]"
+        fi
+    else
+        echo "rtmp: no"
+        echo "webrtc: no"
+        echo "srt: no"
+    fi
+    echo ""
+    echo "paths:"
+    if [ "$INGEST" -eq 1 ]; then
+        printf "%s\n" "$SLUGS" | while read -r sl; do
+            [ -n "$sl" ] && echo "  $sl:"
+        done
+    fi
+    echo "  all_others:"
+} > "$WORKDIR/mediamtx.yml"
 
 # Run from the work dir: mediamtx drops an auto-generated TLS cert/key beside
 # its CWD, which would otherwise litter the repository root.
@@ -231,13 +305,56 @@ drawtext=fontfile='$FONT':text='ALT ${ALT}ft  HDG ${HDG}  UAV-$i':x=28:y=h-40:fo
     i=$((i + 1))
 done
 
+# --- ingest slots: where devices push, and what the wall pulls back ----------
+if [ "$INGEST" -eq 1 ]; then
+    if [ "$OPEN_INGEST" -eq 1 ]; then
+        CRED=""
+        SRTCRED=""
+    else
+        CRED="$PUB_USER:$PUB_PASS@"
+        SRTCRED=":$PUB_USER:$PUB_PASS"
+    fi
+
+    echo
+    echo "Ingest — point each device at one of these:"
+    echo
+    printf "%s\n" "$SLUGS" | while read -r sl; do
+        [ -n "$sl" ] || continue
+        echo "  $sl"
+        echo "      RTMP  rtmp://$CRED$ADVERTISE_HOST:$RTMP_PORT/$sl"
+        echo "      SRT   srt://$ADVERTISE_HOST:$SRT_PORT?streamid=publish:$sl$SRTCRED"
+        echo "      RTSP  rtsp://$CRED$ADVERTISE_HOST:$PORT/$sl        (push)"
+        echo "      WHIP  http://$ADVERTISE_HOST:$WEBRTC_PORT/$sl/whip"
+    done
+    echo
+    if [ "$OPEN_INGEST" -eq 1 ]; then
+        echo "  No credential required — anyone who can reach this host can publish."
+    else
+        echo "  Publish credential: $PUB_USER / $PUB_PASS   (this machine needs none)"
+    fi
+
+    # Whatever a device pushes, the wall pulls back as plain RTSP.
+    printf "%s\n" "$SLUGS" | while read -r sl; do
+        [ -n "$sl" ] || continue
+        NAME=$(printf "%s" "$sl" | tr '[:lower:]-' '[:upper:] ')
+        echo "$NAME|rtsp://$ADVERTISE_HOST:$PORT/$sl" >> "$WORKDIR/ingest-feeds"
+    done
+    [ -f "$WORKDIR/ingest-feeds" ] && FEEDLINES="${FEEDLINES}$(cat "$WORKDIR/ingest-feeds")
+"
+fi
+
 echo
-if [ "$ADVERTISE" = "1" ]; then
-    echo "Paste into uavwall-feeds.txt on the operator machine:"
+if [ "$ADVERTISE" = "1" ] || [ "$INGEST" -eq 1 ]; then
+    echo "Paste into uavwall.conf on the operator machine (feed= per line):"
     echo "---8<---"
-    printf "%b" "$FEEDLINES"
+    printf "%b" "$FEEDLINES" | sed 's/^/feed=/'
     echo "--->8---"
     echo
+    if [ "$INGEST" -eq 1 ]; then
+        echo "An ingest slot with nothing attached shows as offline in the wall"
+        echo "until a device starts publishing to it."
+        echo
+    fi
 fi
 echo "Ctrl-C to stop."
 wait

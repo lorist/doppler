@@ -85,6 +85,46 @@ advertise LAN URLs.
 > the picture is obviously synthetic than that it imitates real sensor imagery.
 > Use `-f` with real footage when fidelity matters.
 
+### Real devices pushing in — wearables and body cameras
+
+The generator publishes feeds *to* the wall. Real devices work the other way:
+they push, and something has to listen. The same `mediamtx` that serves the
+synthetic feeds does that too, so it stays one process either way:
+
+```bash
+./scripts/uav-streams.sh -n 4 -i 2      # 4 synthetic feeds + 2 slots for devices
+./scripts/uav-streams.sh -n 0 -i 6      # devices only, nothing synthetic
+./scripts/uav-streams.sh -i 2 -a        # advertise the LAN address to point devices at
+```
+
+It prints a push URL per slot in each protocol and the `feed=` lines to paste
+into `uavwall.conf`. Whatever a device pushes, the wall pulls back as ordinary
+RTSP — nothing in the app changes:
+
+| Protocol | Port | Typical device |
+| --- | --- | --- |
+| SRT | 8890/udp | LTE-bonded bodycams; the usual choice on a lossy link |
+| RTMP | 1935 | most bodycams, phone encoders, OBS |
+| RTSP push | 8554 | some IP and tactical cameras |
+| WebRTC / WHIP | 8889 | browser and app-based |
+
+Publishing needs a credential (`-u user:pass`, default `uav`/`uav`, or `-o` to
+disable); this machine is exempt, since that is where the synthetic publishers
+and the wall itself run. A slot with nothing attached simply shows offline in
+the rail until a device starts sending.
+
+**Why a separate service and not the app itself.** Pulse can listen for RTMP —
+`pulse_rtmp_session_connect_input()` is a real server with TLS and auth — but
+one listener binds one port to one stream, so every device would need its own
+port. And Pulse speaks no SRT at all, which is what most LTE-bonded wearables
+use. mediamtx takes every protocol on one port each with a path per device, and
+re-serves them as the RTSP the wall already consumes.
+
+> **macOS gotcha, already handled in the script.** mediamtx binds a bare
+> `:port` as **IPv6-only**, so an SRT handshake from an IPv4 device never
+> arrives — and nothing is logged at either end, which makes it look like the
+> device is at fault. The generated config binds `0.0.0.0` explicitly.
+
 ### Running the generator on a separate machine
 
 Recommended when measuring, or when anyone might look at a task manager during
