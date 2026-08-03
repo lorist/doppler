@@ -32,6 +32,7 @@
 #   ./scripts/uav-streams.sh -I alpha,bravo  # name the ingest slots
 #   ./scripts/uav-streams.sh -i 2 -u op:s3c  # set the publish credential
 #   ./scripts/uav-streams.sh -i 2 -o         # open ingest, no credential
+#   ./scripts/uav-streams.sh -i 2 -v         # log every connection attempt
 #
 # Ingest accepts RTMP, SRT, RTSP-push and WebRTC/WHIP on one port each, with a
 # path per device, and re-serves every one as RTSP — which is all uavwall pulls.
@@ -57,6 +58,7 @@ INGEST_NAMES=""
 PUB_USER="uav"
 PUB_PASS="uav"
 OPEN_INGEST=0
+VERBOSE=0
 RTMP_PORT=1935
 SRT_PORT=8890
 WEBRTC_PORT=8889
@@ -94,6 +96,7 @@ while [ $# -gt 0 ]; do
         -I) INGEST_NAMES="$2"; shift 2 ;;
         -u) PUB_USER="${2%%:*}"; PUB_PASS="${2#*:}"; shift 2 ;;
         -o) OPEN_INGEST=1; shift ;;
+        -v) VERBOSE=1; shift ;;
         -h|--help) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 1 ;;
     esac
@@ -129,7 +132,13 @@ fi
 # One mediamtx serves both, so a demo can mix generated feeds and real devices
 # without a second process or a second port to explain.
 {
-    echo "logLevel: error"
+    # -v surfaces every connection attempt and auth rejection, which is the
+    # only way to tell "the device never reached us" from "we turned it away".
+    if [ "$VERBOSE" -eq 1 ]; then
+        echo "logLevel: info"
+    else
+        echo "logLevel: error"
+    fi
     echo "rtsp: yes"
     echo "rtspAddress: :$PORT"
     echo "hls: no"
@@ -167,7 +176,10 @@ fi
         OIFS=$IFS; IFS='
 '
         for sl in $SLUGS; do
-            [ -n "$sl" ] && echo "  $sl:"
+            # Two segments: RTMP clients require /app/stream and refuse a
+            # single-segment path. mediamtx is happy either way, and SRT
+            # accepts the slash inside its streamid.
+            [ -n "$sl" ] && echo "  live/$sl:"
         done
         IFS=$OIFS
     fi
@@ -362,10 +374,10 @@ if [ "$INGEST" -eq 1 ]; then
     for sl in $SLUGS; do
         [ -n "$sl" ] || continue
         echo "  $sl"
-        echo "      RTMP  rtmp://$CRED$ADVERTISE_HOST:$RTMP_PORT/$sl"
-        echo "      SRT   srt://$ADVERTISE_HOST:$SRT_PORT?streamid=publish:$sl$SRTCRED"
-        echo "      RTSP  rtsp://$CRED$ADVERTISE_HOST:$PORT/$sl        (push)"
-        echo "      WHIP  http://$ADVERTISE_HOST:$WEBRTC_PORT/$sl/whip"
+        echo "      RTMP  rtmp://$CRED$ADVERTISE_HOST:$RTMP_PORT/live/$sl"
+        echo "      SRT   srt://$ADVERTISE_HOST:$SRT_PORT?streamid=publish:live/$sl$SRTCRED"
+        echo "      RTSP  rtsp://$CRED$ADVERTISE_HOST:$PORT/live/$sl        (push)"
+        echo "      WHIP  http://$ADVERTISE_HOST:$WEBRTC_PORT/live/$sl/whip"
     done
     IFS=$OIFS
     echo
@@ -381,7 +393,7 @@ if [ "$INGEST" -eq 1 ]; then
     for sl in $SLUGS; do
         [ -n "$sl" ] || continue
         NAME=$(printf "%s" "$sl" | tr '[:lower:]-' '[:upper:] ')
-        echo "$NAME|rtsp://$ADVERTISE_HOST:$PORT/$sl" >> "$WORKDIR/ingest-feeds"
+        echo "$NAME|rtsp://$ADVERTISE_HOST:$PORT/live/$sl" >> "$WORKDIR/ingest-feeds"
     done
     IFS=$OIFS
     [ -f "$WORKDIR/ingest-feeds" ] && FEEDLINES="${FEEDLINES}$(cat "$WORKDIR/ingest-feeds")

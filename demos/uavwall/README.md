@@ -120,6 +120,43 @@ disable); this machine is exempt, since that is where the synthetic publishers
 and the wall itself run. A slot with nothing attached simply shows offline in
 the rail until a device starts sending.
 
+**Pointing a phone or body camera at it.** Verified with Larix Broadcaster on
+Android; the same shape applies to most encoders.
+
+* **RTMP needs two path segments** — `rtmp://host:port/app/stream`. Larix
+  refuses a single-segment URL outright ("Can't find rtmp app and stream"),
+  which is why the slots are `live/<callsign>` rather than just `<callsign>`.
+  mediamtx accepts either, so this only shows up on a real device — testing with
+  ffmpeg will not find it.
+* **Larix publishes to the app segment**, treating the whole path as the app and
+  sending no stream name, so `rtmp://host:1935/live/hawkeye-21` arrives at path
+  `live`. Pull it back from `rtsp://host:8554/live`. For several phones at once,
+  give each a distinct app segment.
+* **Credentials go in the URL for RTMP** (`rtmp://user:pass@host/...`) rather
+  than the encoder's separate Login/Password fields, which use RTMP's own auth
+  handshake. For SRT they go in the stream ID: `publish:live/<name>:user:pass`.
+* Start with `-o` (no credential) for first contact, then add auth once frames
+  are arriving — it removes a whole class of ambiguity from the first attempt.
+* The free tier of Larix burns a **watermark** into the picture, and a phone
+  held upright sends portrait video inside a landscape frame. Both matter in
+  front of an audience.
+
+**When a device will not connect**, `-v` puts mediamtx at `logLevel: info`,
+which distinguishes the two cases the encoder's own error message cannot:
+
+```bash
+./scripts/uav-streams.sh -i 2 -a -o -v
+```
+
+Nothing logged means the traffic never arrived — wrong network, client
+isolation, or a firewall. A logged connection followed by an error means it
+arrived and was refused, which names the cause. A device that connects and
+publishes appears as:
+
+```
+[RTMP] [conn 10.0.2.12:43058] is publishing to path 'live'
+```
+
 **Why a separate service and not the app itself.** Pulse can listen for RTMP —
 `pulse_rtmp_session_connect_input()` is a real server with TLS and auth — but
 one listener binds one port to one stream, so every device would need its own
