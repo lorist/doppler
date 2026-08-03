@@ -26,6 +26,7 @@
 # Real devices can push *into* the same server, alongside (or instead of) the
 # synthetic feeds — one mediamtx serves both, so there is only ever one process:
 #
+#   ./scripts/uav-streams.sh -S 1 -R 1       # 4 RTSP feeds + 1 over SRT + 1 over RTMP
 #   ./scripts/uav-streams.sh -i 2            # 4 synthetic + 2 slots for wearables
 #   ./scripts/uav-streams.sh -n 0 -i 4       # ingest only, no synthetic feeds
 #   ./scripts/uav-streams.sh -I alpha,bravo  # name the ingest slots
@@ -49,6 +50,8 @@
 set -e
 
 FEEDS=4
+SRT_FEEDS=0
+RTMP_FEEDS=0
 INGEST=0
 INGEST_NAMES=""
 PUB_USER="uav"
@@ -86,6 +89,8 @@ while [ $# -gt 0 ]; do
         -l) LOOPLEN="$2"; shift 2 ;;
         -a) ADVERTISE=1; shift ;;
         -i) INGEST="$2"; shift 2 ;;
+        -S) SRT_FEEDS="$2"; shift 2 ;;
+        -R) RTMP_FEEDS="$2"; shift 2 ;;
         -I) INGEST_NAMES="$2"; shift 2 ;;
         -u) PUB_USER="${2%%:*}"; PUB_PASS="${2#*:}"; shift 2 ;;
         -o) OPEN_INGEST=1; shift ;;
@@ -113,6 +118,11 @@ else
     SLUGS=""
 fi
 [ -n "$SLUGS" ] && INGEST=1 || INGEST=0
+# Publishing a synthetic feed over SRT or RTMP needs those listeners up, even
+# when no external device is expected.
+if [ "$SRT_FEEDS" -gt 0 ] 2>/dev/null || [ "$RTMP_FEEDS" -gt 0 ] 2>/dev/null; then
+    INGEST=1
+fi
 
 # --- RTSP server ------------------------------------------------------------
 # Synthetic publishers create their paths on demand; ingest paths are declared.
@@ -153,10 +163,13 @@ fi
     fi
     echo ""
     echo "paths:"
-    if [ "$INGEST" -eq 1 ]; then
-        printf "%s\n" "$SLUGS" | while read -r sl; do
+    if [ "$INGEST" -eq 1 ] && [ -n "$SLUGS" ]; then
+        OIFS=$IFS; IFS='
+'
+        for sl in $SLUGS; do
             [ -n "$sl" ] && echo "  $sl:"
         done
+        IFS=$OIFS
     fi
     echo "  all_others:"
 } > "$WORKDIR/mediamtx.yml"
@@ -196,7 +209,7 @@ if [ "$ADVERTISE" = "1" ]; then
     [ -n "$ADVERTISE_HOST" ] || { echo "could not determine a LAN address" >&2; ADVERTISE_HOST=127.0.0.1; }
 fi
 
-echo "Publishing $FEEDS feed(s) at ${WIDTH}x${HEIGHT}${SRCFILE:+ from $SRCFILE}${SRCDIR:+ from $SRCDIR}:"
+echo "Publishing $((FEEDS + SRT_FEEDS + RTMP_FEEDS)) feed(s) at ${WIDTH}x${HEIGHT}${SRCFILE:+ from $SRCFILE}${SRCDIR:+ from $SRCDIR}:"
 
 # A folder of clips: one per feed, in sorted order, cycling if there are fewer
 # clips than feeds. They are streamed as-is — run scripts/prepare-footage.sh
@@ -216,9 +229,30 @@ if [ -n "$SRCDIR" ]; then
 fi
 
 FEEDLINES=""
+TOTAL=$((FEEDS + SRT_FEEDS + RTMP_FEEDS))
 i=1
-while [ "$i" -le "$FEEDS" ]; do
-    URL="rtsp://127.0.0.1:$PORT/uav$i"
+while [ "$i" -le "$TOTAL" ]; do
+    # The first FEEDS publish over RTSP as they always have; any extras are the
+    # same generated picture pushed over SRT or RTMP instead, so a demo shows
+    # all three ingest paths arriving on one wall without any hardware.
+    if [ "$i" -le "$FEEDS" ]; then
+        PROTO="RTSP"
+        URL="rtsp://127.0.0.1:$PORT/uav$i"
+        OUTOPTS="-f rtsp -rtsp_transport tcp"
+        PATHNAME="uav$i"
+    elif [ "$i" -le "$((FEEDS + SRT_FEEDS))" ]; then
+        PROTO="SRT"
+        n=$((i - FEEDS))
+        PATHNAME="srt$n"
+        URL="srt://127.0.0.1:$SRT_PORT?streamid=publish:$PATHNAME"
+        OUTOPTS="-f mpegts"
+    else
+        PROTO="RTMP"
+        n=$((i - FEEDS - SRT_FEEDS))
+        PATHNAME="rtmp$n"
+        URL="rtmp://127.0.0.1:$RTMP_PORT/$PATHNAME"
+        OUTOPTS="-f flv"
+    fi
     # Callsigns rather than "FEED 01". Deliberately generic — raptors and
     # watch-words are the traditional aviation naming pool, and none of these
     # are real platform or unit names.
@@ -297,10 +331,15 @@ drawtext=fontfile='$FONT':text='ALT ${ALT}ft  HDG ${HDG}  UAV-$i':x=28:y=h-40:fo
         -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline \
         -pix_fmt yuv420p -g $((FPS * 2)) -b:v 2M -maxrate 2M -bufsize 1M \
         -c:a aac -b:a 64k -ar 48000 -ac 1 \
-        -f rtsp -rtsp_transport tcp "$URL" &
+        $OUTOPTS "$URL" &
 
-    echo "  rtsp://$ADVERTISE_HOST:$PORT/uav$i   ($LABEL)"
-    FEEDLINES="${FEEDLINES}${LABEL}|rtsp://$ADVERTISE_HOST:$PORT/uav$i
+    # However it was published, the wall pulls it back as plain RTSP.
+    if [ "$PROTO" = "RTSP" ]; then
+        echo "  rtsp://$ADVERTISE_HOST:$PORT/$PATHNAME   ($LABEL)"
+    else
+        echo "  rtsp://$ADVERTISE_HOST:$PORT/$PATHNAME   ($LABEL, published over $PROTO)"
+    fi
+    FEEDLINES="${FEEDLINES}${LABEL}|rtsp://$ADVERTISE_HOST:$PORT/$PATHNAME
 "
     i=$((i + 1))
 done
@@ -318,7 +357,9 @@ if [ "$INGEST" -eq 1 ]; then
     echo
     echo "Ingest — point each device at one of these:"
     echo
-    printf "%s\n" "$SLUGS" | while read -r sl; do
+    OIFS=$IFS; IFS='
+'
+    for sl in $SLUGS; do
         [ -n "$sl" ] || continue
         echo "  $sl"
         echo "      RTMP  rtmp://$CRED$ADVERTISE_HOST:$RTMP_PORT/$sl"
@@ -326,6 +367,7 @@ if [ "$INGEST" -eq 1 ]; then
         echo "      RTSP  rtsp://$CRED$ADVERTISE_HOST:$PORT/$sl        (push)"
         echo "      WHIP  http://$ADVERTISE_HOST:$WEBRTC_PORT/$sl/whip"
     done
+    IFS=$OIFS
     echo
     if [ "$OPEN_INGEST" -eq 1 ]; then
         echo "  No credential required — anyone who can reach this host can publish."
@@ -334,11 +376,14 @@ if [ "$INGEST" -eq 1 ]; then
     fi
 
     # Whatever a device pushes, the wall pulls back as plain RTSP.
-    printf "%s\n" "$SLUGS" | while read -r sl; do
+    OIFS=$IFS; IFS='
+'
+    for sl in $SLUGS; do
         [ -n "$sl" ] || continue
         NAME=$(printf "%s" "$sl" | tr '[:lower:]-' '[:upper:] ')
         echo "$NAME|rtsp://$ADVERTISE_HOST:$PORT/$sl" >> "$WORKDIR/ingest-feeds"
     done
+    IFS=$OIFS
     [ -f "$WORKDIR/ingest-feeds" ] && FEEDLINES="${FEEDLINES}$(cat "$WORKDIR/ingest-feeds")
 "
 fi

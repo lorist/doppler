@@ -78,7 +78,8 @@ URLs, so a fresh checkout demonstrates itself.
 
 Options: `-n` feed count, `-s WxH`, `-t sensor|bars`, `-f clip.mp4` to loop real
 footage instead, `-l` seconds of scene to pre-render, `-p` port, `-a` to
-advertise LAN URLs.
+advertise LAN URLs, `-S`/`-R` to publish extra feeds over SRT/RTMP, `-i` for
+ingest slots real devices push into.
 
 > The synthetic imagery is deliberately abstract. ffmpeg cannot conjure
 > convincing aerial footage, and for a demonstration it is arguably better that
@@ -92,10 +93,16 @@ they push, and something has to listen. The same `mediamtx` that serves the
 synthetic feeds does that too, so it stays one process either way:
 
 ```bash
-./scripts/uav-streams.sh -n 4 -i 2      # 4 synthetic feeds + 2 slots for devices
+./scripts/uav-streams.sh -n 4 -S 1 -R 1 # 4 over RTSP + 1 over SRT + 1 over RTMP
+./scripts/uav-streams.sh -n 4 -i 2      # 4 synthetic feeds + 2 slots for real devices
 ./scripts/uav-streams.sh -n 0 -i 6      # devices only, nothing synthetic
 ./scripts/uav-streams.sh -i 2 -a        # advertise the LAN address to point devices at
 ```
+
+`-S` and `-R` publish the *same generated picture* over SRT and RTMP instead of
+RTSP, so a demo can show all three ingest paths arriving on one wall with no
+hardware at all. `-i` is the other half: empty slots that wait for a real device
+to push into them.
 
 It prints a push URL per slot in each protocol and the `feed=` lines to paste
 into `uavwall.conf`. Whatever a device pushes, the wall pulls back as ordinary
