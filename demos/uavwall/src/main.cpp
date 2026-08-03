@@ -342,6 +342,7 @@ struct App
   // Which feed is being listened to, or -1. One at a time on purpose: six
   // downlinks playing at once is noise, not information.
   int monitor_feed = -1;
+  Recorder monitor; // an ffmpeg child playing the selected feed's audio
 
   // Feed-loss alert. alert_feed is the worst current stall, recomputed each
   // frame; dismissal is remembered against it so a *new* stall re-raises the
@@ -1240,75 +1241,60 @@ recording_count (const App & app)
 // ----------------------------------------------------------------------------
 //  Audio monitoring
 //
-//  Each feed's RTSP session is already bound to MAIN, so connecting a speaker
-//  to that instance's MAIN content is enough for Pulse to render its audio —
-//  no pulling, decoding or mixing on our side. That only works for one feed at
-//  a time by design: the operator listens to the source they have selected.
+//  Pulse cannot help here. A feed's RTSP session is bound to MAIN as that
+//  instance's *source* — it is the microphone, not remote media — and Pulse
+//  has no notion of monitoring your own input: asking for a selfview audio
+//  output does not return an error, it aborts the process with "Connecting a
+//  selfview to audio does not make any sense".
+//
+//  So monitoring is an ffmpeg child playing the feed's audio to the default
+//  output, using exactly the recorder's machinery: a stdin pipe, "q" to stop,
+//  reaped without blocking. One feed at a time.
 // ----------------------------------------------------------------------------
-
-// The system default audio output, resolved once. Empty id means none found,
-// in which case monitoring is simply unavailable.
-static PulseDeviceID
-default_speaker (Pulse * pulse)
-{
-  PulseDeviceIterator * it = nullptr;
-  if (pulse_device_iterator_new (pulse, PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT, &it) != PULSE_SUCCESS || !it)
-    return 0;
-  PulseDeviceID chosen = 0, first = 0;
-  for (const PulseDevice * d = pulse_device_iterator_first (it); d != nullptr; d = pulse_device_iterator_next (it)) {
-    PulseDeviceID id = pulse_device_get_id (d);
-    if (first == 0)
-      first = id;
-    if (pulse_device_is_system_default (d)) {
-      chosen = id;
-      break;
-    }
-  }
-  pulse_device_iterator_free (it);
-  return chosen ? chosen : first;
-}
 
 static void
 stop_monitor (App & app)
 {
-  if (app.monitor_feed < 0 || app.monitor_feed >= (int) app.feeds.size ()) {
-    app.monitor_feed = -1;
-    return;
-  }
-  Feed & f = app.feeds[(size_t) app.monitor_feed];
-  if (f.pulse)
-    pulse_device_session_disconnect_main_audio (f.pulse);
+  if (app.monitor.busy ())
+    stop_recorder (app.monitor, false);
   app.monitor_feed = -1;
 }
 
-// Listening to a feed is exclusive: starting one stops whatever was playing.
+// Listening is exclusive: starting one stops whatever was playing.
 static void
 start_monitor (App & app, int idx)
 {
   if (idx < 0 || idx >= (int) app.feeds.size ())
     return;
-  Feed & f = app.feeds[(size_t) idx];
-  if (!f.pulse || !f.connected) {
-    set_status (app, "Connect the feed before monitoring it");
-    return;
-  }
   stop_monitor (app);
 
-  PulseDeviceID spk = default_speaker (f.pulse);
-  if (spk == 0) {
-    set_status (app, "No audio output device available");
+  if (g_ffmpeg.empty ()) {
+    set_status (app, "ffmpeg not found — cannot listen");
     return;
   }
-  PulseError err = pulse_device_session_connect_device_by_id (f.pulse, spk, PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT,
-                                                             PULSE_MEDIA_CONTENT_MAIN);
-  if (err != PULSE_SUCCESS)
-    std::fprintf (stderr, "[uavwall] monitor %s: %s\n", f.name.c_str (), pulse_strerror (err));
-  if (err != PULSE_SUCCESS) {
-    set_status (app, std::string ("monitor: ") + pulse_strerror (err));
+  Feed & f = app.feeds[(size_t) idx];
+
+  // ffmpeg opens the URL itself, so this works whether or not the feed is
+  // connected in the wall — same as recording.
+  app.monitor.path = "/dev/null"; // only used to name the child's log
+  std::vector<std::string> args = {g_ffmpeg,
+                                   "-hide_banner",
+                                   "-loglevel",
+                                   "error",
+                                   "-rtsp_transport",
+                                   app.cfg.rtsp_tcp ? "tcp" : "udp",
+                                   "-i",
+                                   f.url,
+                                   "-vn", // audio only; the picture is already on the wall
+                                   "-f",
+                                   "audiotoolbox",
+                                   "-"};
+  if (!spawn_recorder (app.monitor, args, false)) {
+    set_status (app, "Could not start the monitor");
     return;
   }
   app.monitor_feed = idx;
-  set_status (app, "Monitoring " + f.name);
+  set_status (app, "Listening to " + f.name);
 }
 
 // ----------------------------------------------------------------------------
@@ -4487,6 +4473,7 @@ main (int argc, char ** argv)
     // Reap finished recorders. Deferred rather than waited on, so stopping a
     // recording never stalls a frame.
     reap_recorder (app.canvas_rec);
+    reap_recorder (app.monitor);
     for (Feed & f : app.feeds)
       reap_recorder (f.rec);
 
