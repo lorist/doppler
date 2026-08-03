@@ -2099,11 +2099,31 @@ ui_inspector (App & app, ImVec2 at, float w)
   // column the eye can run down.
   auto row = [&] (const char * k, const std::string & v, ImU32 vc) {
     draw_mono (app, dl, ImVec2 (at.x + pad, y), k, theme::WhiteU32 (0.35f), 9.2f);
-    std::string val = v;
     // Tail-elide: the end of an RTSP URL is the part that identifies the feed.
+    // Walk forward one UTF-8 character at a time and keep the longest suffix
+    // that fits. The obvious `val = "…" + val.substr(2)` loop does not
+    // terminate — the ellipsis is three bytes and only two are removed, so the
+    // string grows by one each pass and the UI hangs on any URL long enough to
+    // need shortening.
+    std::string val = v;
     const float room = w - pad * 2 - du (52.0f);
-    while (val.size () > 4 && mono_w (app, val.c_str (), 9.2f) > room)
-      val = "…" + val.substr (2);
+    if (mono_w (app, val.c_str (), 9.2f) > room) {
+      std::size_t start = 0;
+      bool fitted = false;
+      while (start < val.size ()) {
+        ++start;
+        while (start < val.size () && (val[start] & 0xC0) == 0x80)
+          ++start; // don't split a multi-byte character
+        std::string cand = "…" + val.substr (start);
+        if (mono_w (app, cand.c_str (), 9.2f) <= room) {
+          val = cand;
+          fitted = true;
+          break;
+        }
+      }
+      if (!fitted)
+        val = "…";
+    }
     dl->AddText (app.fonts.mono, theme::fs (9.2f), ImVec2 (p1.x - pad - mono_w (app, val.c_str (), 9.2f), y), vc,
                  val.c_str ());
     y += du (12.0f);
