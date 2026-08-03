@@ -286,6 +286,7 @@ autoconnect=false          # connect every feed at startup
 
 # Where recordings are written, relative to the working directory.
 record_dir=recordings
+audio_delay_ms=250        # holds feed audio back to match the canvas
 
 # Interface. ui_scale applies on next start.
 ui_scale=1.2
@@ -507,9 +508,27 @@ How it is put together, and why:
 > listening to in the same room. Use headphones, or keep the conference muted
 > locally — this is a real loop, not a theoretical one.
 
-Lip sync is approximate: the canvas and the ffmpeg-decoded audio have unrelated
-latencies, on the order of a few hundred milliseconds. Fine for hearing what is
-happening around a source; not good enough for someone speaking to camera.
+### Lining audio up with the picture
+
+The two arrive at different times. Video goes through Pulse's RTSP client — a
+jitter window (`rtsp_latency_ms`, 200ms by default) plus decode — before it ever
+reaches the compositor; the ffmpeg audio path is shorter. So audio runs ahead,
+by a few hundred milliseconds.
+
+**Real timestamping is not available.** `PulseDataSessionFrame` is
+`{update_config, audio, video}` — there is no PTS field anywhere in the
+data-session API, and Pulse stamps frames itself as they arrive. There is no way
+to say *this sample belongs at time T*; only when to hand it over.
+
+So `audio_delay_ms` holds audio back to match, and **Settings → Canvas &
+sending** has a slider that applies live. The right value depends on the source,
+the encoder and the network, so tune it by ear against a source with speech in
+it — a phone is ideal, drone engine wash tells you nothing. Start at the default
+250ms and adjust until a hand clap lands with the picture.
+
+If audio is *behind* the picture, the lever is the other end: lower
+`rtsp_latency_ms` so the video path buffers less. Delaying the video is not
+practical — it would mean queueing whole composited frames at 8MB each.
 
 ## Recording
 

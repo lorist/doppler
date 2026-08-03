@@ -117,6 +117,12 @@ struct Config
   // directory, same as uavwall.conf itself.
   std::string record_dir = "recordings";
 
+  // How far to hold feed audio back so it lines up with the canvas. Video
+  // arrives later (Pulse buffers and decodes it); this is the difference, and
+  // it depends on the source and the network, so it is a setting rather than a
+  // constant.
+  int audio_delay_ms = 250;
+
   // Interface
   float ui_scale = 1.2f;
   bool show_stats = true;
@@ -185,19 +191,33 @@ struct PcmRing
       tail = next;
     }
   }
+  size_t available () const { return buf.empty () ? 0 : (tail + buf.size () - head) % buf.size (); }
+
   // Always fills n samples, padding with silence on underrun — the conference
   // needs a continuous stream, and a gap is worse than a moment of quiet.
-  void read (int16_t * dst, size_t n)
+  //
+  // `keep` samples are held back deliberately. Video reaches the conference
+  // later than audio does, because Pulse's RTSP client buffers a jitter window
+  // and decodes before the frame ever reaches the compositor, while ffmpeg's
+  // audio path is shorter. Holding audio back by that difference is the only
+  // alignment available: the SDK's frame carries no timestamp, so we cannot
+  // tell Pulse when a sample belongs — only when to hand it over.
+  void read (int16_t * dst, size_t n, size_t keep = 0)
   {
     std::lock_guard<std::mutex> lock (m);
     size_t got = 0;
-    if (!buf.empty ())
-      while (got < n && head != tail) {
+    if (!buf.empty ()) {
+      size_t have = (tail + buf.size () - head) % buf.size ();
+      size_t serve = have > keep ? have - keep : 0;
+      if (serve > n)
+        serve = n;
+      while (got < serve) {
         dst[got++] = buf[head];
         head = (head + 1) % buf.size ();
       }
+    }
     for (size_t i = got; i < n; i++)
-      dst[i] = 0;
+      dst[i] = 0; // still filling the delay window, or the source stalled
   }
 };
 
@@ -530,6 +550,8 @@ load_config (App & app)
       app.cfg.send_as_content = (v == "content");
     else if (k == "record_dir")
       app.cfg.record_dir = v;
+    else if (k == "audio_delay_ms")
+      app.cfg.audio_delay_ms = std::max (0, std::min (2000, atoi (v.c_str ())));
     else if (k == "preset_a")
       app.cfg.preset_a = v;
     else if (k == "preset_b")
@@ -621,7 +643,9 @@ save_config (App & app, bool force = true)
   ofs << "ui_scale=" << app.cfg.ui_scale << "\n";
   ofs << "show_stats=" << (app.cfg.show_stats ? "true" : "false") << "\n\n";
   ofs << "# Where recordings are written, relative to the working directory.\n";
-  ofs << "record_dir=" << app.cfg.record_dir << "\n\n";
+  ofs << "record_dir=" << app.cfg.record_dir << "\n";
+  ofs << "# Holds feed audio back to line up with the canvas, which arrives later.\n";
+  ofs << "audio_delay_ms=" << app.cfg.audio_delay_ms << "\n\n";
   ofs << "# Saved layouts, recalled from the A/B/C slots. feed,x,y,w,h per tile.\n";
   ofs << "preset_a=" << app.cfg.preset_a << "\n";
   ofs << "preset_b=" << app.cfg.preset_b << "\n";
@@ -898,7 +922,8 @@ push_canvas (App & app)
     want = kAirRate / 4;
   if (want > 0) {
     pcm.resize (want);
-    app.air_ring.read (pcm.data (), want); // pads silence when no source is on air
+    const size_t keep = (size_t) app.cfg.audio_delay_ms * kAirRate * kAirChannels / 1000;
+    app.air_ring.read (pcm.data (), want, keep); // pads silence when no source is on air
     frame.audio.data = (const uint8_t *) pcm.data ();
     frame.audio.data_size = (int) (want * sizeof (int16_t));
   }
@@ -1475,7 +1500,8 @@ start_air (App & app, int idx)
     return;
   }
 
-  app.air_ring.init (kAirRate * kAirChannels); // one second of slack
+  // Room for the delay window plus a second of slack on top.
+  app.air_ring.init (kAirRate * kAirChannels * (size_t) (2 + app.cfg.audio_delay_ms / 1000));
   app.air_feed = idx;
   app.air_quit.store (false);
   int fd = app.air_fd;
@@ -3131,7 +3157,20 @@ ui_settings (App & app)
                      app.cfg.send_as_content, !live))
       app.cfg.send_as_content = true;
     ImGui::EndDisabled ();
-    seek (base.y + cardh + du (10.0f));
+    seek (base.y + cardh + du (14.0f));
+
+    // Tunable live: the right value depends on the source and the network, and
+    // the only way to find it is to listen while adjusting.
+    row ("Audio delay");
+    instrument_slider (app, "adly", &app.cfg.audio_delay_ms, 0, 1000, "%d ms", panel_w - du (125.0f));
+    next_row ();
+    {
+      ImVec2 at2 = ImGui::GetCursorScreenPos ();
+      dl->AddText (app.fonts.body, theme::fs (11.0f), ImVec2 (at2.x + du (125.0f), at2.y),
+                   theme::WhiteU32 (0.40f), "Holds feed audio back to match the canvas, which arrives later.");
+      seek (at2.y + du (22.0f));
+    }
+
     if (live)
       locked_callout (app, "Locked while sending. Stop sending to change the stream.", panel_w);
     break;
