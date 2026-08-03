@@ -117,11 +117,11 @@ struct Config
   // directory, same as uavwall.conf itself.
   std::string record_dir = "recordings";
 
-  // How far to hold feed audio back so it lines up with the canvas. Video
-  // arrives later (Pulse buffers and decodes it); this is the difference, and
-  // it depends on the source and the network, so it is a setting rather than a
-  // constant.
-  int audio_delay_ms = 250;
+  // Holds feed audio back when it arrives *ahead* of the canvas. Default 0:
+  // with the low-latency decode flags the audio path is the shorter of the two,
+  // so the usual complaint is audio lagging, which this cannot fix — see the
+  // README on lowering rtsp_latency_ms instead.
+  int audio_delay_ms = 0;
 
   // Interface
   float ui_scale = 1.2f;
@@ -1381,10 +1381,20 @@ start_monitor (App & app, int idx)
   // ffmpeg opens the URL itself, so this works whether or not the feed is
   // connected in the wall — same as recording.
   app.monitor.path = "/dev/null"; // only used to name the child's log
+  // Same low-latency flags as the conference path: monitoring three seconds
+  // behind the picture is not monitoring.
   std::vector<std::string> args = {g_ffmpeg,
                                    "-hide_banner",
                                    "-loglevel",
                                    "error",
+                                   "-fflags",
+                                   "nobuffer",
+                                   "-flags",
+                                   "low_delay",
+                                   "-probesize",
+                                   "32",
+                                   "-analyzeduration",
+                                   "0",
                                    "-rtsp_transport",
                                    app.cfg.rtsp_tcp ? "tcp" : "udp",
                                    "-i",
@@ -1490,7 +1500,13 @@ start_air (App & app, int idx)
   char rate[16], ch[8];
   snprintf (rate, sizeof (rate), "%u", kAirRate);
   snprintf (ch, sizeof (ch), "%u", kAirChannels);
+  // Without these, ffmpeg probes the input before emitting anything and the
+  // audio arrives ~3s late — measured at 3.15s against 0.21s with them. That
+  // dwarfs any alignment we could apply downstream, and was why the delay
+  // control appeared to do nothing at all.
   std::vector<std::string> args = {g_ffmpeg, "-hide_banner", "-loglevel", "error",
+                                   "-fflags", "nobuffer", "-flags", "low_delay",
+                                   "-probesize", "32", "-analyzeduration", "0",
                                    "-rtsp_transport", app.cfg.rtsp_tcp ? "tcp" : "udp",
                                    "-i", f.url,
                                    "-vn", "-f", "s16le", "-acodec", "pcm_s16le",

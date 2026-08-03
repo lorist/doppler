@@ -286,7 +286,7 @@ autoconnect=false          # connect every feed at startup
 
 # Where recordings are written, relative to the working directory.
 record_dir=recordings
-audio_delay_ms=250        # holds feed audio back to match the canvas
+audio_delay_ms=0          # delays feed audio when it runs ahead of the canvas
 
 # Interface. ui_scale applies on next start.
 ui_scale=1.2
@@ -520,15 +520,26 @@ by a few hundred milliseconds.
 data-session API, and Pulse stamps frames itself as they arrive. There is no way
 to say *this sample belongs at time T*; only when to hand it over.
 
-So `audio_delay_ms` holds audio back to match, and **Settings → Canvas &
-sending** has a slider that applies live. The right value depends on the source,
-the encoder and the network, so tune it by ear against a source with speech in
-it — a phone is ideal, drone engine wash tells you nothing. Start at the default
-250ms and adjust until a hand clap lands with the picture.
+**The dominant term was ffmpeg's own probing**, not anything in this app.
+Left at its defaults, ffmpeg reads the input for about three seconds before
+emitting a sample — measured at **3.15s, against 0.21s** with
+`-fflags nobuffer -flags low_delay -probesize 32 -analyzeduration 0`. Any
+alignment control is meaningless beside that, which is exactly how it behaved:
+the delay slider appeared to do nothing. Both audio paths — the conference feed
+and **LISTEN** — now use those flags.
 
-If audio is *behind* the picture, the lever is the other end: lower
-`rtsp_latency_ms` so the video path buffers less. Delaying the video is not
-practical — it would mean queueing whole composited frames at 8MB each.
+What is left is `audio_delay_ms`, which holds audio back when it arrives *ahead*
+of the canvas, with a live slider in **Settings → Canvas & sending**. It
+defaults to **0**, because with the low-latency flags the audio path is the
+shorter of the two.
+
+If audio still lags the picture, this control cannot help — it only ever delays.
+The lever is the other end: lower `rtsp_latency_ms` so Pulse's video path
+buffers less. Delaying video is not practical; it would mean queueing composited
+frames at 8MB apiece.
+
+Tune by ear against something with speech or a hand clap in it. A phone is
+ideal; drone engine wash tells you nothing about sync.
 
 ## Recording
 
