@@ -202,12 +202,24 @@ struct PcmRing
   // audio path is shorter. Holding audio back by that difference is the only
   // alignment available: the SDK's frame carries no timestamp, so we cannot
   // tell Pulse when a sample belongs — only when to hand it over.
-  void read (int16_t * dst, size_t n, size_t keep = 0)
+  void read (int16_t * dst, size_t n, size_t keep = 0, size_t slack = 0)
   {
     std::lock_guard<std::mutex> lock (m);
     size_t got = 0;
     if (!buf.empty ()) {
       size_t have = (tail + buf.size () - head) % buf.size ();
+
+      // Shed anything beyond what we mean to hold. Producer and consumer run at
+      // the same nominal rate, so without this the buffer sits at whatever
+      // depth ffmpeg's opening burst left it at — permanently, since nothing
+      // ever drains it. That backlog *is* the audio lag, and it survived
+      // setting the delay to zero.
+      size_t cap = keep + n + slack;
+      if (have > cap) {
+        head = (head + (have - cap)) % buf.size ();
+        have = cap;
+      }
+
       size_t serve = have > keep ? have - keep : 0;
       if (serve > n)
         serve = n;
@@ -923,7 +935,9 @@ push_canvas (App & app)
   if (want > 0) {
     pcm.resize (want);
     const size_t keep = (size_t) app.cfg.audio_delay_ms * kAirRate * kAirChannels / 1000;
-    app.air_ring.read (pcm.data (), want, keep); // pads silence when no source is on air
+    // 40ms of slack absorbs render-loop jitter without letting a backlog build.
+    const size_t slack = kAirRate * kAirChannels * 40 / 1000;
+    app.air_ring.read (pcm.data (), want, keep, slack); // pads silence when no source is on air
     frame.audio.data = (const uint8_t *) pcm.data ();
     frame.audio.data_size = (int) (want * sizeof (int16_t));
   }
