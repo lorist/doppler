@@ -86,6 +86,51 @@ ingest slots real devices push into.
 > the picture is obviously synthetic than that it imitates real sensor imagery.
 > Use `-f` with real footage when fidelity matters.
 
+### The standard demo setup
+
+Four drone downlinks over RTSP plus one wearable pushing in — one command, one
+process:
+
+```bash
+./scripts/uav-streams.sh -n 4 -d UAV_footage/prepared -i 1 -a -o
+```
+
+* `-n 4 -d …/prepared` — the four synthetic downlinks, from real footage
+* `-i 1` — one ingest slot (`hawkeye-21`) for the wearable
+* `-a` — print the LAN address, so a phone has something to point at
+* `-o` — no publish credential, which is one less variable at a demo
+
+The matching feed list in `uavwall.conf`:
+
+```ini
+feed=HAWKEYE 21|rtsp://127.0.0.1:8554/uav1
+feed=KESTREL 33|rtsp://127.0.0.1:8554/uav2
+feed=NOMAD 14|rtsp://127.0.0.1:8554/uav3
+feed=OSPREY 12|rtsp://127.0.0.1:8554/uav4
+feed=WEARABLE 01|rtsp://127.0.0.1:8554/live
+#feed=WEARABLE 01|rtsp://127.0.0.1:8554/live/hawkeye-21
+```
+
+Loopback rather than the LAN address throughout: everything runs on this
+machine, and a DHCP change would otherwise break every line at once. The
+wearable is the same device either way — swap the two `WEARABLE 01` lines to
+put it on SRT instead of RTMP:
+
+| | Larix Broadcaster setting |
+| --- | --- |
+| RTMP | URL `rtmp://<lan-ip>:1935/live/hawkeye-21` → arrives on path `live` |
+| SRT | URL `srt://<lan-ip>:8890`, stream ID `publish:live/hawkeye-21` → arrives on `live/hawkeye-21` |
+
+One phone publishes one stream, so only one of the two can be live; the other
+shows offline in the rail, which costs nothing.
+
+> **A commented feed does not survive Settings → Save.** `save_config()`
+> rebuilds the file from memory and knows only about active feeds, so the
+> disabled line above is dropped the moment the app writes the config. Quitting
+> is safe — the app leaves a file that changed underneath it alone — but an
+> explicit Save is not. To keep both, make it a real feed and simply leave it
+> disconnected.
+
 ### Real devices pushing in — wearables and body cameras
 
 The generator publishes feeds *to* the wall. Real devices work the other way:
