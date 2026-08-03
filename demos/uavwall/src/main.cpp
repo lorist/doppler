@@ -188,6 +188,26 @@ struct Feed
   double win_started = 0.0;
 };
 
+// Fit a source of aspect sw:sh inside the rect (dx,dy,dw,dh) without distorting
+// it, centred, letterboxing whatever is left over. Every place a feed is drawn
+// goes through this: a 16:9 tile fed a 16:9 source is unchanged, but a 4:3
+// camera — or the rail's much wider thumbnail slot — no longer stretches the
+// picture to fill the space.
+static void
+fit_rect (int sw, int sh, float dx, float dy, float dw, float dh, float * ox, float * oy, float * ow,
+          float * oh)
+{
+  if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) {
+    *ox = dx; *oy = dy; *ow = dw; *oh = dh;
+    return;
+  }
+  const float scale = std::min (dw / (float) sw, dh / (float) sh);
+  *ow = sw * scale;
+  *oh = sh * scale;
+  *ox = dx + (dw - *ow) / 2;
+  *oy = dy + (dh - *oh) / 2;
+}
+
 // Where a feed appears on the canvas, in canvas pixels.
 struct Tile
 {
@@ -774,7 +794,9 @@ composite (App & app)
     Feed & f = app.feeds[t.feed];
     if (f.frame.w <= 0)
       continue;
-    blit_scaled (app.canvas, f.frame, (int) t.x, (int) t.y, (int) t.w, (int) t.h);
+    float fx, fy, fw, fh;
+    fit_rect (f.frame.w, f.frame.h, t.x, t.y, t.w, t.h, &fx, &fy, &fw, &fh);
+    blit_scaled (app.canvas, f.frame, (int) fx, (int) fy, (int) fw, (int) fh);
   }
 }
 
@@ -2266,8 +2288,12 @@ ui_feed_rail (App & app, float w, float h)
     const bool dbl = hovered && ImGui::IsMouseDoubleClicked (ImGuiMouseButton_Left);
 
     if (f.texture && f.tex_w > 0) {
-      dl->AddImageRounded ((ImTextureID) (intptr_t) f.texture, t0, t1, ImVec2 (0, 0), ImVec2 (1, 1),
-                           theme::WhiteU32 (dim), du (theme::RadiusThumb));
+      // The thumbnail slot is far wider than 16:9, so fit rather than fill.
+      float fx, fy, fw, fh;
+      fit_rect (f.tex_w, f.tex_h, t0.x, t0.y, t1.x - t0.x, t1.y - t0.y, &fx, &fy, &fw, &fh);
+      dl->AddRectFilled (t0, t1, theme::HexU32 (theme::WindowBgStart, 0.6f), du (theme::RadiusThumb));
+      dl->AddImageRounded ((ImTextureID) (intptr_t) f.texture, ImVec2 (fx, fy), ImVec2 (fx + fw, fy + fh),
+                           ImVec2 (0, 0), ImVec2 (1, 1), theme::WhiteU32 (dim), du (theme::RadiusThumb));
       dl->AddRect (t0, t1,
                    stalled  ? theme::HexU32 (theme::StatusWarn, 0.55f)
                    : hovered ? theme::HexU32 (theme::AccentPrimary)
@@ -3404,9 +3430,13 @@ ui_canvas (App & app, ImVec2 size)
     ImVec2 t0 = to_screen (t.x, t.y);
     ImVec2 t1 = to_screen (t.x + t.w, t.y + t.h);
 
-    if (f.texture && f.tex_w > 0)
-      dl->AddImage ((ImTextureID) (intptr_t) f.texture, t0, t1);
-    else
+    if (f.texture && f.tex_w > 0) {
+      // Mirror the compositor exactly, or the preview would lie about what the
+      // far end receives.
+      float fx, fy, fw, fh;
+      fit_rect (f.tex_w, f.tex_h, t0.x, t0.y, t1.x - t0.x, t1.y - t0.y, &fx, &fy, &fw, &fh);
+      dl->AddImage ((ImTextureID) (intptr_t) f.texture, ImVec2 (fx, fy), ImVec2 (fx + fw, fy + fh));
+    } else
       dl->AddRectFilled (t0, t1, theme::WhiteU32 (0.06f));
     if (stalled)
       dl->AddRectFilled (t0, t1, theme::HexU32 (theme::StatusWarn, 0.05f));
