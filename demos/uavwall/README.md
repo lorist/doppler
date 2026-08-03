@@ -475,9 +475,17 @@ that instance's *source* — it is the microphone, not remote media — so:
 Pulse has no notion of monitoring your own input, so the audio never comes back
 through the SDK at all.
 
-Expect **200–400 ms** of lag against the picture: the player is a separate
-process with its own jitter buffer. Fine for monitoring; not good enough for lip
-sync, which matters if feed audio is ever sent into the VMR.
+**LISTEN lags the picture by a few hundred milliseconds, and that is as good as
+it gets.** The audiotoolbox output device exposes no buffer control — only
+`-list_devices` and `-audio_device_index` — so there is nothing to tune on this
+path, and an `ffplay` build with `-sync ext` and every low-latency flag measured
+the same by ear. What remains is CoreAudio's own output queue, below anything
+either player reaches.
+
+That is acceptable for what LISTEN is for: hearing *what is happening* around a
+source — someone shouting, a vehicle approaching — not judging lip sync. It has
+no bearing on **what the conference hears**, which travels a different path and
+does arrive in sync. Judge sync there, never here.
 
 ## Sending feed audio to the VMR
 
