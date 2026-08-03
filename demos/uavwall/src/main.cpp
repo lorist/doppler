@@ -32,6 +32,8 @@
 
 #include <pexpulse/pulse.h>
 #include <pexpulse/pulse_data_session.h>
+#include <pexpulse/pulse_device.h>
+#include <pexpulse/pulse_device_session.h>
 #include <pexpulse/pulse_options.h>
 #include <pexpulse/pulse_participant_control.h>
 #include <pexpulse/pulse_registrations.h>
@@ -336,6 +338,10 @@ struct App
 
   // Rail selection, driving the inspector card at the foot of the rail.
   int inspect_feed = -1;
+
+  // Which feed is being listened to, or -1. One at a time on purpose: six
+  // downlinks playing at once is noise, not information.
+  int monitor_feed = -1;
 
   // Feed-loss alert. alert_feed is the worst current stall, recomputed each
   // frame; dismissal is remembered against it so a *new* stall re-raises the
@@ -1229,6 +1235,80 @@ recording_count (const App & app)
     if (f.rec.active ())
       n++;
   return n;
+}
+
+// ----------------------------------------------------------------------------
+//  Audio monitoring
+//
+//  Each feed's RTSP session is already bound to MAIN, so connecting a speaker
+//  to that instance's MAIN content is enough for Pulse to render its audio —
+//  no pulling, decoding or mixing on our side. That only works for one feed at
+//  a time by design: the operator listens to the source they have selected.
+// ----------------------------------------------------------------------------
+
+// The system default audio output, resolved once. Empty id means none found,
+// in which case monitoring is simply unavailable.
+static PulseDeviceID
+default_speaker (Pulse * pulse)
+{
+  PulseDeviceIterator * it = nullptr;
+  if (pulse_device_iterator_new (pulse, PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT, &it) != PULSE_SUCCESS || !it)
+    return 0;
+  PulseDeviceID chosen = 0, first = 0;
+  for (const PulseDevice * d = pulse_device_iterator_first (it); d != nullptr; d = pulse_device_iterator_next (it)) {
+    PulseDeviceID id = pulse_device_get_id (d);
+    if (first == 0)
+      first = id;
+    if (pulse_device_is_system_default (d)) {
+      chosen = id;
+      break;
+    }
+  }
+  pulse_device_iterator_free (it);
+  return chosen ? chosen : first;
+}
+
+static void
+stop_monitor (App & app)
+{
+  if (app.monitor_feed < 0 || app.monitor_feed >= (int) app.feeds.size ()) {
+    app.monitor_feed = -1;
+    return;
+  }
+  Feed & f = app.feeds[(size_t) app.monitor_feed];
+  if (f.pulse)
+    pulse_device_session_disconnect_main_audio (f.pulse);
+  app.monitor_feed = -1;
+}
+
+// Listening to a feed is exclusive: starting one stops whatever was playing.
+static void
+start_monitor (App & app, int idx)
+{
+  if (idx < 0 || idx >= (int) app.feeds.size ())
+    return;
+  Feed & f = app.feeds[(size_t) idx];
+  if (!f.pulse || !f.connected) {
+    set_status (app, "Connect the feed before monitoring it");
+    return;
+  }
+  stop_monitor (app);
+
+  PulseDeviceID spk = default_speaker (f.pulse);
+  if (spk == 0) {
+    set_status (app, "No audio output device available");
+    return;
+  }
+  PulseError err = pulse_device_session_connect_device_by_id (f.pulse, spk, PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT,
+                                                             PULSE_MEDIA_CONTENT_MAIN);
+  if (err != PULSE_SUCCESS)
+    std::fprintf (stderr, "[uavwall] monitor %s: %s\n", f.name.c_str (), pulse_strerror (err));
+  if (err != PULSE_SUCCESS) {
+    set_status (app, std::string ("monitor: ") + pulse_strerror (err));
+    return;
+  }
+  app.monitor_feed = idx;
+  set_status (app, "Monitoring " + f.name);
 }
 
 // ----------------------------------------------------------------------------
@@ -2178,24 +2258,43 @@ ui_inspector (App & app, ImVec2 at, float w)
     draw_mono (app, dl, ImVec2 (at.x + pad, y), e.c_str (), theme::HexU32 (theme::StatusError, 0.90f), 9.2f);
   }
 
-  // Two half-width actions along the bottom.
-  const float bh = du (22.0f), bw = (w - pad * 2 - du (6.0f)) / 2;
+  // Three actions along the bottom now that a feed can be listened to.
+  const float bh = du (22.0f), gapb = du (5.0f);
+  const float bw = (w - pad * 2 - gapb * 2) / 3;
+  const bool monitoring = app.monitor_feed == app.inspect_feed;
   ImGui::SetCursorScreenPos (ImVec2 (at.x + pad, p1.y - pad - bh));
+  // Listening is exclusive, so the button reads as a state rather than an
+  // action once it is on.
+  if (deck_button (app, "insp_mon", monitoring ? "LISTENING" : "LISTEN", ImVec2 (bw, bh), theme::StatusOnline,
+                   monitoring ? Btn::Fill : Btn::Tinted, f.connected)) {
+    if (monitoring)
+      stop_monitor (app);
+    else
+      start_monitor (app, app.inspect_feed);
+  }
+  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + bw + gapb, p1.y - pad - bh));
   if (deck_button (app, "insp_rc", "RECONNECT", ImVec2 (bw, bh), theme::AccentPrimary, Btn::Fill)) {
+    if (app.monitor_feed == app.inspect_feed)
+      stop_monitor (app); // the instance is about to be torn down
     stop_feed (f);
     start_feed (f);
     if (f.connected)
       f.connected_at = ImGui::GetTime ();
   }
-  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + bw + du (6.0f), p1.y - pad - bh));
+  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + (bw + gapb) * 2, p1.y - pad - bh));
   if (deck_button (app, "insp_rm", "REMOVE", ImVec2 (bw, bh), 0xFFFFFF, Btn::Outline)) {
     int idx = app.inspect_feed;
+    if (app.monitor_feed == idx)
+      stop_monitor (app);
     remove_feed_tiles (app, idx);
     stop_feed (app.feeds[(size_t) idx]);
     app.feeds.erase (app.feeds.begin () + idx);
     for (Tile & tl : app.tiles)
       if (tl.feed > idx)
         tl.feed--;
+    // Indices shift down, so a monitor on a later feed would follow the wrong one.
+    if (app.monitor_feed > idx)
+      app.monitor_feed--;
     app.inspect_feed = -1;
     app.fullscreen_feed = -1;
   }
@@ -2258,7 +2357,7 @@ ui_feed_rail (App & app, float w, float h)
                      scrolls ? ImGuiWindowFlags_None : ImGuiWindowFlags_NoScrollbar);
   dl = ImGui::GetWindowDrawList ();
 
-  int toggle_feed = -1, rec_feed = -1;
+  int toggle_feed = -1, rec_feed = -1, mon_feed = -1;
   for (int i = 0; i < n; i++) {
     Feed & f = app.feeds[(size_t) i];
     ImGui::PushID (i);
@@ -2400,6 +2499,13 @@ ui_feed_rail (App & app, float w, float h)
   ImGui::EndChild ();
   ImGui::PopStyleColor ();
 
+  if (mon_feed >= 0) {
+    if (app.monitor_feed == mon_feed)
+      stop_monitor (app);
+    else
+      start_monitor (app, mon_feed);
+  }
+
   if (rec_feed >= 0) {
     Feed & f = app.feeds[(size_t) rec_feed];
     if (f.rec.busy ())
@@ -2413,6 +2519,8 @@ ui_feed_rail (App & app, float w, float h)
   if (toggle_feed >= 0) {
     Feed & f = app.feeds[(size_t) toggle_feed];
     if (f.connected) {
+      if (app.monitor_feed == toggle_feed)
+        stop_monitor (app); // its Pulse instance is about to be freed
       stop_feed (f);
       remove_feed_tiles (app, toggle_feed); // a source that is gone should not hold canvas space
       app.fullscreen_feed = -1;
@@ -3938,6 +4046,8 @@ ui_deck (App & app, float width, char * vmr_buf, size_t vmr_sz, char * pin_buf, 
     // the two is the one that throws work away.
     if (deck_button (app, "connall", lbl, ImVec2 (bw, ch), any_off ? theme::StatusOnline : theme::StatusError,
                      any_off ? Btn::Tinted : Btn::Outline)) {
+      if (!any_off)
+        stop_monitor (app); // every instance is about to be freed
       for (Feed & f : app.feeds) {
         if (any_off) {
           start_feed (f);
@@ -4552,6 +4662,7 @@ main (int argc, char ** argv)
         f.rec.pid = -1;
   }
 
+  stop_monitor (app);
   conf_disconnect (app);
   for (Feed & f : app.feeds)
     stop_feed (f);
