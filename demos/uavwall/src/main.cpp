@@ -123,6 +123,12 @@ struct Config
   // text so the config parser stays a flat key=value reader.
   std::string preset_a, preset_b, preset_c;
 
+  // Identity of the config file as we last read or wrote it. Used to avoid
+  // overwriting edits made in an editor while the app was running — which the
+  // save-on-exit would otherwise do silently.
+  long cfg_mtime = 0;
+  long cfg_size = -1;
+
   // Session-only: silences the feed-loss cue without hiding the visual state.
   // Deliberately not persisted — an operator muting alerts during one demo
   // should not find them still muted at the next.
@@ -385,6 +391,17 @@ add_feed_line (App & app, const std::string & value)
     app.feeds.push_back (std::move (f));
 }
 
+// Stamp the file's identity so an external edit can be detected later.
+static void
+stamp_config (App & app)
+{
+  struct stat st{};
+  if (stat (kConfigFile, &st) == 0) {
+    app.cfg.cfg_mtime = (long) st.st_mtime;
+    app.cfg.cfg_size = (long) st.st_size;
+  }
+}
+
 static void
 load_config (App & app)
 {
@@ -462,6 +479,8 @@ load_config (App & app)
     }
   }
 
+  stamp_config (app);
+
   // Still nothing: default to what scripts/uav-streams.sh publishes, so a
   // fresh checkout demonstrates itself.
   if (app.feeds.empty ()) {
@@ -476,9 +495,24 @@ load_config (App & app)
   }
 }
 
+// `force` is for saves the operator explicitly asked for (the Save button,
+// storing a preset). The automatic save on exit passes false, so a file that
+// changed underneath us is left alone rather than silently reverted.
 static void
-save_config (App & app)
+save_config (App & app, bool force = true)
 {
+  if (!force && app.cfg.cfg_size >= 0) {
+    struct stat st{};
+    if (stat (kConfigFile, &st) == 0 &&
+        ((long) st.st_mtime != app.cfg.cfg_mtime || (long) st.st_size != app.cfg.cfg_size)) {
+      std::fprintf (stderr,
+                    "[uavwall] %s changed while the app was running — leaving it alone.\n"
+                    "          Use Settings > Save to write this session's values instead.\n",
+                    kConfigFile);
+      return;
+    }
+  }
+
   std::ofstream ofs (kConfigFile, std::ios::trunc);
   ofs << "# uavwall configuration. Edit here or via Settings in the app.\n\n";
   ofs << "# Conference to send the composed canvas into.\n";
@@ -514,6 +548,8 @@ save_config (App & app)
   ofs << "# One per feed: feed=NAME|URL\n";
   for (const Feed & f : app.feeds)
     ofs << "feed=" << f.name << "|" << f.url << "\n";
+  ofs.close ();
+  stamp_config (app);
 }
 
 // ----------------------------------------------------------------------------
@@ -2580,6 +2616,13 @@ ui_settings (App & app)
   };
   auto next_row = [&] (float rh = 26.0f) { seek (row_y + du (rh) + du (6.0f)); };
 
+  // Tab-local buffers are primed on entry to their tab as well as on open; a
+  // buffer primed only on IsWindowAppearing() is still empty when the operator
+  // clicks through to its tab afterwards.
+  static int primed_tab = -1;
+  const bool tab_entered = ImGui::IsWindowAppearing () || primed_tab != app.settings_tab;
+  primed_tab = app.settings_tab;
+
   static char vmr[512], pin[64], dname[128], host[256], alias[256], user[256], pass[256];
   if (ImGui::IsWindowAppearing ()) {
     snprintf (vmr, sizeof (vmr), "%s", app.cfg.vmr.c_str ());
@@ -2869,11 +2912,11 @@ ui_settings (App & app)
     heading ("RECORDING", "Captured with ffmpeg, alongside the wall.");
 
     static char rdir[512];
-    if (ImGui::IsWindowAppearing ())
+    if (tab_entered)
       snprintf (rdir, sizeof (rdir), "%s", app.cfg.record_dir.c_str ());
     row ("Folder");
-    if (panel_field (app, "##rdir", rdir, sizeof (rdir), panel_w - du (125.0f), true))
-      app.cfg.record_dir = rdir;
+    if (panel_field (app, "##rdir", rdir, sizeof (rdir), panel_w - du (125.0f), true) && rdir[0] != '\0')
+      app.cfg.record_dir = rdir; // never let it become empty — ensure_dir would fail
     next_row ();
     {
       ImVec2 at = ImGui::GetCursorScreenPos ();
@@ -4436,7 +4479,7 @@ main (int argc, char ** argv)
     glfwSwapBuffers (window);
   }
 
-  save_config (app);
+  save_config (app, false);
 
   // Stop every recording before anything else and wait for the children to
   // finalise their files: a killed ffmpeg leaves an MP4 with no moov atom that
