@@ -33,6 +33,18 @@
 #   ./scripts/uav-streams.sh -i 2 -u op:s3c  # set the publish credential
 #   ./scripts/uav-streams.sh -i 2 -o         # open ingest, no credential
 #   ./scripts/uav-streams.sh -i 2 -v         # log every connection attempt
+#   ./scripts/uav-streams.sh -A rotor        # audible per-feed engine wash
+#   ./scripts/uav-streams.sh -A tone         # a distinct pitch per feed
+#   ./scripts/uav-streams.sh -A off          # no audio track at all
+#
+# Audio modes. The default is near-silent, which is fine until you want to
+# demonstrate the wall's LISTEN button — then you need something audible, and
+# something that differs per feed so switching between them is obvious:
+#
+#   quiet  brown noise at -34dB (default; present but inaudible)
+#   rotor  brown noise with a per-feed tremolo — reads as engine/rotor wash
+#   tone   a clean per-feed pitch, unmistakable when switching sources
+#   off    no audio track
 #
 # Ingest accepts RTMP, SRT, RTSP-push and WebRTC/WHIP on one port each, with a
 # path per device, and re-serves every one as RTSP — which is all uavwall pulls.
@@ -59,6 +71,7 @@ PUB_USER="uav"
 PUB_PASS="uav"
 OPEN_INGEST=0
 VERBOSE=0
+AUDIO_MODE=quiet
 RTMP_PORT=1935
 SRT_PORT=8890
 WEBRTC_PORT=8889
@@ -97,6 +110,7 @@ while [ $# -gt 0 ]; do
         -u) PUB_USER="${2%%:*}"; PUB_PASS="${2#*:}"; shift 2 ;;
         -o) OPEN_INGEST=1; shift ;;
         -v) VERBOSE=1; shift ;;
+        -A) AUDIO_MODE="$2"; shift 2 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown option: $1" >&2; usage 1 ;;
     esac
@@ -291,7 +305,24 @@ WARDEN 63"
     ALT=$(( 800 + i * 350 ))
     SPEED=$(awk -v i="$i" 'BEGIN{printf "%.2f", 0.05 + i*0.02}')
 
-    AUDIO="-f lavfi -i anoisesrc=color=brown:amplitude=0.02:sample_rate=48000"
+    # Per-feed audio. Pitch and beat rate vary with $i so an operator switching
+    # between feeds can hear that the source changed, not just see it.
+    ACODEC="-c:a aac -b:a 64k -ar 48000 -ac 1"
+    case "$AUDIO_MODE" in
+        off)
+            AUDIO=""
+            ACODEC="-an"
+            ;;
+        rotor)
+            AUDIO="-f lavfi -i anoisesrc=color=brown:amplitude=0.30:sample_rate=48000,tremolo=f=$((7 + i * 2)):d=0.85"
+            ;;
+        tone)
+            AUDIO="-f lavfi -i sine=frequency=$((300 + i * 90)):sample_rate=48000,volume=0.4"
+            ;;
+        *)
+            AUDIO="-f lavfi -i anoisesrc=color=brown:amplitude=0.02:sample_rate=48000"
+            ;;
+    esac
 
     if [ -n "$SRCDIR" ]; then
         # This feed's clip (1-based, cycling through the folder).
@@ -342,7 +373,7 @@ drawtext=fontfile='$FONT':text='ALT ${ALT}ft  HDG ${HDG}  UAV-$i':x=28:y=h-40:fo
         -vf "$BASE,$OVERLAY" \
         -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline \
         -pix_fmt yuv420p -g $((FPS * 2)) -b:v 2M -maxrate 2M -bufsize 1M \
-        -c:a aac -b:a 64k -ar 48000 -ac 1 \
+        $ACODEC \
         $OUTOPTS "$URL" &
 
     # However it was published, the wall pulls it back as plain RTSP.

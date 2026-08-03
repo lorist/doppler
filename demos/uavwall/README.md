@@ -79,7 +79,26 @@ URLs, so a fresh checkout demonstrates itself.
 Options: `-n` feed count, `-s WxH`, `-t sensor|bars`, `-f clip.mp4` to loop real
 footage instead, `-l` seconds of scene to pre-render, `-p` port, `-a` to
 advertise LAN URLs, `-S`/`-R` to publish extra feeds over SRT/RTMP, `-i` for
-ingest slots real devices push into.
+ingest slots real devices push into, `-A` for the audio track.
+
+**Audio.** The synthetic feeds carry an audio track by default, but at −48 dB it
+is inaudible — it exists only to prove the track is there. To demonstrate the
+wall's **LISTEN** button you want something you can hear, and something that
+differs per feed so switching sources is obviously doing something:
+
+| `-A` | What it sounds like | Measured |
+| --- | --- | --- |
+| `quiet` | brown noise, present but inaudible (default) | −48 dB |
+| `rotor` | brown noise with a per-feed tremolo — reads as engine wash | −28 dB |
+| `tone` | a clean per-feed pitch, unmistakable when switching | −29 dB |
+| `off` | no audio track at all | — |
+
+```bash
+./scripts/uav-streams.sh -n 4 -d UAV_footage/prepared -i 1 -a -o -A rotor
+```
+
+Pitch and beat rate both vary with the feed index, so `rotor` on feed 1 and feed
+3 are distinguishable by ear.
 
 > The synthetic imagery is deliberately abstract. ffmpeg cannot conjure
 > convincing aerial footage, and for a demonstration it is arguably better that
