@@ -38,6 +38,8 @@ this participant's video — so everyone in the VMR sees the composed picture.
   shown as discrete metric cells along the foot of the window.
 * **Listen** — monitor the audio of the selected source, one at a time, from
   the inspector.
+* **Send audio** — put one selected feed's audio into the conference alongside
+  the canvas.
 * **Recording** — capture any feed (stream-copied, so the file is the original
   picture) or the composed canvas to MP4, into `recordings/`.
 * **Registration** — register to Infinity with a username and password so the
@@ -475,6 +477,39 @@ through the SDK at all.
 Expect **200–400 ms** of lag against the picture: the player is a separate
 process with its own jitter buffer. Fine for monitoring; not good enough for lip
 sync, which matters if feed audio is ever sent into the VMR.
+
+## Sending feed audio to the VMR
+
+**SEND AUDIO** in the inspector puts the selected feed's audio into the
+conference. One source at a time — the canvas header shows which, or `AUDIO
+silent` when none is chosen.
+
+One rather than a mix, deliberately. A mix needs per-feed gain, clipping and
+drift handling between independent clocks, and four drones at once is not
+something anyone wants to listen to. A gallery picks a source; so does this.
+
+How it is put together, and why:
+
+* The PCM comes from **a second decode** — an ffmpeg child writing s16le to a
+  pipe — because Pulse will not give us a feed's audio at all (see above).
+* A reader thread fills a ring buffer; the render loop drains it and attaches
+  the samples to **the same `push_frame` call that carries the canvas**. One
+  call site on one thread: the SDK makes no promise about two threads pushing
+  frames into one instance.
+* The sample count follows **wall clock** since the previous push, so the stream
+  keeps real time even though the render loop's cadence is not perfectly even.
+  Underrun pads with silence; a stall is capped so it cannot dump a burst.
+* The conference input is configured for audio **whether or not a source is
+  selected**, and pushes silence when none is. Adding audio later would mean
+  renegotiating the session mid-call.
+
+> **Feedback.** The wall sends audio into a conference the operator may also be
+> listening to in the same room. Use headphones, or keep the conference muted
+> locally — this is a real loop, not a theoretical one.
+
+Lip sync is approximate: the canvas and the ffmpeg-decoded audio have unrelated
+latencies, on the order of a few hundred milliseconds. Fine for hearing what is
+happening around a source; not good enough for someone speaking to camera.
 
 ## Recording
 

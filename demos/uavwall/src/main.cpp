@@ -156,6 +156,51 @@ struct Recorder
   bool busy () const { return pid > 0; }
 };
 
+static const uint32_t kAirRate = 48000;
+static const uint32_t kAirChannels = 1;
+
+// Single producer (reader thread), single consumer (render loop).
+struct PcmRing
+{
+  std::vector<int16_t> buf;
+  size_t head = 0, tail = 0;
+  std::mutex m;
+
+  void init (size_t samples)
+  {
+    std::lock_guard<std::mutex> lock (m);
+    buf.assign (samples, 0);
+    head = tail = 0;
+  }
+  void write (const int16_t * src, size_t n)
+  {
+    std::lock_guard<std::mutex> lock (m);
+    if (buf.empty ())
+      return;
+    for (size_t i = 0; i < n; i++) {
+      size_t next = (tail + 1) % buf.size ();
+      if (next == head) // full: drop oldest, so latency cannot creep upward
+        head = (head + 1) % buf.size ();
+      buf[tail] = src[i];
+      tail = next;
+    }
+  }
+  // Always fills n samples, padding with silence on underrun — the conference
+  // needs a continuous stream, and a gap is worse than a moment of quiet.
+  void read (int16_t * dst, size_t n)
+  {
+    std::lock_guard<std::mutex> lock (m);
+    size_t got = 0;
+    if (!buf.empty ())
+      while (got < n && head != tail) {
+        dst[got++] = buf[head];
+        head = (head + 1) % buf.size ();
+      }
+    for (size_t i = got; i < n; i++)
+      dst[i] = 0;
+  }
+};
+
 struct RgbaImage
 {
   int w = 0, h = 0;
@@ -343,6 +388,15 @@ struct App
   // downlinks playing at once is noise, not information.
   int monitor_feed = -1;
   Recorder monitor; // an ffmpeg child playing the selected feed's audio
+
+  // The one feed whose audio is sent into the conference, or -1 for silence.
+  int air_feed = -1;
+  pid_t air_pid = -1;
+  int air_fd = -1;
+  std::thread air_thread;
+  std::atomic<bool> air_quit{false};
+  PcmRing air_ring;
+  double air_last_push = 0.0;
 
   // Feed-loss alert. alert_feed is the worst current stall, recomputed each
   // frame; dismissal is remembered against it so a *new* stall re-raises the
@@ -586,10 +640,16 @@ save_config (App & app, bool force = true)
 static PulseDataSessionConfig *
 make_rgba_input_config (int w, int h)
 {
-  PulseDataSessionConfig * cfg = pulse_data_session_config_new (PULSE_DATA_SESSION_VIDEO_FROM_VALUES);
+  // Audio is configured whether or not a source is selected, and silence is
+  // pushed when there is none. Adding it later would mean reconfiguring the
+  // session mid-call, which is a renegotiation for no good reason.
+  PulseDataSessionConfig * cfg =
+    pulse_data_session_config_new (PULSE_DATA_SESSION_AUDIO_FROM_VALUES_VIDEO_FROM_VALUES);
   PulseDimensions dims{(uint32_t) w, (uint32_t) h};
   PulseFramerate fps{30, 1};
   pulse_data_session_config_video_from_values (cfg, PULSE_MEDIA_PIXEL_FORMAT_RGBA, dims, fps);
+  pulse_data_session_config_audio_from_values (cfg, PULSE_MEDIA_AUDIO_FORMAT_S16LE,
+                                               PULSE_MEDIA_AUDIO_LAYOUT_INTERLEAVED, kAirRate, kAirChannels);
   return cfg;
 }
 
@@ -823,6 +883,25 @@ push_canvas (App & app)
   }
   frame.video.data = app.canvas.px.data ();
   frame.video.data_size = (int) app.canvas.px.size ();
+
+  // Audio rides along on the same call. The sample count follows wall clock
+  // since the previous push, so the stream stays in step with real time even
+  // though the render loop's cadence is not perfectly even.
+  static std::vector<int16_t> pcm;
+  double now = glfwGetTime ();
+  if (app.air_last_push == 0.0)
+    app.air_last_push = now;
+  double dt = now - app.air_last_push;
+  app.air_last_push = now;
+  size_t want = (size_t) (dt * kAirRate * kAirChannels);
+  if (want > kAirRate / 4) // a long stall should not dump a quarter-second burst
+    want = kAirRate / 4;
+  if (want > 0) {
+    pcm.resize (want);
+    app.air_ring.read (pcm.data (), want); // pads silence when no source is on air
+    frame.audio.data = (const uint8_t *) pcm.data ();
+    frame.audio.data_size = (int) (want * sizeof (int16_t));
+  }
   pulse_data_session_push_frame (app.conf, &frame, app.input_content);
   if (upd)
     pulse_data_session_config_free (upd);
@@ -1295,6 +1374,121 @@ start_monitor (App & app, int idx)
   }
   app.monitor_feed = idx;
   set_status (app, "Listening to " + f.name);
+}
+
+// ----------------------------------------------------------------------------
+//  Feed audio into the conference
+//
+//  One source at a time, chosen by the operator — the same model as LISTEN, and
+//  what a broadcast gallery actually does. A mix would need per-feed gain,
+//  clipping and drift handling between independent clocks, for a result nobody
+//  wants to listen to.
+//
+//  Pulse will not hand us a feed's audio (see "Listening to a feed"), so the
+//  PCM comes from a second decode: an ffmpeg child writing s16le to a pipe.
+//  A reader thread fills a ring; the render loop drains it and attaches the
+//  samples to the same push_frame call that carries the canvas. Deliberately
+//  the same call site — two threads pushing frames into one Pulse instance is
+//  not a guarantee the SDK makes.
+// ----------------------------------------------------------------------------
+
+// Spawn a child and keep its *stdout*, the mirror of spawn_recorder which keeps
+// the child's stdin.
+static bool
+spawn_reader (pid_t * pid_out, int * fd_out, const std::vector<std::string> & args)
+{
+  int fds[2];
+  if (pipe (fds) != 0)
+    return false;
+  std::vector<char *> argv;
+  argv.reserve (args.size () + 1);
+  for (const std::string & a : args)
+    argv.push_back (const_cast<char *> (a.c_str ()));
+  argv.push_back (nullptr);
+
+  pid_t pid = fork ();
+  if (pid < 0) {
+    close (fds[0]);
+    close (fds[1]);
+    return false;
+  }
+  if (pid == 0) {
+    dup2 (fds[1], STDOUT_FILENO);
+    close (fds[0]);
+    close (fds[1]);
+    int devnull = open ("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2 (devnull, STDERR_FILENO);
+      close (devnull);
+    }
+    execv (argv[0], argv.data ());
+    _exit (127);
+  }
+  close (fds[1]);
+  *pid_out = pid;
+  *fd_out = fds[0];
+  return true;
+}
+
+static void
+stop_air (App & app)
+{
+  app.air_quit.store (true);
+  if (app.air_fd >= 0) {
+    // Close first so a blocked read returns and the thread can notice the flag.
+    close (app.air_fd);
+    app.air_fd = -1;
+  }
+  if (app.air_thread.joinable ())
+    app.air_thread.join ();
+  if (app.air_pid > 0) {
+    kill (app.air_pid, SIGTERM);
+    int st = 0;
+    waitpid (app.air_pid, &st, 0);
+    app.air_pid = -1;
+  }
+  app.air_feed = -1;
+}
+
+static void
+start_air (App & app, int idx)
+{
+  if (idx < 0 || idx >= (int) app.feeds.size ())
+    return;
+  stop_air (app);
+  if (g_ffmpeg.empty ()) {
+    set_status (app, "ffmpeg not found — cannot send feed audio");
+    return;
+  }
+  Feed & f = app.feeds[(size_t) idx];
+
+  char rate[16], ch[8];
+  snprintf (rate, sizeof (rate), "%u", kAirRate);
+  snprintf (ch, sizeof (ch), "%u", kAirChannels);
+  std::vector<std::string> args = {g_ffmpeg, "-hide_banner", "-loglevel", "error",
+                                   "-rtsp_transport", app.cfg.rtsp_tcp ? "tcp" : "udp",
+                                   "-i", f.url,
+                                   "-vn", "-f", "s16le", "-acodec", "pcm_s16le",
+                                   "-ar", rate, "-ac", ch, "-"};
+  if (!spawn_reader (&app.air_pid, &app.air_fd, args)) {
+    set_status (app, "Could not start the audio source");
+    return;
+  }
+
+  app.air_ring.init (kAirRate * kAirChannels); // one second of slack
+  app.air_feed = idx;
+  app.air_quit.store (false);
+  int fd = app.air_fd;
+  app.air_thread = std::thread ([&app, fd] () {
+    std::vector<int16_t> chunk (1024);
+    while (!app.air_quit.load ()) {
+      ssize_t n = read (fd, chunk.data (), chunk.size () * sizeof (int16_t));
+      if (n <= 0)
+        break; // EOF or the fd was closed under us by stop_air
+      app.air_ring.write (chunk.data (), (size_t) n / sizeof (int16_t));
+    }
+  });
+  set_status (app, "Sending " + f.name + " audio to the VMR");
 }
 
 // ----------------------------------------------------------------------------
@@ -2128,7 +2322,7 @@ preset_slot (App & app, int i)
 static float
 inspector_h (const App & app)
 {
-  return du (app.inspect_feed >= 0 && app.inspect_feed < (int) app.feeds.size () ? 150.0f : 58.0f);
+  return du (app.inspect_feed >= 0 && app.inspect_feed < (int) app.feeds.size () ? 178.0f : 58.0f);
 }
 
 // Feed inspector, pinned to the foot of the rail: what this source actually is,
@@ -2244,11 +2438,25 @@ ui_inspector (App & app, ImVec2 at, float w)
     draw_mono (app, dl, ImVec2 (at.x + pad, y), e.c_str (), theme::HexU32 (theme::StatusError, 0.90f), 9.2f);
   }
 
-  // Three actions along the bottom now that a feed can be listened to.
+  // Four actions in two rows: three across was already tight, and RECONNECT
+  // does not abbreviate well.
   const float bh = du (22.0f), gapb = du (5.0f);
-  const float bw = (w - pad * 2 - gapb * 2) / 3;
+  const float bw = (w - pad * 2 - gapb) / 2;
+  const float row2 = p1.y - pad - bh;
+  const float row1 = row2 - bh - gapb;
   const bool monitoring = app.monitor_feed == app.inspect_feed;
-  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad, p1.y - pad - bh));
+  const bool on_air = app.air_feed == app.inspect_feed;
+
+  // Sending this feed's audio into the conference — one source at a time.
+  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad, row1));
+  if (deck_button (app, "insp_air", on_air ? "AUDIO ON AIR" : "SEND AUDIO", ImVec2 (bw, bh), theme::StatusError,
+                   on_air ? Btn::Fill : Btn::Outline, f.connected)) {
+    if (on_air)
+      stop_air (app);
+    else
+      start_air (app, app.inspect_feed);
+  }
+  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + bw + gapb, row1));
   // Listening is exclusive, so the button reads as a state rather than an
   // action once it is on.
   if (deck_button (app, "insp_mon", monitoring ? "LISTENING" : "LISTEN", ImVec2 (bw, bh), theme::StatusOnline,
@@ -2258,7 +2466,7 @@ ui_inspector (App & app, ImVec2 at, float w)
     else
       start_monitor (app, app.inspect_feed);
   }
-  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + bw + gapb, p1.y - pad - bh));
+  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad, row2));
   if (deck_button (app, "insp_rc", "RECONNECT", ImVec2 (bw, bh), theme::AccentPrimary, Btn::Fill)) {
     if (app.monitor_feed == app.inspect_feed)
       stop_monitor (app); // the instance is about to be torn down
@@ -2267,11 +2475,13 @@ ui_inspector (App & app, ImVec2 at, float w)
     if (f.connected)
       f.connected_at = ImGui::GetTime ();
   }
-  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + (bw + gapb) * 2, p1.y - pad - bh));
+  ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + bw + gapb, row2));
   if (deck_button (app, "insp_rm", "REMOVE", ImVec2 (bw, bh), 0xFFFFFF, Btn::Outline)) {
     int idx = app.inspect_feed;
     if (app.monitor_feed == idx)
       stop_monitor (app);
+    if (app.air_feed == idx)
+      stop_air (app);
     remove_feed_tiles (app, idx);
     stop_feed (app.feeds[(size_t) idx]);
     app.feeds.erase (app.feeds.begin () + idx);
@@ -2281,6 +2491,8 @@ ui_inspector (App & app, ImVec2 at, float w)
     // Indices shift down, so a monitor on a later feed would follow the wrong one.
     if (app.monitor_feed > idx)
       app.monitor_feed--;
+    if (app.air_feed > idx)
+      app.air_feed--;
     app.inspect_feed = -1;
     app.fullscreen_feed = -1;
   }
@@ -3475,8 +3687,11 @@ ui_canvas (App & app, ImVec2 size)
     draw_label (app, dl, at, sending ? "PROGRAM · WHAT THE VMR RECEIVES" : "CANVAS · READY TO SEND",
                 theme::WhiteU32 (theme::TextLabel));
     char spec[128];
-    snprintf (spec, sizeof (spec), "%d×%d · %d fps · H.264 · %s", app.cfg.canvas_w, app.cfg.canvas_h,
-              app.cfg.send_fps, app.cfg.send_as_content ? "CONTENT" : "MAIN");
+    const char * air = app.air_feed >= 0 && app.air_feed < (int) app.feeds.size ()
+                         ? app.feeds[(size_t) app.air_feed].name.c_str ()
+                         : "silent";
+    snprintf (spec, sizeof (spec), "%d×%d · %d fps · H.264 · %s · AUDIO %s", app.cfg.canvas_w, app.cfg.canvas_h,
+              app.cfg.send_fps, app.cfg.send_as_content ? "CONTENT" : "MAIN", air);
     float rx = at.x + cw - mono_w (app, spec);
     draw_mono (app, dl, ImVec2 (rx, at.y - du (1.0f)), spec, theme::WhiteU32 (0.45f));
 
@@ -4650,6 +4865,7 @@ main (int argc, char ** argv)
   }
 
   stop_monitor (app);
+  stop_air (app);
   conf_disconnect (app);
   for (Feed & f : app.feeds)
     stop_feed (f);
