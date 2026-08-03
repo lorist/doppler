@@ -36,6 +36,8 @@ this participant's video — so everyone in the VMR sees the composed picture.
 * **Stats** — per-feed rates, plus this process's CPU and memory and, once in
   a conference, the real transmit bitrate, packet loss and RTT from Pulse,
   shown as discrete metric cells along the foot of the window.
+* **Listen** — monitor the audio of the selected source, one at a time, from
+  the inspector.
 * **Recording** — capture any feed (stream-copied, so the file is the original
   picture) or the composed canvas to MP4, into `recordings/`.
 * **Registration** — register to Infinity with a username and password so the
@@ -111,13 +113,14 @@ Four drone downlinks over RTSP plus one wearable pushing in — one command, one
 process:
 
 ```bash
-./scripts/uav-streams.sh -n 4 -d UAV_footage/prepared -i 1 -a -o
+./scripts/uav-streams.sh -n 4 -d UAV_footage/prepared -i 1 -a -o -A rotor
 ```
 
 * `-n 4 -d …/prepared` — the four synthetic downlinks, from real footage
 * `-i 1` — one ingest slot (`hawkeye-21`) for the wearable
 * `-a` — print the LAN address, so a phone has something to point at
 * `-o` — no publish credential, which is one less variable at a demo
+* `-A rotor` — audible per-feed audio, so **LISTEN** has something to play
 
 The matching feed list in `uavwall.conf`:
 
@@ -444,6 +447,34 @@ Registration belongs to a single Pulse instance, and an incoming call is
 answered on that same one — so the long-lived instance that keeps global
 GStreamer state alive is also the conference instance, rather than one being
 created per call.
+
+## Listening to a feed
+
+Select a source in the rail and press **LISTEN** in the inspector to hear it.
+Exclusive by design: starting one stops whatever was playing, because six
+downlinks at once is noise rather than information. The case it exists for is
+hearing what is happening around a body camera, not drone engine wash.
+
+Like recording, it is an `ffmpeg` child — `-vn -f audiotoolbox` to the default
+output — so it needs ffmpeg present, and it opens the URL itself, meaning a feed
+can be listened to whether or not it is connected in the wall.
+
+**Pulse cannot do this**, which is worth recording because two plausible
+approaches fail in different ways. A feed's RTSP session is bound to MAIN as
+that instance's *source* — it is the microphone, not remote media — so:
+
+* connecting a **speaker to MAIN** succeeds and is silent, because it renders
+  incoming call audio and there is no call;
+* asking for a **selfview audio** data session, mirroring how the video is
+  pulled, does not return an error — it **aborts the process** with
+  `"Connecting a selfview to audio does not make any sense"`.
+
+Pulse has no notion of monitoring your own input, so the audio never comes back
+through the SDK at all.
+
+Expect **200–400 ms** of lag against the picture: the player is a separate
+process with its own jitter buffer. Fine for monitoring; not good enough for lip
+sync, which matters if feed audio is ever sent into the VMR.
 
 ## Recording
 
