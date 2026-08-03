@@ -202,34 +202,42 @@ struct PcmRing
   // audio path is shorter. Holding audio back by that difference is the only
   // alignment available: the SDK's frame carries no timestamp, so we cannot
   // tell Pulse when a sample belongs — only when to hand it over.
-  void read (int16_t * dst, size_t n, size_t keep = 0, size_t slack = 0)
+  // Hand over whatever the source has actually produced, up to `max`, leaving
+  // `keep` behind as the deliberate delay. Never pads.
+  //
+  // An earlier version asked for a wall-clock number of samples and padded the
+  // shortfall with silence. That converted every hiccup in the render loop into
+  // a gap, and every early frame into a discarded sample — audible as periodic
+  // chopping at the loop's own jitter frequency. The source and the conference
+  // both run at 48kHz; the push cadence does not have to, and pretending it
+  // does was the whole problem.
+  size_t take (int16_t * dst, size_t max, size_t keep = 0)
   {
     std::lock_guard<std::mutex> lock (m);
-    size_t got = 0;
-    if (!buf.empty ()) {
-      size_t have = (tail + buf.size () - head) % buf.size ();
-
-      // Shed anything beyond what we mean to hold. Producer and consumer run at
-      // the same nominal rate, so without this the buffer sits at whatever
-      // depth ffmpeg's opening burst left it at — permanently, since nothing
-      // ever drains it. That backlog *is* the audio lag, and it survived
-      // setting the delay to zero.
-      size_t cap = keep + n + slack;
-      if (have > cap) {
-        head = (head + (have - cap)) % buf.size ();
-        have = cap;
-      }
-
-      size_t serve = have > keep ? have - keep : 0;
-      if (serve > n)
-        serve = n;
-      while (got < serve) {
-        dst[got++] = buf[head];
-        head = (head + 1) % buf.size ();
-      }
+    if (buf.empty ())
+      return 0;
+    size_t have = (tail + buf.size () - head) % buf.size ();
+    size_t serve = have > keep ? have - keep : 0;
+    if (serve > max)
+      serve = max;
+    for (size_t i = 0; i < serve; i++) {
+      dst[i] = buf[head];
+      head = (head + 1) % buf.size ();
     }
-    for (size_t i = got; i < n; i++)
-      dst[i] = 0; // still filling the delay window, or the source stalled
+    return serve;
+  }
+
+  // Shed anything deeper than `keep`, so a backlog cannot become permanent
+  // latency. Producer and consumer run at the same nominal rate, so nothing
+  // else would ever drain it.
+  void drop_beyond (size_t keep)
+  {
+    std::lock_guard<std::mutex> lock (m);
+    if (buf.empty ())
+      return;
+    size_t have = (tail + buf.size () - head) % buf.size ();
+    if (have > keep)
+      head = (head + (have - keep)) % buf.size ();
   }
 };
 
@@ -428,7 +436,6 @@ struct App
   std::thread air_thread;
   std::atomic<bool> air_quit{false};
   PcmRing air_ring;
-  double air_last_push = 0.0;
 
   // Feed-loss alert. alert_feed is the worst current stall, recomputed each
   // frame; dismissal is remembered against it so a *new* stall re-raises the
@@ -923,23 +930,19 @@ push_canvas (App & app)
   // Audio rides along on the same call. The sample count follows wall clock
   // since the previous push, so the stream stays in step with real time even
   // though the render loop's cadence is not perfectly even.
+  // Forward exactly what the source produced since the last push — no more, and
+  // never silence to make up a number. The conference consumes at its own rate
+  // and buffers; our cadence only has to be frequent enough, not exact.
   static std::vector<int16_t> pcm;
-  double now = glfwGetTime ();
-  if (app.air_last_push == 0.0)
-    app.air_last_push = now;
-  double dt = now - app.air_last_push;
-  app.air_last_push = now;
-  size_t want = (size_t) (dt * kAirRate * kAirChannels);
-  if (want > kAirRate / 4) // a long stall should not dump a quarter-second burst
-    want = kAirRate / 4;
-  if (want > 0) {
-    pcm.resize (want);
-    const size_t keep = (size_t) app.cfg.audio_delay_ms * kAirRate * kAirChannels / 1000;
-    // 40ms of slack absorbs render-loop jitter without letting a backlog build.
-    const size_t slack = kAirRate * kAirChannels * 40 / 1000;
-    app.air_ring.read (pcm.data (), want, keep, slack); // pads silence when no source is on air
+  const size_t keep = (size_t) app.cfg.audio_delay_ms * kAirRate * kAirChannels / 1000;
+  // A backlog beyond the delay plus a quarter second is latency, not jitter.
+  app.air_ring.drop_beyond (keep + kAirRate * kAirChannels / 4);
+  const size_t cap = kAirRate * kAirChannels / 4;
+  pcm.resize (cap);
+  size_t got = app.air_ring.take (pcm.data (), cap, keep);
+  if (got > 0) {
     frame.audio.data = (const uint8_t *) pcm.data ();
-    frame.audio.data_size = (int) (want * sizeof (int16_t));
+    frame.audio.data_size = (int) (got * sizeof (int16_t));
   }
   pulse_data_session_push_frame (app.conf, &frame, app.input_content);
   if (upd)

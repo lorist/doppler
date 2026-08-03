@@ -520,6 +520,10 @@ by a few hundred milliseconds.
 data-session API, and Pulse stamps frames itself as they arrive. There is no way
 to say *this sample belongs at time T*; only when to hand it over.
 
+Judge sync **in the VMR, not through LISTEN** — the local monitor is a separate
+ffmpeg pipeline with its own latency, and it is not what the conference hears.
+Chasing the monitor's lag will send you after a number that does not exist.
+
 **The dominant term was ffmpeg's own probing**, not anything in this app.
 Left at its defaults, ffmpeg reads the input for about three seconds before
 emitting a sample — measured at **3.15s, against 0.21s** with
