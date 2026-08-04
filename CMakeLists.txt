@@ -57,7 +57,7 @@ pulse_declare_imgui()   # fetches Dear ImGui + builds the shared `imgui` lib
 # Demos. Lightweight demos build by default; the heavier ones that need extra
 # system packages are opt-in.
 # ---------------------------------------------------------------------------
-# Of the demos, only pexclient has been ported to Windows so far; the others
+# Of the demos, pexclient and uavwall have been ported to Windows; the others
 # keep their POSIX assumptions and are opt-in there.
 if(WIN32)
     set(_default_posix_demos OFF)
@@ -71,7 +71,7 @@ option(BUILD_PEXNINJA    "Build the larger pexninja reference client"       OFF)
 option(BUILD_DOPPLER_SIP "Build the SIP-signalling demo (needs PJSIP)"      OFF)
 option(BUILD_VIDEOWALL   "Build the videowall multi-Pulse compositor"       ${_default_posix_demos})
 option(BUILD_PEXCLIENT   "Build the pexclient home-screen client"           ON)
-option(BUILD_UAVWALL     "Build the uavwall UAV-feeds-to-VMR demo"          ${_default_posix_demos})
+option(BUILD_UAVWALL     "Build the uavwall UAV-feeds-to-VMR demo"          ON)
 
 if(BUILD_DOPPLER)
     add_subdirectory(demos/doppler)

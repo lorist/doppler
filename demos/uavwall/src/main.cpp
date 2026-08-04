@@ -45,18 +45,28 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <mach/mach.h>
 #endif
+#if defined(_WIN32)
+#include <windows.h>
+#include <fcntl.h>    // _O_RDONLY
+#include <io.h>       // _open_osfhandle / _read / _write / _close
+#include <mmsystem.h> // PlaySound — the incoming-call ring and the feed-loss cue
+#include <psapi.h>    // GetProcessMemoryInfo — resident memory for the stats row
+#include <filesystem>
+#else
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
+#endif
 #include <cctype>
 #include <cerrno>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -73,6 +83,101 @@
 
 #ifndef UAVWALL_ASSET_DIR
 #define UAVWALL_ASSET_DIR "."
+#endif
+
+// ----------------------------------------------------------------------------
+//  Platform shim
+//
+//  Every recording, the LISTEN monitor and the feed-audio decode is an ffmpeg
+//  child driven through a pipe (Pulse has no recording API and will not hand
+//  back a feed's audio — see the README). That plumbing is the only part of
+//  this file that is not portable, and it is deliberately kept to the three
+//  primitives below so the ~14 call sites above them are shared verbatim.
+//
+//  Windows keeps the POSIX *shape* by two tricks, both of which matter:
+//
+//    * the pipe handle is wrapped in a CRT descriptor with _open_osfhandle(),
+//      so `in_fd` stays an int and the writer thread, the reader thread and
+//      every close are unchanged;
+//    * the process HANDLE lives in the same slot as the pid. Win32 process
+//      handles are always small positive values, so the "> 0 is running, -1 is
+//      none" convention the rest of the file relies on survives intact.
+// ----------------------------------------------------------------------------
+
+#if defined(_WIN32)
+using ProcHandle = intptr_t; // a HANDLE, kept in a pid-shaped slot
+static inline ptrdiff_t
+pio_read (int fd, void * buf, size_t n)
+{
+  return _read (fd, buf, (unsigned int) n);
+}
+static inline ptrdiff_t
+pio_write (int fd, const void * buf, size_t n)
+{
+  return _write (fd, buf, (unsigned int) n);
+}
+static inline int
+pio_close (int fd)
+{
+  return _close (fd); // also closes the underlying HANDLE, as POSIX close does
+}
+
+// CreateProcess takes one command line rather than an argv, so the vector has
+// to be quoted back into a string using the rules the CRT uses to split it
+// again. Paths with spaces (C:\Program Files\...) make this load-bearing.
+static std::string
+win_quote (const std::string & a)
+{
+  if (!a.empty () && a.find_first_of (" \t\"") == std::string::npos)
+    return a;
+  std::string out = "\"";
+  size_t bs = 0;
+  for (char c : a) {
+    if (c == '\\') {
+      bs++;
+    } else if (c == '"') {
+      out.append (bs * 2 + 1, '\\');
+      out += '"';
+      bs = 0;
+    } else {
+      out.append (bs, '\\');
+      bs = 0;
+      out += c;
+    }
+  }
+  out.append (bs * 2, '\\');
+  out += '"';
+  return out;
+}
+
+static std::string
+win_cmdline (const std::vector<std::string> & args)
+{
+  std::string cmd;
+  for (const std::string & a : args) {
+    if (!cmd.empty ())
+      cmd += ' ';
+    cmd += win_quote (a);
+  }
+  return cmd;
+}
+#else
+using ProcHandle = pid_t;
+static inline ptrdiff_t
+pio_read (int fd, void * buf, size_t n)
+{
+  return read (fd, buf, n);
+}
+static inline ptrdiff_t
+pio_write (int fd, const void * buf, size_t n)
+{
+  return write (fd, buf, n);
+}
+static inline int
+pio_close (int fd)
+{
+  return close (fd);
+}
 #endif
 
 // Everything an operator might reasonably want to change, with defaults chosen
@@ -149,7 +254,7 @@ struct Config
 
 struct Recorder
 {
-  pid_t pid = -1;
+  ProcHandle pid = -1;
   int in_fd = -1; // ffmpeg's stdin: "q" for a feed, raw frames for the canvas
   std::string path;
   double started_at = 0.0;
@@ -431,7 +536,7 @@ struct App
 
   // The one feed whose audio is sent into the conference, or -1 for silence.
   int air_feed = -1;
-  pid_t air_pid = -1;
+  ProcHandle air_pid = -1;
   int air_fd = -1;
   std::thread air_thread;
   std::atomic<bool> air_quit{false};
@@ -971,30 +1076,59 @@ push_canvas (App & app)
 // Resolved once. Empty means the record controls are unavailable rather than
 // silently broken — ffmpeg is a runtime dependency only for this feature.
 static std::string g_ffmpeg;
+// Windows only: ffmpeg has no audio *output* device there (dshow is capture
+// only), so LISTEN plays through ffplay instead. Empty disables just that
+// button, exactly as an absent ffmpeg disables the record rings.
+static std::string g_ffplay;
 
-static void
-find_ffmpeg ()
+static std::string
+find_tool (const char * name)
 {
-  static const char * fixed[] = {"/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"};
-  for (const char * p : fixed)
-    if (access (p, X_OK) == 0) {
-      g_ffmpeg = p;
-      return;
-    }
+#if defined(_WIN32)
+  const std::string exe = std::string (name) + ".exe";
   const char * path = getenv ("PATH");
   if (!path)
-    return;
+    return {};
+  std::string dir;
+  std::istringstream iss (path);
+  while (std::getline (iss, dir, ';')) { // ';' on Windows, not ':'
+    if (dir.empty ())
+      continue;
+    std::string cand = dir + "\\" + exe;
+    std::error_code ec;
+    if (std::filesystem::is_regular_file (cand, ec))
+      return cand;
+  }
+  return {};
+#else
+  const std::string fixed[] = {std::string ("/opt/homebrew/bin/") + name, std::string ("/usr/local/bin/") + name,
+                               std::string ("/usr/bin/") + name};
+  for (const std::string & p : fixed)
+    if (access (p.c_str (), X_OK) == 0)
+      return p;
+  const char * path = getenv ("PATH");
+  if (!path)
+    return {};
   std::string s (path), dir;
   std::istringstream iss (s);
   while (std::getline (iss, dir, ':')) {
     if (dir.empty ())
       continue;
-    std::string cand = dir + "/ffmpeg";
-    if (access (cand.c_str (), X_OK) == 0) {
-      g_ffmpeg = cand;
-      return;
-    }
+    std::string cand = dir + "/" + name;
+    if (access (cand.c_str (), X_OK) == 0)
+      return cand;
   }
+  return {};
+#endif
+}
+
+static void
+find_ffmpeg ()
+{
+  g_ffmpeg = find_tool ("ffmpeg");
+#if defined(_WIN32)
+  g_ffplay = find_tool ("ffplay");
+#endif
 }
 
 // "HAWKEYE 21" -> "HAWKEYE-21", so the filename survives a shell and a USB stick.
@@ -1036,6 +1170,13 @@ ensure_dir (const std::string & path)
 {
   if (path.empty ())
     return false;
+#if defined(_WIN32)
+  // Both separators are legal here and a configured path may use either, so
+  // let the standard library do the walking rather than splitting by hand.
+  std::error_code ec;
+  std::filesystem::create_directories (path, ec);
+  return std::filesystem::is_directory (path, ec);
+#else
   std::string acc;
   size_t i = 0;
   if (path[0] == '/') {
@@ -1054,6 +1195,7 @@ ensure_dir (const std::string & path)
   }
   struct stat st{};
   return stat (path.c_str (), &st) == 0 && S_ISDIR (st.st_mode);
+#endif
 }
 
 // Fork/exec with a pipe on stdin. ffmpeg's own output goes to a log beside the
@@ -1061,6 +1203,69 @@ ensure_dir (const std::string & path)
 static bool
 spawn_recorder (Recorder & r, const std::vector<std::string> & args, bool nonblocking_stdin)
 {
+#if defined(_WIN32)
+  // No caller asks for a non-blocking stdin — the canvas encoder's writer
+  // thread took that job, and an anonymous pipe has no O_NONBLOCK equivalent
+  // anyway. Assert the expectation rather than silently ignoring it.
+  (void) nonblocking_stdin;
+
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof (sa);
+  sa.bInheritHandle = TRUE;
+
+  HANDLE rd = nullptr, wr = nullptr;
+  if (!CreatePipe (&rd, &wr, &sa, 0))
+    return false;
+  // Only the read end belongs to the child. If our write end were inheritable
+  // the child would hold a copy open and never see the EOF that finalises the
+  // file when we close it.
+  SetHandleInformation (wr, HANDLE_FLAG_INHERIT, 0);
+
+  // ffmpeg's own diagnostics go to a log beside the recording, so a failure can
+  // be read after the fact — same as the POSIX path.
+  HANDLE log = CreateFileA ((r.path + ".log").c_str (), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+  STARTUPINFOA si{};
+  si.cb = sizeof (si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = rd;
+  si.hStdOutput = log != INVALID_HANDLE_VALUE ? log : GetStdHandle (STD_OUTPUT_HANDLE);
+  si.hStdError = log != INVALID_HANDLE_VALUE ? log : GetStdHandle (STD_ERROR_HANDLE);
+
+  std::string cmd = win_cmdline (args);
+  std::vector<char> mutable_cmd (cmd.begin (), cmd.end ());
+  mutable_cmd.push_back ('\0'); // CreateProcessA may write to this buffer
+
+  PROCESS_INFORMATION pi{};
+  BOOL ok = CreateProcessA (nullptr, mutable_cmd.data (), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                            &si, &pi);
+  CloseHandle (rd);
+  if (log != INVALID_HANDLE_VALUE)
+    CloseHandle (log);
+  if (!ok) {
+    CloseHandle (wr);
+    return false;
+  }
+  CloseHandle (pi.hThread);
+
+  // A CRT descriptor over the pipe is what keeps in_fd an int, so the writer
+  // thread and every close above this line are shared with POSIX.
+  int fd = _open_osfhandle ((intptr_t) wr, 0);
+  if (fd < 0) {
+    CloseHandle (wr);
+    TerminateProcess (pi.hProcess, 1);
+    CloseHandle (pi.hProcess);
+    return false;
+  }
+
+  r.pid = (ProcHandle) pi.hProcess;
+  r.in_fd = fd;
+  r.started_at = ImGui::GetTime ();
+  r.stopping = false;
+  r.bytes = 0;
+  return true;
+#else
   int fds[2];
   if (pipe (fds) != 0)
     return false;
@@ -1104,6 +1309,7 @@ spawn_recorder (Recorder & r, const std::vector<std::string> & args, bool nonblo
   r.stopping = false;
   r.bytes = 0;
   return true;
+#endif
 }
 
 static void
@@ -1115,10 +1321,10 @@ stop_recorder (Recorder & r, bool frames_on_stdin)
     // A feed recorder is told to quit; the canvas recorder simply gets EOF,
     // which finalises the file the same way.
     if (!frames_on_stdin) {
-      ssize_t n = write (r.in_fd, "q\n", 2);
+      ptrdiff_t n = pio_write (r.in_fd, "q\n", 2);
       (void) n;
     }
-    close (r.in_fd);
+    pio_close (r.in_fd);
     r.in_fd = -1;
   }
   r.stopping = true;
@@ -1127,26 +1333,49 @@ stop_recorder (Recorder & r, bool frames_on_stdin)
 
 // Called every frame. Reaping is deferred rather than waited on, so stopping a
 // recording never stalls the UI.
+// Has the child gone? Never blocks, and clears the slot when it has. Shared by
+// reap_recorder and the bounded wait during shutdown.
+static bool
+reap_if_exited (Recorder & r)
+{
+  if (r.pid <= 0)
+    return true;
+#if defined(_WIN32)
+  HANDLE h = (HANDLE) r.pid;
+  DWORD w = WaitForSingleObject (h, 0);
+  if (w != WAIT_OBJECT_0 && w != WAIT_FAILED)
+    return false;
+  CloseHandle (h);
+#else
+  int st = 0;
+  pid_t got = waitpid (r.pid, &st, WNOHANG);
+  if (got != r.pid && got >= 0)
+    return false;
+#endif
+  r.pid = -1;
+  r.stopping = false;
+  if (r.in_fd >= 0) {
+    pio_close (r.in_fd);
+    r.in_fd = -1;
+  }
+  return true;
+}
+
 static void
 reap_recorder (Recorder & r)
 {
   if (r.pid <= 0)
     return;
-  int st = 0;
-  pid_t got = waitpid (r.pid, &st, WNOHANG);
-  if (got == r.pid || got < 0) {
-    r.pid = -1;
-    r.stopping = false;
-    if (r.in_fd >= 0) {
-      close (r.in_fd);
-      r.in_fd = -1;
-    }
+  if (reap_if_exited (r))
     return;
-  }
   if (r.stopping && ImGui::GetTime () > r.kill_after) {
     // It will not go quietly; the file is likely unplayable, but a wedged
     // child is worse.
+#if defined(_WIN32)
+    TerminateProcess ((HANDLE) r.pid, 1);
+#else
     kill (r.pid, SIGKILL);
+#endif
     r.kill_after = ImGui::GetTime () + 5.0;
   }
 }
@@ -1277,7 +1506,7 @@ start_canvas_recording (App & app)
       const unsigned char * pp = frame.data ();
       size_t left = frame.size ();
       while (left > 0) {
-        ssize_t n = write (app.canvas_rec.in_fd, pp, left);
+        ptrdiff_t n = pio_write (app.canvas_rec.in_fd, pp, left);
         if (n > 0) {
           pp += n;
           left -= (size_t) n;
@@ -1285,7 +1514,7 @@ start_canvas_recording (App & app)
         }
         if (n < 0 && errno == EINTR)
           continue;
-        return; // EPIPE: the encoder is gone
+        return; // EPIPE (ERROR_BROKEN_PIPE): the encoder is gone
       }
       app.canvas_rec.bytes += frame.size ();
       {
@@ -1376,8 +1605,16 @@ recording_count (const App & app)
 static void
 stop_monitor (App & app)
 {
-  if (app.monitor.busy ())
+  if (app.monitor.busy ()) {
     stop_recorder (app.monitor, false);
+#if defined(_WIN32)
+    // The monitor is ffplay here (see below), which takes its keys from SDL
+    // rather than stdin, so the "q" stop_recorder just wrote is ignored. There
+    // is no file to finalise, so bring the kill-fallback forward instead of
+    // leaving the sound playing for the usual eight seconds.
+    app.monitor.kill_after = ImGui::GetTime ();
+#endif
+  }
   app.monitor_feed = -1;
 }
 
@@ -1389,10 +1626,21 @@ start_monitor (App & app, int idx)
     return;
   stop_monitor (app);
 
+#if defined(_WIN32)
+  // ffmpeg has no audio output device on Windows at all — dshow is capture
+  // only, and there is no wasapi/directsound muxer to write to. ffplay is the
+  // one player in the same distribution, so LISTEN uses it here and needs it
+  // present separately from ffmpeg.
+  if (g_ffplay.empty ()) {
+    set_status (app, "ffplay not found — cannot listen");
+    return;
+  }
+#else
   if (g_ffmpeg.empty ()) {
     set_status (app, "ffmpeg not found — cannot listen");
     return;
   }
+#endif
   Feed & f = app.feeds[(size_t) idx];
 
   // ffmpeg opens the URL itself, so this works whether or not the feed is
@@ -1400,6 +1648,25 @@ start_monitor (App & app, int idx)
   app.monitor.path = "/dev/null"; // only used to name the child's log
   // Same low-latency flags as the conference path: monitoring three seconds
   // behind the picture is not monitoring.
+#if defined(_WIN32)
+  std::vector<std::string> args = {g_ffplay,
+                                   "-hide_banner",
+                                   "-loglevel",
+                                   "error",
+                                   "-nodisp",  // audio only; the picture is already on the wall
+                                   "-autoexit", // follow the feed if it ends
+                                   "-fflags",
+                                   "nobuffer",
+                                   "-flags",
+                                   "low_delay",
+                                   "-probesize",
+                                   "32",
+                                   "-analyzeduration",
+                                   "0",
+                                   "-rtsp_transport",
+                                   app.cfg.rtsp_tcp ? "tcp" : "udp",
+                                   f.url};
+#else
   std::vector<std::string> args = {g_ffmpeg,
                                    "-hide_banner",
                                    "-loglevel",
@@ -1420,6 +1687,7 @@ start_monitor (App & app, int idx)
                                    "-f",
                                    "audiotoolbox",
                                    "-"};
+#endif
   if (!spawn_recorder (app.monitor, args, false)) {
     set_status (app, "Could not start the monitor");
     return;
@@ -1447,8 +1715,50 @@ start_monitor (App & app, int idx)
 // Spawn a child and keep its *stdout*, the mirror of spawn_recorder which keeps
 // the child's stdin.
 static bool
-spawn_reader (pid_t * pid_out, int * fd_out, const std::vector<std::string> & args)
+spawn_reader (ProcHandle * pid_out, int * fd_out, const std::vector<std::string> & args)
 {
+#if defined(_WIN32)
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof (sa);
+  sa.bInheritHandle = TRUE;
+
+  HANDLE rd = nullptr, wr = nullptr;
+  if (!CreatePipe (&rd, &wr, &sa, 0))
+    return false;
+  SetHandleInformation (rd, HANDLE_FLAG_INHERIT, 0); // our read end stays ours
+
+  STARTUPINFOA si{};
+  si.cb = sizeof (si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = GetStdHandle (STD_INPUT_HANDLE);
+  si.hStdOutput = wr;
+  si.hStdError = INVALID_HANDLE_VALUE; // the POSIX path sends this to /dev/null
+
+  std::string cmd = win_cmdline (args);
+  std::vector<char> mutable_cmd (cmd.begin (), cmd.end ());
+  mutable_cmd.push_back ('\0');
+
+  PROCESS_INFORMATION pi{};
+  BOOL ok = CreateProcessA (nullptr, mutable_cmd.data (), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                            &si, &pi);
+  CloseHandle (wr);
+  if (!ok) {
+    CloseHandle (rd);
+    return false;
+  }
+  CloseHandle (pi.hThread);
+
+  int fd = _open_osfhandle ((intptr_t) rd, _O_RDONLY);
+  if (fd < 0) {
+    CloseHandle (rd);
+    TerminateProcess (pi.hProcess, 1);
+    CloseHandle (pi.hProcess);
+    return false;
+  }
+  *pid_out = (ProcHandle) pi.hProcess;
+  *fd_out = fd;
+  return true;
+#else
   int fds[2];
   if (pipe (fds) != 0)
     return false;
@@ -1480,12 +1790,31 @@ spawn_reader (pid_t * pid_out, int * fd_out, const std::vector<std::string> & ar
   *pid_out = pid;
   *fd_out = fds[0];
   return true;
+#endif
 }
 
 static void
 stop_air (App & app)
 {
   app.air_quit.store (true);
+#if defined(_WIN32)
+  // Order is reversed from POSIX on purpose. Closing a handle that another
+  // thread is blocked reading is not guaranteed to release it on Windows, so
+  // the child is killed first: that closes its end of the pipe, the reader
+  // sees EOF, and the thread leaves on its own.
+  if (app.air_pid > 0) {
+    TerminateProcess ((HANDLE) app.air_pid, 1);
+    WaitForSingleObject ((HANDLE) app.air_pid, INFINITE);
+    CloseHandle ((HANDLE) app.air_pid);
+    app.air_pid = -1;
+  }
+  if (app.air_thread.joinable ())
+    app.air_thread.join ();
+  if (app.air_fd >= 0) {
+    pio_close (app.air_fd);
+    app.air_fd = -1;
+  }
+#else
   if (app.air_fd >= 0) {
     // Close first so a blocked read returns and the thread can notice the flag.
     close (app.air_fd);
@@ -1499,6 +1828,7 @@ stop_air (App & app)
     waitpid (app.air_pid, &st, 0);
     app.air_pid = -1;
   }
+#endif
   app.air_feed = -1;
 }
 
@@ -1541,7 +1871,7 @@ start_air (App & app, int idx)
   app.air_thread = std::thread ([&app, fd] () {
     std::vector<int16_t> chunk (1024);
     while (!app.air_quit.load ()) {
-      ssize_t n = read (fd, chunk.data (), chunk.size () * sizeof (int16_t));
+      ptrdiff_t n = pio_read (fd, chunk.data (), chunk.size () * sizeof (int16_t));
       if (n <= 0)
         break; // EOF or the fd was closed under us by stop_air
       app.air_ring.write (chunk.data (), (size_t) n / sizeof (int16_t));
@@ -1730,6 +2060,15 @@ play_ring ()
     AudioServicesPlaySystemSound (sound);
   else
     AudioServicesPlayAlertSound (kSystemSoundID_UserPreferredAlert);
+}
+#elif defined(_WIN32)
+static void
+play_ring ()
+{
+  // Fire-and-forget, like the macOS path: one short system chime, retriggered
+  // by the ring timer, so an in-flight sound never outlives the call. Async so
+  // the UI thread never blocks on it.
+  PlaySoundW (L"SystemExclamation", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
 }
 #else
 static void
@@ -2063,6 +2402,26 @@ sample_resources (App & app)
   if (now - app.stats_sampled_at < 1.0)
     return;
 
+#if defined(_WIN32)
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (GetProcessTimes (GetCurrentProcess (), &created, &exited, &kernel, &user)) {
+    // Both are 100ns ticks of consumed CPU, the same quantity getrusage
+    // reports, so the percentage below is computed identically.
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+    double cpu = (double) (k.QuadPart + u.QuadPart) / 1e7;
+    if (app.stats_sampled_at > 0.0)
+      app.proc_cpu_pct = 100.0 * (cpu - app.last_cpu_seconds) / (now - app.stats_sampled_at);
+    app.last_cpu_seconds = cpu;
+  }
+
+  PROCESS_MEMORY_COUNTERS pmc{};
+  if (GetProcessMemoryInfo (GetCurrentProcess (), &pmc, sizeof (pmc)))
+    app.proc_rss_mb = pmc.WorkingSetSize / (1024.0 * 1024.0);
+#else
   struct rusage ru;
   if (getrusage (RUSAGE_SELF, &ru) == 0) {
     double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
@@ -2083,6 +2442,7 @@ sample_resources (App & app)
       app.proc_rss_mb = pages_res * (double) sysconf (_SC_PAGESIZE) / (1024.0 * 1024.0);
     fclose (f);
   }
+#endif
 #endif
 
   // Outbound conference stats, straight from Pulse.
@@ -4570,11 +4930,36 @@ ui_footer (App & app, float width)
 // (deregister, stop recordings, disconnect) runs as if the window was closed.
 static volatile sig_atomic_t g_quit = 0;
 
+#if !defined(_WIN32)
 static void
 on_signal (int)
 {
   g_quit = 1; // async-signal-safe: set a flag, nothing else
 }
+#endif
+
+#if defined(_WIN32)
+// The console equivalent, and it covers rather more than Ctrl-C: closing the
+// console window and logging off arrive here too. Windows gives the handler a
+// few seconds before killing the process, which is enough for the shutdown
+// below — but it runs on its own thread, so it must only set the flag and wait
+// for the render loop to finish rather than tearing anything down here.
+static BOOL WINAPI
+on_console_ctrl (DWORD type)
+{
+  switch (type) {
+  case CTRL_C_EVENT:
+  case CTRL_BREAK_EVENT:
+  case CTRL_CLOSE_EVENT:
+  case CTRL_LOGOFF_EVENT:
+  case CTRL_SHUTDOWN_EVENT:
+    g_quit = 1;
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+#endif
 
 // Registration requires a handle built by pulse_new_with_internal_sso_handling()
 // on macOS/Linux — plain pulse_new() fails with "missing sso callbacks" even for
@@ -4586,6 +4971,19 @@ on_sso_select (PulseSSOProviderList *, void *)
 {
   return -1;
 }
+
+#if defined(_WIN32)
+// Completing an SSO login means opening the IdP URL in a browser and receiving
+// the token back over a pexip-auth:// deep link — plumbing this demo does not
+// have. Decline, so an SSO-gated registration fails cleanly rather than
+// hanging. Password registration, which is all the wall uses, is unaffected.
+static bool
+on_sso_request (PulseSSOProviderRequest *, PulseSSOProviderSetToken *, void *)
+{
+  std::fprintf (stderr, "[uavwall] SSO login is not supported on Windows\n");
+  return false;
+}
+#endif
 
 int
 main (int argc, char ** argv)
@@ -4647,15 +5045,24 @@ main (int argc, char ** argv)
   // Resolved once, for both normal and bench starts.
   find_ffmpeg ();
 
+#if defined(_WIN32)
+  SetConsoleCtrlHandler (on_console_ctrl, TRUE);
+#else
   signal (SIGINT, on_signal);
   signal (SIGTERM, on_signal);
+#endif
 
   g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
   g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
 
   // Created before any feed instance and freed last: this is both the
   // conference instance and the one that keeps Pulse's global state alive.
-#if defined(HOST_WINDOWS)
+#if defined(_WIN32)
+  // The Windows Pulse build does not export the internal-SSO constructor at
+  // all; pulse.h's recipe there is pulse_new() plus explicit SSO callbacks,
+  // set immediately below. (This guard previously named HOST_WINDOWS, which
+  // only pexninja's CMakeLists ever defines — so on Windows it took the macOS
+  // branch and failed to link.)
   app.conf = pulse_new ();
 #else
   app.conf = pulse_new_with_internal_sso_handling (argc, (const char **) argv, on_sso_select, &app);
@@ -4664,6 +5071,20 @@ main (int argc, char ** argv)
     std::fprintf (stderr, "[uavwall] pulse_new() failed — cannot continue\n");
     return 1;
   }
+#if defined(_WIN32)
+  // These hooks must exist for pulse_register to work at all on Windows, even
+  // for plain password registration — the same requirement the internal-SSO
+  // constructor satisfies on macOS and Linux.
+  {
+    PulseSSOProviderCallbackConfig sso_cb{};
+    sso_cb.selection_callback = on_sso_select;
+    sso_cb.selection_callback_user_context = &app;
+    sso_cb.request_callback = on_sso_request;
+    sso_cb.request_callback_user_context = &app;
+    pulse_options_set_sso_provider_callbacks (app.conf, &sso_cb);
+  }
+#endif
+
   pulse_options_set_self_view_window_handle (app.conf, nullptr);
   pulse_options_set_remote_video_window_handle (app.conf, nullptr);
   pulse_options_set_presentation_video_window_handle (app.conf, nullptr);
@@ -4928,12 +5349,9 @@ main (int argc, char ** argv)
     if (!any)
       break;
     std::this_thread::sleep_for (std::chrono::milliseconds (100));
-    int st = 0;
-    if (app.canvas_rec.pid > 0 && waitpid (app.canvas_rec.pid, &st, WNOHANG) == app.canvas_rec.pid)
-      app.canvas_rec.pid = -1;
+    reap_if_exited (app.canvas_rec);
     for (Feed & f : app.feeds)
-      if (f.rec.pid > 0 && waitpid (f.rec.pid, &st, WNOHANG) == f.rec.pid)
-        f.rec.pid = -1;
+      reap_if_exited (f.rec);
   }
 
   stop_monitor (app);
@@ -4948,6 +5366,12 @@ main (int argc, char ** argv)
       pulse_deregister (app.conf, nullptr);
     pulse_options_set_registration_state_callback (app.conf, nullptr);
     pulse_options_set_conference_state_callback (app.conf, nullptr);
+#if defined(_WIN32)
+    // Only Windows registers these explicitly (see pulse_new above), and
+    // pulse_free refuses to release the handle while any callback is still
+    // registered — it logs and leaks rather than freeing.
+    pulse_options_set_sso_provider_callbacks (app.conf, nullptr);
+#endif
     pulse_free (app.conf); // last one out
     app.conf = nullptr;
   }

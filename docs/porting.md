@@ -44,7 +44,8 @@ Two things worth knowing about the macOS SDK, because they surprise people:
 
 | Demo | macOS | Linux | Windows |
 | --- | --- | --- | --- |
-| [`doppler`](../demos/doppler/), [`videowall`](../demos/videowall/), [`uavwall`](../demos/uavwall/) | built | should build; see below | needs a port |
+| [`doppler`](../demos/doppler/), [`videowall`](../demos/videowall/) | built | should build; see below | needs a port |
+| [`uavwall`](../demos/uavwall/) | built | should build; see below | **built** under MSVC — see below |
 | [`pexninja`](../demos/pexninja/) | built | built | builds under MSVC via the NuGet |
 | [`windows`](../demos/windows/) | — | — | .NET WinForms, uses the managed wrapper |
 
@@ -79,12 +80,15 @@ actually falls over, rather than trusting this page.
 
 ## Windows
 
-Supported by the SDK, but a genuine port of the application code. The Pulse
-call, registration and RTSP logic is plain C API and compiles anywhere; what does
-not port is the platform plumbing, most of which is in `uavwall`'s recording and
-lifecycle code.
+**`uavwall` is now ported** — it builds under MSVC and runs. What follows is
+what the port actually involved, kept because `doppler` and `videowall` still
+need the same treatment and the shape is identical.
 
-| Area | Today | Windows equivalent |
+The Pulse call, registration and RTSP logic is plain C API and compiled
+unchanged. What did not port is the platform plumbing, all of it in the
+recording and lifecycle code:
+
+| Area | POSIX | Windows equivalent |
 | --- | --- | --- |
 | Recording subprocess | `fork` / `execv` / `pipe` / `dup2` | `CreateProcess` + `CreatePipe`, with the child's stdin redirected |
 | Stopping a recorder | write `q` to stdin, then `waitpid` | `WriteFile` to the pipe (identical semantics), then `WaitForSingleObject` |
@@ -99,27 +103,61 @@ lifecycle code.
 GLFW, Dear ImGui, OpenGL and the two bundled fonts (DM Sans, IBM Plex Mono) are
 already cross-platform and need nothing.
 
-`uavwall` guards its macOS-specific code with `#if defined(__APPLE__)` already,
-so the compiler will point at most of the above on the first attempt — the
-POSIX headers at the top of `src/main.cpp` (`unistd.h`, `sys/wait.h`,
-`sys/stat.h`, `fcntl.h`, `signal.h`) are the list of what needs replacing.
+### How it was actually done
 
-### Suggested order
+The process layer never grew a second implementation of its *callers*. Two
+choices kept the POSIX shape intact, and both are worth reusing:
 
-1. Get it compiling with recording **disabled** — stub `start_feed_recording`,
-   `start_canvas_recording` and `reap_recorder` to no-ops. That isolates the
-   Pulse and UI layers, which should need almost nothing.
-2. Replace `mkdir`/`access` with `std::filesystem` (helps every platform).
-3. Port the process layer behind a small `spawn_recorder` / `stop_recorder` /
-   `reap_recorder` interface — the three functions the rest of the code already
-   goes through, so nothing above them changes.
-4. Metrics and the alert sound last; both are cosmetic and the app is usable
-   without them.
+* **The pipe handle is wrapped in a CRT descriptor** with `_open_osfhandle()`,
+  so `Recorder::in_fd` stays an `int` and the canvas writer thread, the PCM
+  reader thread and every `close` are shared verbatim. Only three one-line
+  wrappers (`pio_read` / `pio_write` / `pio_close`) differ.
+* **The process `HANDLE` lives in the pid slot**, typedef'd as `ProcHandle`.
+  Win32 process handles are always small positive values, so the "`> 0` is
+  running, `-1` is none" convention the rest of the file relies on survives
+  untouched — no call site changed.
+
+Three things were not on the list above and cost the most time:
+
+* **`ffmpeg` has no audio output device on Windows.** `dshow` is capture-only
+  and there is no WASAPI/DirectSound muxer, so `-f audiotoolbox` has no
+  counterpart at all. **LISTEN** runs `ffplay -nodisp` instead — a second
+  runtime dependency, and one that ignores the `q`-on-stdin stop, so the
+  monitor uses the existing kill-fallback with its timer brought forward.
+* **`pulse_new` needs a different recipe.** The Windows Pulse build does not
+  export `pulse_new_with_internal_sso_handling`; it is `pulse_new()` plus
+  `pulse_options_set_sso_provider_callbacks()`, which must be present for
+  `pulse_register` to work *even for plain password registration*. `uavwall`
+  had a guard for this already — spelled `HOST_WINDOWS`, a macro only
+  `pexninja`'s CMakeLists ever defines, so on Windows it took the macOS branch
+  and failed to link.
+* **Closing a descriptor does not release a blocked reader.** The POSIX
+  `stop_air` closes the pipe so the reader thread's `read` returns; Windows
+  makes no such guarantee, so there the child is terminated *first* and the
+  thread leaves on the resulting EOF.
+
+Everything else went as predicted. GLFW, Dear ImGui, OpenGL and the two bundled
+fonts (DM Sans, IBM Plex Mono) needed nothing.
+
+### What is different at runtime
+
+* **Canvas recording encodes in software** (`libx264`); there is no
+  `h264_videotoolbox` equivalent wired up. `h264_qsv` would restore hardware
+  encode on Intel, at the cost of failing on machines without Quick Sync.
+* **LISTEN needs `ffplay`** on `PATH`, separately from `ffmpeg`. Absent, the
+  button reports it rather than failing silently — the same treatment recording
+  already gives a missing `ffmpeg`.
+* **`pulse_free` still logs a stale `pin_code_request` callback** at exit. That
+  is repo-wide (`pexclient` does the same on every platform), not specific to
+  this port.
 
 ## Rough effort
 
 * **Linux** — an afternoon, most of it testing, plus the audio stub and a
   hardware encoder for canvas recording.
-* **Windows** — a couple of days, concentrated in the process layer and the MSVC
-  toolchain. The recording feature carries essentially all of the risk; without
-  it, the port is mostly build configuration.
+* **Windows** — estimated at a couple of days; `uavwall` took rather less,
+  because `pexclient` had already proven the toolchain, the NuGet plumbing in
+  [`cmake/PulseDemo.cmake`](../cmake/PulseDemo.cmake) and the `.bat` launcher.
+  With that in place the work was the process layer and little else. `doppler`
+  and `videowall` should now be cheaper again — they have no recording layer,
+  which was where all the risk sat.

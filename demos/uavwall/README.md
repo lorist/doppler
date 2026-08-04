@@ -60,9 +60,19 @@ cmake --build build -j --target uavwall
 ./build/run-uavwall.sh
 ```
 
+On Windows, build with MSVC from a developer prompt (`vcvars64.bat`) — the Pulse
+runtime comes from the in-repo NuGet automatically:
+
+```bat
+cmake -S . -B build-win -G Ninja
+cmake --build build-win --target uavwall
+build-win\run-uavwall.bat
+```
+
 Linux should build as-is (the SDK is x86-64 only, and the incoming-call and
-feed-loss sounds are silent there); Windows needs the recording layer ported off
-POSIX. [`docs/porting.md`](../../docs/porting.md) has the detail.
+feed-loss sounds are silent there). [`docs/porting.md`](../../docs/porting.md)
+has the detail on all three, including what differs on Windows: **LISTEN needs
+`ffplay`** rather than `ffmpeg`, and canvas recording encodes in software.
 
 ## Test feeds
 
