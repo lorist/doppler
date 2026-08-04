@@ -164,8 +164,11 @@ $env:PATH = "$kit\pulse;$kit\tools;" + $env:PATH
 $env:PEX_BASE_PATH = "$kit\pulse"
 
 $children = @()
+# Keep mediamtx's output: its log is the ground truth when a device will not
+# connect -- "is publishing to path 'x'" versus nothing arriving at all.
 $mtx = Start-Process -FilePath "$kit\mediamtx\mediamtx.exe" -ArgumentList "`"$kit\mediamtx\mediamtx.yml`"" `
-    -WorkingDirectory "$kit\mediamtx" -WindowStyle Hidden -PassThru
+    -WorkingDirectory "$kit\mediamtx" -WindowStyle Hidden -PassThru `
+    -RedirectStandardOutput "$kit\mediamtx\mediamtx.log" -RedirectStandardError "$kit\mediamtx\mediamtx.err.log"
 $children += $mtx
 Start-Sleep -Seconds 2
 
