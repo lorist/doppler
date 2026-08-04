@@ -82,7 +82,7 @@ authInternalUsers:
 
 paths:
   wearable:
-    runOnDemand: ffmpeg -hide_banner -loglevel warning -rtsp_transport tcp -i rtsp://127.0.0.1:8554/live -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 30 -b:v 4M -c:a copy -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/wearable
+    runOnDemand: ffmpeg -hide_banner -loglevel warning -rtsp_transport tcp -i rtsp://127.0.0.1:8554/live/wearable -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 30 -b:v 4M -c:a copy -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/wearable
     runOnDemandRestart: yes
   all_others:
 '@ | Out-File -Encoding ascii (Join-Path $OutDir "mediamtx\mediamtx.yml")
@@ -210,12 +210,17 @@ Needs: Windows 11 x64. Nothing to install.
 To dial a conference or register: Settings inside the app (credentials are
 not shipped in the kit). Recordings land in recordings\.
 
-A phone or bodycam can push in live:
-  RTMP  rtmp://<this-machine>:1935/live/<name>   (Larix: whole path is the app)
+A phone or bodycam can push in live. The relay listens on path live/wearable,
+so point the device there -- the two common app layouts both reach it:
+  Larix (one URL field):        rtmp://<this-machine>:1935/live/wearable
+  PRISM / OBS (URL + key):      URL rtmp://<this-machine>:1935/live
+                                key wearable
 The wall pulls it back as the WEARABLE 01 feed (rtsp://127.0.0.1:8554/wearable),
 which relays through ffmpeg to fix two things at once: mediamtx's RTMP
 conversion gives both tracks the same RTP payload type, and the Windows Pulse
 decoder cannot handle High-profile H.264 (most phones send High profile).
+If the tile stays offline, mediamtx\mediamtx.log names the path the device
+actually landed on ("is publishing to path '...'") -- it must be live/wearable.
 
 If feeds show offline: another process may already own port 8554 or 1935 on
 this machine (a previous rig, another mediamtx). Stop it and relaunch.
