@@ -150,6 +150,22 @@ fonts (DM Sans, IBM Plex Mono) needed nothing.
 * **`pulse_free` still logs a stale `pin_code_request` callback** at exit. That
   is repo-wide (`pexclient` does the same on every platform), not specific to
   this port.
+* **High-profile H.264 feeds break up on Windows.** Diagnosed live against a
+  phone (Larix over RTMP → mediamtx → RTSP): the picture smeared as if the
+  feed had packet loss, while the same stream played clean in `ffplay` and the
+  same rig was clean on the Mac. Eliminated in turn: the bitstream (zero decode
+  errors over 10s), frame timing (PTS locked at 33/34ms), the jitter buffer
+  (500ms changed nothing), and a real mediamtx quirk found on the way — its
+  RTMP→RTSP conversion gives *both* tracks payload type 96 — which turned out
+  not to be the cause either. What fixed it: transcoding the feed to
+  **Constrained Baseline at the same 1080p**, changing nothing but the
+  profile. The Windows Pulse build decodes through DXVA/Media Foundation
+  hardware paths (`pexlgpl.dll` carries both); macOS uses VideoToolbox, which
+  is why the Mac never showed it. Observed on Intel UHD 770, driver
+  32.0.101.7077. Until fixed in the SDK: set the device to **Baseline
+  profile** (Larix exposes this directly), or relay through ffmpeg with
+  `-profile:v baseline`; the four Baseline test feeds and pexclient's
+  conference video are unaffected. Worth reporting to Pexip with this repro.
 
 ## Rough effort
 
