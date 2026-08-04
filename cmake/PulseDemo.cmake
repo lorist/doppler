@@ -26,9 +26,13 @@
 #
 # Search order:
 #   * headers : ${PEXIP_PREFIX}/include, then the in-repo SDK copy under
-#               sdk/linux/opt/pexip/include.
+#               sdk/linux/opt/pexip/include (sdk/windows/include on Windows).
 #   * library : ${PEXIP_PREFIX}/lib (Linux .deb install), then the in-repo
-#               macOS dylibs under sdk/macos.
+#               macOS dylibs under sdk/macos (sdk/windows/native on Windows).
+#
+# On Windows the SDK ships as a NuGet package (sdk/windows/*.nupkg). It is
+# extracted once, at configure time, into sdk/windows/include + sdk/windows/
+# native (both gitignored — the .nupkg is the artifact of record).
 #
 # Sets in the caller scope:
 #   PEXPULSE_INCLUDE_DIR, PEXPULSE_LIBRARY, PEXPULSE_LIBDIR
@@ -36,16 +40,43 @@ macro(pulse_find_runtime)
     set(PEXIP_PREFIX "/opt/pexip" CACHE PATH
         "Install prefix of the Pexip Pulse package")
 
+    if(WIN32)
+        set(_pulse_win_sdk "${CMAKE_SOURCE_DIR}/sdk/windows")
+        if(NOT EXISTS "${_pulse_win_sdk}/include/pexpulse/pulse.h"
+                OR NOT EXISTS "${_pulse_win_sdk}/native/pexpulse.lib")
+            file(GLOB _pulse_nupkg "${_pulse_win_sdk}/Pexip.Pulse.*.nupkg")
+            if(NOT _pulse_nupkg)
+                message(FATAL_ERROR "No Pexip.Pulse .nupkg found in ${_pulse_win_sdk}")
+            endif()
+            list(GET _pulse_nupkg 0 _pulse_nupkg)
+            message(STATUS "Extracting Windows Pulse SDK from ${_pulse_nupkg}")
+            # file(ARCHIVE_EXTRACT) needs CMake >= 3.18 — a given on Windows,
+            # where there is no distro package manager pinning an old one.
+            file(ARCHIVE_EXTRACT
+                INPUT "${_pulse_nupkg}"
+                DESTINATION "${_pulse_win_sdk}/_nupkg"
+                PATTERNS "build/native/include/*" "runtimes/win-x64/native/*")
+            file(MAKE_DIRECTORY "${_pulse_win_sdk}/include/pexpulse")
+            file(GLOB _pulse_hdrs "${_pulse_win_sdk}/_nupkg/build/native/include/*.h")
+            file(COPY ${_pulse_hdrs} DESTINATION "${_pulse_win_sdk}/include/pexpulse")
+            file(COPY "${_pulse_win_sdk}/_nupkg/runtimes/win-x64/native/"
+                 DESTINATION "${_pulse_win_sdk}/native")
+            file(REMOVE_RECURSE "${_pulse_win_sdk}/_nupkg")
+        endif()
+    endif()
+
     find_path(PEXPULSE_INCLUDE_DIR
         NAMES pexpulse/pulse.h
         HINTS "${PEXIP_PREFIX}/include"
               "${CMAKE_SOURCE_DIR}/sdk/linux/opt/pexip/include"
+              "${CMAKE_SOURCE_DIR}/sdk/windows/include"
         REQUIRED)
 
     find_library(PEXPULSE_LIBRARY
         NAMES pexpulse
         HINTS "${PEXIP_PREFIX}/lib"
               "${CMAKE_SOURCE_DIR}/sdk/macos"
+              "${CMAKE_SOURCE_DIR}/sdk/windows/native"
         REQUIRED)
 
     message(STATUS "Found pexpulse headers: ${PEXPULSE_INCLUDE_DIR}")
@@ -60,14 +91,28 @@ macro(pulse_find_runtime)
     # The Pulse install prefix (the parent of lib/, e.g. /opt/pexip). The runtime
     # needs this exported as PEX_BASE_PATH to locate its models, gstreamer plugins
     # and friends; without it Pulse aborts at startup. The launcher scripts below
-    # set it for the user.
-    get_filename_component(PEXPULSE_PREFIX "${PEXPULSE_LIBDIR}" DIRECTORY)
+    # set it for the user. On Windows the NuGet layout keeps share/models next to
+    # the DLLs, so the prefix IS the lib dir.
+    if(WIN32)
+        set(PEXPULSE_PREFIX "${PEXPULSE_LIBDIR}")
+    else()
+        get_filename_component(PEXPULSE_PREFIX "${PEXPULSE_LIBDIR}" DIRECTORY)
+    endif()
 
     if(NOT TARGET pexip::pulse)
         add_library(pexip::pulse SHARED IMPORTED)
-        set_target_properties(pexip::pulse PROPERTIES
-            IMPORTED_LOCATION "${PEXPULSE_LIBRARY}"
-            INTERFACE_INCLUDE_DIRECTORIES "${PEXPULSE_INCLUDE_DIR}")
+        if(WIN32)
+            # On Windows the "library" find_library returns is the import lib;
+            # the DLL sits next to it.
+            set_target_properties(pexip::pulse PROPERTIES
+                IMPORTED_LOCATION "${PEXPULSE_LIBDIR}/pexpulse.dll"
+                IMPORTED_IMPLIB "${PEXPULSE_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${PEXPULSE_INCLUDE_DIR}")
+        else()
+            set_target_properties(pexip::pulse PROPERTIES
+                IMPORTED_LOCATION "${PEXPULSE_LIBRARY}"
+                INTERFACE_INCLUDE_DIRECTORIES "${PEXPULSE_INCLUDE_DIR}")
+        endif()
     endif()
 endmacro()
 
@@ -114,10 +159,14 @@ endmacro()
 #
 # Bake the Pulse library directory into the target's RPATH so the direct
 # dependency libpexpulse.so resolves at run time without LD_LIBRARY_PATH.
+# Windows has no RPATH — DLL resolution goes through PATH, which the .bat
+# launcher from pulse_demo_launcher() sets — so this is a no-op there.
 function(pulse_demo_rpath target)
-    set_target_properties(${target} PROPERTIES
-        BUILD_RPATH   "${PEXPULSE_LIBDIR}"
-        INSTALL_RPATH "${PEXPULSE_LIBDIR}")
+    if(NOT WIN32)
+        set_target_properties(${target} PROPERTIES
+            BUILD_RPATH   "${PEXPULSE_LIBDIR}"
+            INSTALL_RPATH "${PEXPULSE_LIBDIR}")
+    endif()
 endfunction()
 
 # pulse_demo_launcher(<target> <script-name>)
@@ -127,7 +176,27 @@ endfunction()
 # private siblings — libpexlgpl, libimf, libonnxruntime.so.1, ... — are found),
 # exports PEX_BASE_PATH (the Pulse runtime aborts at startup without it), and
 # then execs the demo binary. Lets users just run ./build/<script-name>.
+#
+# On Windows the same job is done by a .bat file (the DLL search path is PATH
+# there); pass the .sh name as usual and the extension is swapped for you.
 function(pulse_demo_launcher target script)
+    if(WIN32)
+        string(REGEX REPLACE "\\.sh$" ".bat" script "${script}")
+        file(TO_NATIVE_PATH "${PEXPULSE_LIBDIR}" _pulse_libdir_native)
+        file(TO_NATIVE_PATH "${PEXPULSE_PREFIX}" _pulse_prefix_native)
+        file(GENERATE
+            OUTPUT  "${CMAKE_BINARY_DIR}/${script}"
+            CONTENT "@echo off
+rem Auto-generated by CMake -- puts Pulse's private sibling DLLs (pexlgpl,
+rem libmmd, svml_dispmd, tbb12, ...) on the DLL search path, points
+rem PEX_BASE_PATH at the Pulse runtime dir (required at startup), then runs
+rem the demo binary.
+set \"PATH=${_pulse_libdir_native};%PATH%\"
+if not defined PEX_BASE_PATH set \"PEX_BASE_PATH=${_pulse_prefix_native}\"
+\"$<SHELL_PATH:$<TARGET_FILE:${target}>>\" %*
+")
+        return()
+    endif()
     file(GENERATE
         OUTPUT  "${CMAKE_BINARY_DIR}/${script}"
         CONTENT "#!/bin/sh

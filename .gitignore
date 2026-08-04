@@ -1,6 +1,11 @@
 build/
 *.o
 *.a
+
+# Extracted from the Windows NuGet package at CMake configure time — the
+# .nupkg itself is the artifact of record.
+sdk/windows/include/
+sdk/windows/native/
 .cache/
 compile_commands.json
 demos/pexninja/msvc/.vs

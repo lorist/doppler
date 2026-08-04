@@ -1,4 +1,4 @@
-# pexclient — a macOS Pexip Infinity client
+# pexclient — a Pexip Infinity client (macOS & Windows)
 
 `pexclient` is a complete, self-contained video client for Pexip Infinity,
 built on the Pulse SDK and styled after the "Dark Frosted" design in
@@ -27,10 +27,12 @@ What it does:
   layout, dial-out, disconnect-all).
 * **Virtual reception & DTMF** — extension entry when Infinity routes you via
   an IVR, plus a keypad for sending DTMF into gateway calls.
-* **Incoming-call alerting** — ring tone, Dock bounce and window raise.
+* **Incoming-call alerting** — ring tone, Dock bounce / taskbar flash and
+  window raise.
 * **SSO** — IdP sign-in for both conference joins and device registration,
   with a provider chooser. Requires the `.app` bundle — see
-  [Single sign-on](#single-sign-on-sso).
+  [Single sign-on](#single-sign-on-sso). (macOS only for now: the Windows
+  build has no `pexip-auth://` scheme registration yet.)
 
 ## Build & run (macOS, Apple Silicon)
 
@@ -61,6 +63,32 @@ First build fetches Dear ImGui from GitHub (≈5 MB). macOS will prompt for
 camera/microphone permission on first call, and screen-sharing needs Screen
 Recording permission for the app you launch from (Terminal, VS Code, …) in
 System Settings → Privacy & Security.
+
+## Build & run (Windows, x64)
+
+Prerequisites: Visual Studio 2022 (or the Build Tools) with the C++ workload,
+and CMake ≥ 3.18. Everything else is self-contained — the Pulse SDK ships in
+this repo as a NuGet package under [`../../sdk/windows/`](../../sdk/windows/)
+(extracted automatically at configure time), and GLFW + Dear ImGui are
+fetched from GitHub on the first build.
+
+From a "x64 Native Tools" prompt (or any shell where `cl` resolves):
+
+```bat
+cmake -S . -B build                          &rem from the repo root
+cmake --build build --config Release --target pexclient
+```
+
+Then run it via the generated launcher (it puts the Pulse DLLs on `PATH` and
+sets `PEX_BASE_PATH` — don't run the bare exe):
+
+```bat
+build\run-pexclient.bat
+```
+
+Windows asks for camera/microphone permission on first use (Settings →
+Privacy & security). Display and window sharing work out of the box — no
+extra permission needed.
 
 ### Building the .app bundle
 

@@ -40,7 +40,15 @@
 #include <CoreGraphics/CoreGraphics.h>
 #endif
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <dwmapi.h>   // DWMWA_CLOAKED — filter ghost UWP windows out of the share picker
+#include <mmsystem.h> // PlaySound — incoming-call ring
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -447,7 +455,11 @@ now_hhmm ()
 {
   std::time_t t = std::time (nullptr);
   std::tm tm_buf{};
+#if defined(_WIN32)
+  localtime_s (&tm_buf, &t); // MSVC spells the reentrant variant differently (and swaps the args)
+#else
   localtime_r (&t, &tm_buf);
+#endif
   char buf[8];
   std::strftime (buf, sizeof (buf), "%H:%M", &tm_buf);
   return buf;
@@ -570,6 +582,14 @@ play_ring ()
     AudioServicesPlaySystemSound (s);
   else
     AudioServicesPlayAlertSound (kSystemSoundID_UserPreferredAlert);
+}
+#elif defined(_WIN32)
+static void
+play_ring ()
+{
+  // Same fire-and-forget model as the macOS path: one short system chime per
+  // call, retriggered by the ring timer. Async so the UI thread never blocks.
+  PlaySoundW (L"SystemExclamation", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
 }
 #else
 static void
@@ -917,12 +937,94 @@ enumerate_share_sources ()
   return out;
 }
 
+#elif defined(_WIN32)
+
+static std::string
+wide_to_utf8 (const wchar_t * w)
+{
+  if (w == nullptr || w[0] == L'\0')
+    return "";
+  int n = WideCharToMultiByte (CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+  if (n <= 1)
+    return "";
+  std::string out ((size_t) n - 1, '\0');
+  WideCharToMultiByte (CP_UTF8, 0, w, -1, &out[0], n, nullptr, nullptr);
+  return out;
+}
+
+// Displays first, then "normal" application windows — the same filtering
+// rules as the macOS picker (visible, titled, sensibly sized, not ourselves),
+// translated to Win32: EnumDisplayMonitors for displays, EnumWindows for
+// windows, with tool windows and DWM-cloaked UWP ghosts skipped.
+static BOOL CALLBACK
+share_monitor_proc (HMONITOR monitor, HDC, LPRECT, LPARAM lparam)
+{
+  auto * out = reinterpret_cast<std::vector<App::ShareSource> *> (lparam);
+  MONITORINFO info{};
+  info.cbSize = sizeof (info);
+  if (GetMonitorInfo (monitor, &info)) {
+    long w = info.rcMonitor.right - info.rcMonitor.left;
+    long h = info.rcMonitor.bottom - info.rcMonitor.top;
+    char buf[128];
+    snprintf (buf, sizeof (buf), "%sDisplay %zu  (%ldx%ld)", (info.dwFlags & MONITORINFOF_PRIMARY) ? "Main " : "",
+              out->size () + 1, w, h);
+    out->push_back ({(uint64_t) (uintptr_t) monitor, buf, true});
+  }
+  return TRUE;
+}
+
+static BOOL CALLBACK
+share_window_proc (HWND hwnd, LPARAM lparam)
+{
+  auto * out = reinterpret_cast<std::vector<App::ShareSource> *> (lparam);
+
+  if (!IsWindowVisible (hwnd) || IsIconic (hwnd))
+    return TRUE;
+  if (GetWindowLongW (hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)
+    return TRUE;
+
+  // UWP apps leave invisible "cloaked" shell windows behind; DWM knows.
+  BOOL cloaked = FALSE;
+  if (SUCCEEDED (DwmGetWindowAttribute (hwnd, DWMWA_CLOAKED, &cloaked, sizeof (cloaked))) && cloaked)
+    return TRUE;
+
+  // Not ourselves (the macOS picker filters on owner name; process id is the
+  // more robust equivalent here).
+  DWORD pid = 0;
+  GetWindowThreadProcessId (hwnd, &pid);
+  if (pid == GetCurrentProcessId ())
+    return TRUE;
+
+  wchar_t wtitle[256];
+  if (GetWindowTextW (hwnd, wtitle, 256) <= 0)
+    return TRUE;
+  std::string title = wide_to_utf8 (wtitle);
+  if (title.empty ())
+    return TRUE;
+
+  RECT r;
+  if (GetWindowRect (hwnd, &r) && (r.right - r.left < 50 || r.bottom - r.top < 50))
+    return TRUE;
+
+  out->push_back ({(uint64_t) (uintptr_t) hwnd, title, false});
+  return TRUE;
+}
+
+static std::vector<App::ShareSource>
+enumerate_share_sources ()
+{
+  std::vector<App::ShareSource> out;
+  EnumDisplayMonitors (nullptr, nullptr, share_monitor_proc, (LPARAM) &out);
+  EnumWindows (share_window_proc, (LPARAM) &out);
+  return out;
+}
+
 #else
 
 static std::vector<App::ShareSource>
 enumerate_share_sources ()
 {
-  return {}; // window/display capture picker is macOS-only in this demo
+  return {}; // window/display capture picker is macOS/Windows-only in this demo
 }
 
 #endif
@@ -3408,7 +3510,7 @@ on_sso_select (PulseSSOProviderList * list, void * user_context)
 int
 main (int argc, char ** argv)
 {
-#ifdef PEXCLIENT_DEFAULT_CWD
+#if defined(PEXCLIENT_DEFAULT_CWD) && defined(__APPLE__)
   // When launched from the .app bundle, LaunchServices sets the working
   // directory to Contents/Resources *inside the bundle* — where a written
   // config would be destroyed by the next make-bundle.sh run (it rebuilds the
@@ -3464,7 +3566,15 @@ main (int argc, char ** argv)
   // --- Pulse -------------------------------------------------------------
   // The logger must be installed before the first pulse_new* call.
   pulse_global_logger_callback (on_pulse_log, nullptr);
+#if defined(_WIN32)
+  // The Windows Pulse build does not export the internal-SSO constructor (no
+  // pexip-auth:// deep-link plumbing there yet), so SSO joins/registration
+  // are unavailable on this platform — everything else works identically.
+  (void) &on_sso_select;
+  app.pulse = pulse_new ();
+#else
   app.pulse = pulse_new_with_internal_sso_handling (argc, (const char **) argv, on_sso_select, &app);
+#endif
   if (!app.pulse) {
     std::fprintf (stderr, "pulse_new() returned NULL\n");
     return 1;
