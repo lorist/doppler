@@ -37,3 +37,6 @@ UAV_footage/
 # somewhere to write; the captures themselves never are.
 recordings/*
 !recordings/.gitkeep
+*.mp4
+*.crt
+*.key

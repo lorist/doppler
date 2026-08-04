@@ -5106,7 +5106,25 @@ main (int argc, char ** argv)
   float xscale = 1.0f, yscale = 1.0f;
   glfwGetWindowContentScale (window, &xscale, &yscale);
   theme::scale = app.cfg.ui_scale; // must precede font sizing
-  app.fonts = theme::LoadFonts (io, UAVWALL_ASSET_DIR "/fonts", xscale);
+  // The asset dir is baked in as an absolute source-tree path, which is right
+  // for a dev build but wrong for a copied/packaged binary. Fall back to an
+  // assets/ directory beside the executable, which is how the demo kit ships.
+  std::string asset_dir = UAVWALL_ASSET_DIR;
+#if defined(_WIN32)
+  {
+    std::error_code ec;
+    if (!std::filesystem::is_directory (asset_dir + "/fonts", ec)) {
+      char exe[MAX_PATH];
+      DWORD n = GetModuleFileNameA (nullptr, exe, MAX_PATH);
+      if (n > 0 && n < MAX_PATH) {
+        std::string beside = std::filesystem::path (exe).parent_path ().string () + "\\assets";
+        if (std::filesystem::is_directory (beside + "/fonts", ec))
+          asset_dir = beside;
+      }
+    }
+  }
+#endif
+  app.fonts = theme::LoadFonts (io, (asset_dir + "/fonts").c_str (), xscale);
   theme::Apply ();
 
   ImGui_ImplGlfw_InitForOpenGL (window, true);
