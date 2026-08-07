@@ -40,6 +40,8 @@
 #include <pexpulse/pulse_registrations_event.h>
 #include <pexpulse/pulse_media_stats.h>
 #include <pexpulse/pulse_file_session.h>
+#include <pexpulse/pulse_video_mix_input.h>
+#include <pexpulse/pulse_video_mix_session.h>
 #include <pexpulse/pulse_rtsp_session.h>
 
 #if defined(__APPLE__)
@@ -372,6 +374,7 @@ struct ConnectJob
   PulseRtspSessionID session = 0;
   bool output_open = false;
   bool is_file = false; // a local clip rather than a stream
+  PulseVideoMixInputID mix_input = 0; // non-zero when the mixer path was used
   std::string error;
 
   std::atomic<bool> done{false};
@@ -388,6 +391,7 @@ struct Feed
   bool connected = false;      // RTSP session established
   bool output_open = false;    // data-session output opened (see stop_feed)
   bool is_file = false;        // source is a local clip, not a stream
+  PulseVideoMixInputID mix_input = 0;
   std::shared_ptr<ConnectJob> connecting; // in-flight async connect, or null
   std::string error;
 
@@ -886,19 +890,62 @@ connect_job_run (std::shared_ptr<ConnectJob> job)
   pulse_options_set_application_user_agent_string (job->pulse, "uavwall/0.1");
 
   if (source_is_file (job->url)) {
-    // Pulse decodes the file itself and binds it to MAIN at connect — no
-    // separate bind step, and no ffmpeg or RTSP server in the picture. Looping
-    // makes a short clip behave like a continuous downlink.
-    PulseError ferr = pulse_file_input_session_connect (job->pulse, PULSE_MEDIA_FILE_FORMAT_MP4, job->url.c_str (),
-                                                        PULSE_MEDIA_CONTENT_MAIN);
-    if (ferr != PULSE_SUCCESS) {
-      job->error = std::string ("open: ") + pulse_strerror (ferr);
-      pulse_free (job->pulse);
-      job->pulse = nullptr;
-      job->done = true;
-      return;
+    // Two ways into Pulse for a local clip, and the difference is large.
+    // Measured on one 1080p clip, 1-up, with --bench:
+    //
+    //   file session, High profile        8.6 fps
+    //   video mixer,  High profile       30.0 fps
+    //   file session, Constrained Base.  25.0 fps
+    //
+    // The mixer is a different decode pipeline and handles High profile at
+    // full rate, which matters because every phone, camera and editor produces
+    // High — an operator browsing to their own footage would otherwise see
+    // 8fps and conclude the app was broken. So the mixer is the default;
+    // UAVWALL_FILE_VIA_SESSION forces the older path if a clip ever misbehaves.
+    const bool via_mix = getenv ("UAVWALL_FILE_VIA_SESSION") == nullptr;
+    if (via_mix) {
+      PulseVideoMixInputID in_id = PULSE_VIDEO_MIX_INPUT_ID_NONE;
+      PulseError merr = pulse_video_mix_input_from_file_with_loop (job->pulse, job->url.c_str (), true, &in_id);
+      if (merr != PULSE_SUCCESS) {
+        job->error = std::string ("mix input: ") + pulse_strerror (merr);
+        pulse_free (job->pulse);
+        job->pulse = nullptr;
+        job->done = true;
+        return;
+      }
+      PulseVideoMixInput slot{};
+      slot.input_id = in_id;
+      slot.layer = 0;
+      slot.width_ratio = 0.0; // 0 = fill the layer
+      slot.height_ratio = 0.0;
+      slot.x_centrepoint = 0.5;
+      slot.y_centrepoint = 0.5;
+      slot.videoproc_mask = PULSE_VIDEO_PROCESS_TYPE_NONE;
+      PulseVideoMixConfig mcfg{};
+      mcfg.num_inputs = 1;
+      mcfg.inputs = &slot;
+      merr = pulse_video_mix_connect (job->pulse, &mcfg, PULSE_MEDIA_CONTENT_MAIN);
+      if (merr != PULSE_SUCCESS) {
+        job->error = std::string ("mix connect: ") + pulse_strerror (merr);
+        pulse_video_mix_input_release (job->pulse, in_id);
+        pulse_free (job->pulse);
+        job->pulse = nullptr;
+        job->done = true;
+        return;
+      }
+      job->mix_input = in_id;
+    } else {
+      PulseError ferr = pulse_file_input_session_connect (job->pulse, PULSE_MEDIA_FILE_FORMAT_MP4, job->url.c_str (),
+                                                          PULSE_MEDIA_CONTENT_MAIN);
+      if (ferr != PULSE_SUCCESS) {
+        job->error = std::string ("open: ") + pulse_strerror (ferr);
+        pulse_free (job->pulse);
+        job->pulse = nullptr;
+        job->done = true;
+        return;
+      }
+      pulse_file_input_session_loop (job->pulse, PULSE_MEDIA_CONTENT_MAIN, true);
     }
-    pulse_file_input_session_loop (job->pulse, PULSE_MEDIA_CONTENT_MAIN, true);
     job->is_file = true;
   } else {
     PulseRtspInputConfig cfg{};
@@ -1012,7 +1059,13 @@ stop_feed (Feed & f)
     f.output_open = false;
   }
   if (f.is_file) {
-    pulse_file_input_session_disconnect (f.pulse, PULSE_MEDIA_CONTENT_MAIN);
+    if (f.mix_input != 0) {
+      pulse_video_mix_disconnect (f.pulse, PULSE_MEDIA_CONTENT_MAIN);
+      pulse_video_mix_input_release (f.pulse, f.mix_input);
+      f.mix_input = 0;
+    } else {
+      pulse_file_input_session_disconnect (f.pulse, PULSE_MEDIA_CONTENT_MAIN);
+    }
     f.is_file = false;
   } else if (f.session != 0) {
     pulse_rtsp_session_disconnect_input (f.pulse, f.session);
@@ -1053,6 +1106,7 @@ poll_connect_jobs (App & app)
     f.session = job->session;
     f.output_open = job->output_open;
     f.is_file = job->is_file;
+    f.mix_input = job->mix_input;
 
     glGenTextures (1, &f.texture);
     glBindTexture (GL_TEXTURE_2D, f.texture);
