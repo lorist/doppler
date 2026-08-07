@@ -188,6 +188,64 @@ pio_close (int fd)
 }
 #endif
 
+// ----------------------------------------------------------------------------
+//  Where things live
+//
+//  Run from a build tree, everything is relative to the working directory,
+//  which is what every script and every earlier session expects. Run from a
+//  .app, the working directory is "/" — so the config would never persist and
+//  recordings would have nowhere to go. Inside a bundle the app therefore uses
+//  the standard macOS locations instead.
+// ----------------------------------------------------------------------------
+
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+// Directory containing the running executable, empty if it cannot be found.
+static std::string
+exe_dir ()
+{
+#if defined(__APPLE__)
+  char buf[4096];
+  uint32_t sz = sizeof (buf);
+  if (_NSGetExecutablePath (buf, &sz) != 0)
+    return "";
+  return std::filesystem::path (buf).parent_path ().string ();
+#elif defined(_WIN32)
+  char exe[MAX_PATH];
+  DWORD n = GetModuleFileNameA (nullptr, exe, MAX_PATH);
+  return (n > 0 && n < MAX_PATH) ? std::filesystem::path (exe).parent_path ().string () : std::string ();
+#else
+  return "";
+#endif
+}
+
+// True when the executable sits in Foo.app/Contents/MacOS.
+static bool
+in_app_bundle ()
+{
+  const std::string d = exe_dir ();
+  return d.size () > 15 && d.compare (d.size () - 15, 15, "/Contents/MacOS") == 0;
+}
+
+static std::string
+home_dir ()
+{
+  const char * h = getenv ("HOME");
+  return h ? h : ".";
+}
+
+// Contents/Resources/assets when running from a .app, empty otherwise.
+static std::string
+bundle_asset_dir ()
+{
+  if (!in_app_bundle ())
+    return "";
+  const std::string d = exe_dir (); // .../Contents/MacOS
+  return d.substr (0, d.size () - 5) + "Resources/assets";
+}
+
 // Everything an operator might reasonably want to change, with defaults chosen
 // so a fresh checkout demonstrates itself against scripts/uav-streams.sh.
 // Persisted to uavwall.conf next to the working directory.
@@ -228,6 +286,7 @@ struct Config
 
   // Where recordings are written. Relative paths resolve against the working
   // directory, same as uavwall.conf itself.
+  // Overwritten at startup for a bundled app; see default_record_dir().
   std::string record_dir = "recordings";
 
   // Holds feed audio back when it arrives *ahead* of the canvas. Default 0:
@@ -628,7 +687,29 @@ get_status (App & app)
 //  Feed config — "name|rtsp://host/path" per line, # comments allowed
 // ----------------------------------------------------------------------------
 
-static const char * kConfigFile = "uavwall.conf";
+// Where the config lives. From a build tree that is the working directory,
+// which every script and every set of instructions assumes. From a .app the
+// working directory is "/", so the config would be unwritable and would never
+// persist — there it goes to the standard per-user location instead, created
+// on demand.
+static std::string
+config_path ()
+{
+  static std::string cached;
+  if (!cached.empty ())
+    return cached;
+  if (in_app_bundle ()) {
+    const std::string dir = home_dir () + "/Library/Application Support/UAV Wall";
+    std::error_code ec;
+    std::filesystem::create_directories (dir, ec);
+    cached = dir + "/uavwall.conf";
+  } else {
+    cached = "uavwall.conf";
+  }
+  return cached;
+}
+
+#define kConfigFile (config_path ().c_str ())
 static const char * kLegacyFeedsFile = "uavwall-feeds.txt";
 
 static std::string
@@ -5382,7 +5463,12 @@ main (int argc, char ** argv)
       app.feeds.push_back (std::move (f));
     }
   } else {
-    load_config (app);
+    // A bundled app has no useful working directory, so point recordings at the
+  // user's Movies folder before the config is read — an explicit record_dir in
+  // the file still wins.
+  if (in_app_bundle ())
+    app.cfg.record_dir = home_dir () + "/Movies/UAV Wall";
+  load_config (app);
   }
 
   // Resolved once, for both normal and bench starts.
@@ -5453,20 +5539,21 @@ main (int argc, char ** argv)
   // for a dev build but wrong for a copied/packaged binary. Fall back to an
   // assets/ directory beside the executable, which is how the demo kit ships.
   std::string asset_dir = UAVWALL_ASSET_DIR;
-#if defined(_WIN32)
   {
     std::error_code ec;
     if (!std::filesystem::is_directory (asset_dir + "/fonts", ec)) {
-      char exe[MAX_PATH];
-      DWORD n = GetModuleFileNameA (nullptr, exe, MAX_PATH);
-      if (n > 0 && n < MAX_PATH) {
-        std::string beside = std::filesystem::path (exe).parent_path ().string () + "\\assets";
+      // Inside a .app the fonts live in Contents/Resources/assets; beside a
+      // copied binary they sit in assets/, which is how the Windows kit ships.
+      const std::string bundled = bundle_asset_dir ();
+      if (!bundled.empty () && std::filesystem::is_directory (bundled + "/fonts", ec))
+        asset_dir = bundled;
+      else {
+        const std::string beside = exe_dir () + "/assets";
         if (std::filesystem::is_directory (beside + "/fonts", ec))
           asset_dir = beside;
       }
     }
   }
-#endif
   app.fonts = theme::LoadFonts (io, (asset_dir + "/fonts").c_str (), xscale);
   theme::Apply ();
 
