@@ -39,6 +39,7 @@
 #include <pexpulse/pulse_registrations.h>
 #include <pexpulse/pulse_registrations_event.h>
 #include <pexpulse/pulse_media_stats.h>
+#include <pexpulse/pulse_file_session.h>
 #include <pexpulse/pulse_rtsp_session.h>
 
 #if defined(__APPLE__)
@@ -370,6 +371,7 @@ struct ConnectJob
   Pulse * pulse = nullptr; // non-null on success once done
   PulseRtspSessionID session = 0;
   bool output_open = false;
+  bool is_file = false; // a local clip rather than a stream
   std::string error;
 
   std::atomic<bool> done{false};
@@ -385,6 +387,7 @@ struct Feed
   PulseRtspSessionID session = 0;
   bool connected = false;      // RTSP session established
   bool output_open = false;    // data-session output opened (see stop_feed)
+  bool is_file = false;        // source is a local clip, not a stream
   std::shared_ptr<ConnectJob> connecting; // in-flight async connect, or null
   std::string error;
 
@@ -852,6 +855,15 @@ static int g_cfg_rtsp_latency_ms = 200;
 // The worker half of start_feed: every Pulse call for one feed's connect, on
 // its own thread. No GL in here — the texture is created at adoption, on the
 // GL thread. On failure the job frees what it made and carries only the error.
+// A feed source is a local file unless it looks like a URL. Nothing in the
+// config format changes: feed=NAME|rtsp://... stays a stream, feed=NAME|/path
+// becomes a file.
+static bool
+source_is_file (const std::string & s)
+{
+  return s.find ("://") == std::string::npos;
+}
+
 static void
 connect_job_run (std::shared_ptr<ConnectJob> job)
 {
@@ -873,31 +885,48 @@ connect_job_run (std::shared_ptr<ConnectJob> job)
   pulse_options_set_presentation_video_window_handle (job->pulse, nullptr);
   pulse_options_set_application_user_agent_string (job->pulse, "uavwall/0.1");
 
-  PulseRtspInputConfig cfg{};
-  cfg.location = job->url.c_str ();
-  cfg.transport = job->tcp ? PULSE_RTSP_TRANSPORT_TCP : PULSE_RTSP_TRANSPORT_UDP;
-  cfg.latency_ms = (uint32_t) job->latency_ms;
+  if (source_is_file (job->url)) {
+    // Pulse decodes the file itself and binds it to MAIN at connect — no
+    // separate bind step, and no ffmpeg or RTSP server in the picture. Looping
+    // makes a short clip behave like a continuous downlink.
+    PulseError ferr = pulse_file_input_session_connect (job->pulse, PULSE_MEDIA_FILE_FORMAT_MP4, job->url.c_str (),
+                                                        PULSE_MEDIA_CONTENT_MAIN);
+    if (ferr != PULSE_SUCCESS) {
+      job->error = std::string ("open: ") + pulse_strerror (ferr);
+      pulse_free (job->pulse);
+      job->pulse = nullptr;
+      job->done = true;
+      return;
+    }
+    pulse_file_input_session_loop (job->pulse, PULSE_MEDIA_CONTENT_MAIN, true);
+    job->is_file = true;
+  } else {
+    PulseRtspInputConfig cfg{};
+    cfg.location = job->url.c_str ();
+    cfg.transport = job->tcp ? PULSE_RTSP_TRANSPORT_TCP : PULSE_RTSP_TRANSPORT_UDP;
+    cfg.latency_ms = (uint32_t) job->latency_ms;
 
-  PulseRtspSessionID session = 0;
-  PulseError err = pulse_rtsp_session_connect_input (job->pulse, &cfg, &session);
-  if (err != PULSE_SUCCESS) {
-    job->error = std::string ("connect: ") + pulse_strerror (err);
-    pulse_free (job->pulse);
-    job->pulse = nullptr;
-    job->done = true;
-    return;
-  }
-  job->session = session;
+    PulseRtspSessionID session = 0;
+    PulseError err = pulse_rtsp_session_connect_input (job->pulse, &cfg, &session);
+    if (err != PULSE_SUCCESS) {
+      job->error = std::string ("connect: ") + pulse_strerror (err);
+      pulse_free (job->pulse);
+      job->pulse = nullptr;
+      job->done = true;
+      return;
+    }
+    job->session = session;
 
-  err = pulse_rtsp_session_bind_to_content (job->pulse, session, PULSE_MEDIA_CONTENT_MAIN);
-  if (err != PULSE_SUCCESS) {
-    job->error = std::string ("bind: ") + pulse_strerror (err);
-    pulse_rtsp_session_disconnect_input (job->pulse, session);
-    pulse_free (job->pulse);
-    job->pulse = nullptr;
-    job->session = 0;
-    job->done = true;
-    return;
+    err = pulse_rtsp_session_bind_to_content (job->pulse, session, PULSE_MEDIA_CONTENT_MAIN);
+    if (err != PULSE_SUCCESS) {
+      job->error = std::string ("bind: ") + pulse_strerror (err);
+      pulse_rtsp_session_disconnect_input (job->pulse, session);
+      pulse_free (job->pulse);
+      job->pulse = nullptr;
+      job->session = 0;
+      job->done = true;
+      return;
+    }
   }
 
   PulseDataSessionConfig * dcfg = make_video_output_config ();
@@ -982,7 +1011,10 @@ stop_feed (Feed & f)
     pulse_data_session_disconnect (f.pulse, PULSE_MEDIA_VIDEO, PULSE_MEDIA_OUTPUT, PULSE_MEDIA_CONTENT_SELFVIEW);
     f.output_open = false;
   }
-  if (f.session != 0) {
+  if (f.is_file) {
+    pulse_file_input_session_disconnect (f.pulse, PULSE_MEDIA_CONTENT_MAIN);
+    f.is_file = false;
+  } else if (f.session != 0) {
     pulse_rtsp_session_disconnect_input (f.pulse, f.session);
     f.session = 0;
   }
@@ -1020,6 +1052,7 @@ poll_connect_jobs (App & app)
     f.pulse = job->pulse;
     f.session = job->session;
     f.output_open = job->output_open;
+    f.is_file = job->is_file;
 
     glGenTextures (1, &f.texture);
     glBindTexture (GL_TEXTURE_2D, f.texture);
