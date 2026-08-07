@@ -83,6 +83,8 @@
 #include <string>
 #include <vector>
 
+#include <ImGuiFileBrowser.h>
+
 #include "Theme.h"
 
 #ifndef UAVWALL_ASSET_DIR
@@ -3391,6 +3393,12 @@ ui_feed_rail (App & app, float w, float h)
 //  Settings — a real window with a left nav, not one long scrolling form
 // ----------------------------------------------------------------------------
 
+// The file picker for "+ ADD FILE". One instance, driven every frame while it
+// is open; `g_browse_open` is what asks for it, since the dialog has to be
+// opened from inside the same ImGui frame that draws it.
+static imgui_addons::ImGuiFileBrowser g_browser;
+static bool g_browse_open = false;
+
 // A card the operator picks between, rather than a combo they have to open.
 // The cost line is what makes the choice informed.
 static bool
@@ -3801,7 +3809,7 @@ ui_settings (App & app)
   }
 
   case 3: { // ---- Feeds ---------------------------------------------------
-    heading ("FEEDS", "The RTSP sources this wall can place on the canvas.");
+    heading ("FEEDS", "RTSP streams and local clips this wall can place on the canvas.");
     ImGui::BeginDisabled (live);
     row ("Transport");
     {
@@ -3920,6 +3928,12 @@ ui_settings (App & app)
         nf.url = "rtsp://";
         app.feeds.push_back (std::move (nf));
       }
+
+      // A local clip is just a feed whose source is a path. Pulse decodes it
+      // through the video mixer, so no server and no ffmpeg are involved.
+      ImGui::SetCursorScreenPos (ImVec2 (a0.x + aw + du (8.0f), a0.y));
+      if (deck_button (app, "addfile", "+ ADD FILE", ImVec2 (du (93.0f), ah), theme::AccentPrimary, Btn::Tinted))
+        g_browse_open = true;
     }
     break;
   }
@@ -4040,6 +4054,29 @@ ui_settings (App & app)
   ImGui::End ();
   ImGui::PopStyleVar (3);
   ImGui::PopStyleColor (2);
+
+  // Outside the Settings window on purpose: the picker is a top-level popup,
+  // and opening it inside a child would clip it to the panel.
+  if (g_browse_open) {
+    ImGui::OpenPopup ("Choose a video file");
+    g_browse_open = false;
+  }
+  if (g_browser.showFileDialog ("Choose a video file", imgui_addons::ImGuiFileBrowser::DialogMode::OPEN,
+                                ImVec2 (720, 420), ".mp4,.mov,.m4v,.MP4,.MOV")) {
+    Feed nf;
+    const std::string & path = g_browser.selected_path;
+    std::string base = path.substr (path.find_last_of ('/') + 1);
+    std::size_t dot = base.find_last_of ('.');
+    if (dot != std::string::npos)
+      base = base.substr (0, dot);
+    // Uppercase, so a chosen file reads like the callsigns beside it.
+    for (char & c : base)
+      c = (char) toupper ((unsigned char) c);
+    nf.name = base.empty () ? "CLIP" : base;
+    nf.url = path;
+    app.feeds.push_back (std::move (nf));
+    set_status (app, "Added " + nf.name);
+  }
 }
 
 // A coloured strip along the top edge of an overlay window — the same tally
