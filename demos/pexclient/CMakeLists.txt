@@ -20,6 +20,15 @@ target_link_libraries(pexclient PRIVATE
     pexip::pulse
     Threads::Threads)
 
+# On Windows: winmm for the incoming-call ring (PlaySound), dwmapi for the
+# share picker's cloaked-window filter.
+if(WIN32)
+    target_link_libraries(pexclient PRIVATE winmm dwmapi)
+    # The CRT's *_s "secure" nagging adds nothing over the portable calls used
+    # here; keep the build warning-clean without forking the code per platform.
+    target_compile_definitions(pexclient PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # The share picker enumerates displays/windows via CoreGraphics on macOS.
 if(APPLE)
     find_library(COREGRAPHICS_LIBRARY CoreGraphics REQUIRED)

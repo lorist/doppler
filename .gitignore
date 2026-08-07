@@ -1,6 +1,12 @@
 build/
+build-win/
 *.o
 *.a
+
+# Extracted from the Windows NuGet package at CMake configure time — the
+# .nupkg itself is the artifact of record.
+sdk/windows/include/
+sdk/windows/native/
 .cache/
 compile_commands.json
 demos/pexninja/msvc/.vs
@@ -31,3 +37,6 @@ UAV_footage/
 # somewhere to write; the captures themselves never are.
 recordings/*
 !recordings/.gitkeep
+*.mp4
+*.crt
+*.key

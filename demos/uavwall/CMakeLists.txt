@@ -18,6 +18,15 @@ target_link_libraries(uavwall PRIVATE
     pexip::pulse
     Threads::Threads)
 
+# On Windows: winmm for the incoming-call ring (PlaySound), psapi for the
+# resident-memory figure in the stats row.
+if(WIN32)
+    target_link_libraries(uavwall PRIVATE winmm psapi)
+    # The CRT's *_s "secure" nagging adds nothing over the portable calls used
+    # here; keep the build warning-clean without forking the code per platform.
+    target_compile_definitions(uavwall PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # AudioToolbox: the incoming-call ring tone (a macOS system sound).
 if(APPLE)
     find_library(AUDIOTOOLBOX_LIBRARY AudioToolbox REQUIRED)

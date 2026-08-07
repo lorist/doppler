@@ -45,24 +45,35 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <mach/mach.h>
 #endif
+#if defined(_WIN32)
+#include <windows.h>
+#include <fcntl.h>    // _O_RDONLY
+#include <io.h>       // _open_osfhandle / _read / _write / _close
+#include <mmsystem.h> // PlaySound — the incoming-call ring and the feed-loss cue
+#include <psapi.h>    // GetProcessMemoryInfo — resident memory for the stats row
+#include <filesystem>
+#else
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
+#endif
 #include <cctype>
 #include <cerrno>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <fstream>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <sstream>
@@ -73,6 +84,101 @@
 
 #ifndef UAVWALL_ASSET_DIR
 #define UAVWALL_ASSET_DIR "."
+#endif
+
+// ----------------------------------------------------------------------------
+//  Platform shim
+//
+//  Every recording, the LISTEN monitor and the feed-audio decode is an ffmpeg
+//  child driven through a pipe (Pulse has no recording API and will not hand
+//  back a feed's audio — see the README). That plumbing is the only part of
+//  this file that is not portable, and it is deliberately kept to the three
+//  primitives below so the ~14 call sites above them are shared verbatim.
+//
+//  Windows keeps the POSIX *shape* by two tricks, both of which matter:
+//
+//    * the pipe handle is wrapped in a CRT descriptor with _open_osfhandle(),
+//      so `in_fd` stays an int and the writer thread, the reader thread and
+//      every close are unchanged;
+//    * the process HANDLE lives in the same slot as the pid. Win32 process
+//      handles are always small positive values, so the "> 0 is running, -1 is
+//      none" convention the rest of the file relies on survives intact.
+// ----------------------------------------------------------------------------
+
+#if defined(_WIN32)
+using ProcHandle = intptr_t; // a HANDLE, kept in a pid-shaped slot
+static inline ptrdiff_t
+pio_read (int fd, void * buf, size_t n)
+{
+  return _read (fd, buf, (unsigned int) n);
+}
+static inline ptrdiff_t
+pio_write (int fd, const void * buf, size_t n)
+{
+  return _write (fd, buf, (unsigned int) n);
+}
+static inline int
+pio_close (int fd)
+{
+  return _close (fd); // also closes the underlying HANDLE, as POSIX close does
+}
+
+// CreateProcess takes one command line rather than an argv, so the vector has
+// to be quoted back into a string using the rules the CRT uses to split it
+// again. Paths with spaces (C:\Program Files\...) make this load-bearing.
+static std::string
+win_quote (const std::string & a)
+{
+  if (!a.empty () && a.find_first_of (" \t\"") == std::string::npos)
+    return a;
+  std::string out = "\"";
+  size_t bs = 0;
+  for (char c : a) {
+    if (c == '\\') {
+      bs++;
+    } else if (c == '"') {
+      out.append (bs * 2 + 1, '\\');
+      out += '"';
+      bs = 0;
+    } else {
+      out.append (bs, '\\');
+      bs = 0;
+      out += c;
+    }
+  }
+  out.append (bs * 2, '\\');
+  out += '"';
+  return out;
+}
+
+static std::string
+win_cmdline (const std::vector<std::string> & args)
+{
+  std::string cmd;
+  for (const std::string & a : args) {
+    if (!cmd.empty ())
+      cmd += ' ';
+    cmd += win_quote (a);
+  }
+  return cmd;
+}
+#else
+using ProcHandle = pid_t;
+static inline ptrdiff_t
+pio_read (int fd, void * buf, size_t n)
+{
+  return read (fd, buf, n);
+}
+static inline ptrdiff_t
+pio_write (int fd, const void * buf, size_t n)
+{
+  return write (fd, buf, n);
+}
+static inline int
+pio_close (int fd)
+{
+  return close (fd);
+}
 #endif
 
 // Everything an operator might reasonably want to change, with defaults chosen
@@ -149,7 +255,7 @@ struct Config
 
 struct Recorder
 {
-  pid_t pid = -1;
+  ProcHandle pid = -1;
   int in_fd = -1; // ffmpeg's stdin: "q" for a feed, raw frames for the canvas
   std::string path;
   double started_at = 0.0;
@@ -247,6 +353,27 @@ struct RgbaImage
   std::vector<unsigned char> px;
 };
 
+// A feed connect in flight. pulse_rtsp_session_connect_input() blocks until
+// the SDP is fully negotiated — seconds per feed, longer when the source has
+// to be spun up on demand — so it runs on a worker thread: the UI keeps
+// drawing, and N feeds connect in parallel rather than serially. The job owns
+// everything it builds until poll_connect_jobs() adopts it into the feed;
+// inputs are copied in up front so a Settings save mid-flight changes nothing.
+struct ConnectJob
+{
+  std::string url;
+  bool tcp = true;
+  int latency_ms = 200;
+
+  Pulse * pulse = nullptr; // non-null on success once done
+  PulseRtspSessionID session = 0;
+  bool output_open = false;
+  std::string error;
+
+  std::atomic<bool> done{false};
+  std::thread thread;
+};
+
 struct Feed
 {
   std::string name;
@@ -256,6 +383,7 @@ struct Feed
   PulseRtspSessionID session = 0;
   bool connected = false;      // RTSP session established
   bool output_open = false;    // data-session output opened (see stop_feed)
+  std::shared_ptr<ConnectJob> connecting; // in-flight async connect, or null
   std::string error;
 
   GLuint texture = 0;
@@ -431,7 +559,7 @@ struct App
 
   // The one feed whose audio is sent into the conference, or -1 for silence.
   int air_feed = -1;
-  pid_t air_pid = -1;
+  ProcHandle air_pid = -1;
   int air_fd = -1;
   std::thread air_thread;
   std::atomic<bool> air_quit{false};
@@ -444,6 +572,14 @@ struct App
   bool alert_dismissed = false;
   int alert_dismissed_feed = -1;
   double alert_rang_at = 0.0;
+
+  // Connect-failure alert. A failed async connect lands seconds after the
+  // click that started it, possibly while the operator is looking elsewhere.
+  // Generation counters rather than flags: each new failure re-raises the bar
+  // past an old dismissal.
+  int connect_fail_gen = 0;
+  int connect_fail_dismissed_gen = 0;
+  int connect_fail_rang_gen = 0;
 
   // Long-press to store a layout preset: which slot, and since when.
   int preset_held = -1;
@@ -711,56 +847,119 @@ static void stop_feed (Feed & f);
 static bool g_cfg_rtsp_tcp = true;
 static int g_cfg_rtsp_latency_ms = 200;
 
+// The worker half of start_feed: every Pulse call for one feed's connect, on
+// its own thread. No GL in here — the texture is created at adoption, on the
+// GL thread. On failure the job frees what it made and carries only the error.
+static void
+connect_job_run (std::shared_ptr<ConnectJob> job)
+{
+  {
+    // Serialise instance creation only: the first pulse_new() initialises
+    // global media state, and racing N of them on first use is not a bet
+    // worth taking. The blocking connect below runs unserialised.
+    static std::mutex new_mutex;
+    std::lock_guard<std::mutex> lock (new_mutex);
+    job->pulse = pulse_new ();
+  }
+  if (!job->pulse) {
+    job->error = "pulse_new() failed";
+    job->done = true;
+    return;
+  }
+  pulse_options_set_self_view_window_handle (job->pulse, nullptr);
+  pulse_options_set_remote_video_window_handle (job->pulse, nullptr);
+  pulse_options_set_presentation_video_window_handle (job->pulse, nullptr);
+  pulse_options_set_application_user_agent_string (job->pulse, "uavwall/0.1");
+
+  PulseRtspInputConfig cfg{};
+  cfg.location = job->url.c_str ();
+  cfg.transport = job->tcp ? PULSE_RTSP_TRANSPORT_TCP : PULSE_RTSP_TRANSPORT_UDP;
+  cfg.latency_ms = (uint32_t) job->latency_ms;
+
+  PulseRtspSessionID session = 0;
+  PulseError err = pulse_rtsp_session_connect_input (job->pulse, &cfg, &session);
+  if (err != PULSE_SUCCESS) {
+    job->error = std::string ("connect: ") + pulse_strerror (err);
+    pulse_free (job->pulse);
+    job->pulse = nullptr;
+    job->done = true;
+    return;
+  }
+  job->session = session;
+
+  err = pulse_rtsp_session_bind_to_content (job->pulse, session, PULSE_MEDIA_CONTENT_MAIN);
+  if (err != PULSE_SUCCESS) {
+    job->error = std::string ("bind: ") + pulse_strerror (err);
+    pulse_rtsp_session_disconnect_input (job->pulse, session);
+    pulse_free (job->pulse);
+    job->pulse = nullptr;
+    job->session = 0;
+    job->done = true;
+    return;
+  }
+
+  PulseDataSessionConfig * dcfg = make_video_output_config ();
+  if (pulse_data_session_connect_output (job->pulse, dcfg, PULSE_MEDIA_CONTENT_SELFVIEW) == PULSE_SUCCESS)
+    job->output_open = true;
+  pulse_data_session_config_free (dcfg);
+
+  job->done = true;
+}
+
+// Free whatever a finished job built, for a job whose feed no longer wants it
+// (disconnected, removed, or the app is quitting). Mirrors stop_feed, minus
+// the GL state a never-adopted connect does not have.
+static void
+connect_job_discard (ConnectJob & job)
+{
+  if (!job.pulse)
+    return;
+  if (job.output_open)
+    pulse_data_session_disconnect (job.pulse, PULSE_MEDIA_VIDEO, PULSE_MEDIA_OUTPUT, PULSE_MEDIA_CONTENT_SELFVIEW);
+  if (job.session != 0)
+    pulse_rtsp_session_disconnect_input (job.pulse, job.session);
+  pulse_free (job.pulse);
+  job.pulse = nullptr;
+}
+
+// Connects whose feed stopped wanting them mid-flight (disconnect, remove,
+// quit). The blocking call cannot be cancelled, so the job runs to completion
+// here and is torn down when it lands.
+static std::vector<std::shared_ptr<ConnectJob>> g_orphan_connects;
+
+static void
+reap_orphan_connects ()
+{
+  for (size_t i = 0; i < g_orphan_connects.size ();) {
+    ConnectJob & job = *g_orphan_connects[i];
+    if (!job.done.load ()) {
+      i++;
+      continue;
+    }
+    if (job.thread.joinable ())
+      job.thread.join ();
+    connect_job_discard (job);
+    g_orphan_connects.erase (g_orphan_connects.begin () + (long) i);
+  }
+}
+
 // RTSP in, self-view out — the uniform local-source recipe from videowall.
+// pulse_rtsp_session_connect_input() blocks until the SDP is negotiated —
+// seconds per feed — so this only launches the worker; the feed shows as
+// connecting until poll_connect_jobs() adopts the result.
 static void
 start_feed (Feed & f)
 {
-  if (f.connected)
+  if (f.connected || f.connecting)
     return;
   f.error.clear ();
 
-  f.pulse = pulse_new ();
-  if (!f.pulse) {
-    f.error = "pulse_new() failed";
-    return;
-  }
-  pulse_options_set_self_view_window_handle (f.pulse, nullptr);
-  pulse_options_set_remote_video_window_handle (f.pulse, nullptr);
-  pulse_options_set_presentation_video_window_handle (f.pulse, nullptr);
-  pulse_options_set_application_user_agent_string (f.pulse, "uavwall/0.1");
-
-  PulseRtspInputConfig cfg{};
-  cfg.location = f.url.c_str ();
-  cfg.transport = g_cfg_rtsp_tcp ? PULSE_RTSP_TRANSPORT_TCP : PULSE_RTSP_TRANSPORT_UDP;
-  cfg.latency_ms = (uint32_t) g_cfg_rtsp_latency_ms;
-
-  PulseRtspSessionID session = 0;
-  PulseError err = pulse_rtsp_session_connect_input (f.pulse, &cfg, &session);
-  if (err != PULSE_SUCCESS) {
-    f.error = std::string ("connect: ") + pulse_strerror (err);
-    stop_feed (f);
-    return;
-  }
-  f.session = session;
-
-  err = pulse_rtsp_session_bind_to_content (f.pulse, session, PULSE_MEDIA_CONTENT_MAIN);
-  if (err != PULSE_SUCCESS) {
-    f.error = std::string ("bind: ") + pulse_strerror (err);
-    stop_feed (f);
-    return;
-  }
-
-  glGenTextures (1, &f.texture);
-  glBindTexture (GL_TEXTURE_2D, f.texture);
-  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-
-  PulseDataSessionConfig * dcfg = make_video_output_config ();
-  if (pulse_data_session_connect_output (f.pulse, dcfg, PULSE_MEDIA_CONTENT_SELFVIEW) == PULSE_SUCCESS)
-    f.output_open = true;
-  pulse_data_session_config_free (dcfg);
-
-  f.connected = true;
+  auto job = std::make_shared<ConnectJob> ();
+  job->url = f.url;
+  job->tcp = g_cfg_rtsp_tcp;
+  job->latency_ms = g_cfg_rtsp_latency_ms;
+  f.connecting = job;
+  job->thread = std::thread (connect_job_run, job);
 }
 
 // Safe on a never-started or half-started feed — the output session in
@@ -768,6 +967,11 @@ start_feed (Feed & f)
 static void
 stop_feed (Feed & f)
 {
+  // A connect still in flight cannot be cancelled — disown it and let
+  // reap_orphan_connects() free whatever it ends up building.
+  if (f.connecting)
+    g_orphan_connects.push_back (std::move (f.connecting));
+
   if (!f.pulse) {
     f.connected = false;
     return;
@@ -790,6 +994,40 @@ stop_feed (Feed & f)
   f.frame = RgbaImage{};
   f.tex_w = f.tex_h = 0;
   f.connected = false;
+}
+
+// The UI thread's half of start_feed, once per frame: adopt finished connects
+// into their feeds. The GL texture is created here because it needs the GL
+// context, and connected_at is stamped here so UPTIME starts when frames can
+// actually begin to arrive.
+static void
+poll_connect_jobs (App & app)
+{
+  for (Feed & f : app.feeds) {
+    if (!f.connecting || !f.connecting->done.load ())
+      continue;
+    std::shared_ptr<ConnectJob> job = std::move (f.connecting);
+    if (job->thread.joinable ())
+      job->thread.join ();
+
+    if (!job->pulse) {
+      f.error = job->error;
+      app.connect_fail_gen++; // each new failure re-raises the alert bar
+      continue;
+    }
+    f.pulse = job->pulse;
+    f.session = job->session;
+    f.output_open = job->output_open;
+
+    glGenTextures (1, &f.texture);
+    glBindTexture (GL_TEXTURE_2D, f.texture);
+    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+    f.connected = true;
+    f.connected_at = ImGui::GetTime ();
+  }
+  reap_orphan_connects ();
 }
 
 static void
@@ -971,30 +1209,59 @@ push_canvas (App & app)
 // Resolved once. Empty means the record controls are unavailable rather than
 // silently broken — ffmpeg is a runtime dependency only for this feature.
 static std::string g_ffmpeg;
+// Windows only: ffmpeg has no audio *output* device there (dshow is capture
+// only), so LISTEN plays through ffplay instead. Empty disables just that
+// button, exactly as an absent ffmpeg disables the record rings.
+static std::string g_ffplay;
 
-static void
-find_ffmpeg ()
+static std::string
+find_tool (const char * name)
 {
-  static const char * fixed[] = {"/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"};
-  for (const char * p : fixed)
-    if (access (p, X_OK) == 0) {
-      g_ffmpeg = p;
-      return;
-    }
+#if defined(_WIN32)
+  const std::string exe = std::string (name) + ".exe";
   const char * path = getenv ("PATH");
   if (!path)
-    return;
+    return {};
+  std::string dir;
+  std::istringstream iss (path);
+  while (std::getline (iss, dir, ';')) { // ';' on Windows, not ':'
+    if (dir.empty ())
+      continue;
+    std::string cand = dir + "\\" + exe;
+    std::error_code ec;
+    if (std::filesystem::is_regular_file (cand, ec))
+      return cand;
+  }
+  return {};
+#else
+  const std::string fixed[] = {std::string ("/opt/homebrew/bin/") + name, std::string ("/usr/local/bin/") + name,
+                               std::string ("/usr/bin/") + name};
+  for (const std::string & p : fixed)
+    if (access (p.c_str (), X_OK) == 0)
+      return p;
+  const char * path = getenv ("PATH");
+  if (!path)
+    return {};
   std::string s (path), dir;
   std::istringstream iss (s);
   while (std::getline (iss, dir, ':')) {
     if (dir.empty ())
       continue;
-    std::string cand = dir + "/ffmpeg";
-    if (access (cand.c_str (), X_OK) == 0) {
-      g_ffmpeg = cand;
-      return;
-    }
+    std::string cand = dir + "/" + name;
+    if (access (cand.c_str (), X_OK) == 0)
+      return cand;
   }
+  return {};
+#endif
+}
+
+static void
+find_ffmpeg ()
+{
+  g_ffmpeg = find_tool ("ffmpeg");
+#if defined(_WIN32)
+  g_ffplay = find_tool ("ffplay");
+#endif
 }
 
 // "HAWKEYE 21" -> "HAWKEYE-21", so the filename survives a shell and a USB stick.
@@ -1036,6 +1303,13 @@ ensure_dir (const std::string & path)
 {
   if (path.empty ())
     return false;
+#if defined(_WIN32)
+  // Both separators are legal here and a configured path may use either, so
+  // let the standard library do the walking rather than splitting by hand.
+  std::error_code ec;
+  std::filesystem::create_directories (path, ec);
+  return std::filesystem::is_directory (path, ec);
+#else
   std::string acc;
   size_t i = 0;
   if (path[0] == '/') {
@@ -1054,6 +1328,7 @@ ensure_dir (const std::string & path)
   }
   struct stat st{};
   return stat (path.c_str (), &st) == 0 && S_ISDIR (st.st_mode);
+#endif
 }
 
 // Fork/exec with a pipe on stdin. ffmpeg's own output goes to a log beside the
@@ -1061,6 +1336,69 @@ ensure_dir (const std::string & path)
 static bool
 spawn_recorder (Recorder & r, const std::vector<std::string> & args, bool nonblocking_stdin)
 {
+#if defined(_WIN32)
+  // No caller asks for a non-blocking stdin — the canvas encoder's writer
+  // thread took that job, and an anonymous pipe has no O_NONBLOCK equivalent
+  // anyway. Assert the expectation rather than silently ignoring it.
+  (void) nonblocking_stdin;
+
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof (sa);
+  sa.bInheritHandle = TRUE;
+
+  HANDLE rd = nullptr, wr = nullptr;
+  if (!CreatePipe (&rd, &wr, &sa, 0))
+    return false;
+  // Only the read end belongs to the child. If our write end were inheritable
+  // the child would hold a copy open and never see the EOF that finalises the
+  // file when we close it.
+  SetHandleInformation (wr, HANDLE_FLAG_INHERIT, 0);
+
+  // ffmpeg's own diagnostics go to a log beside the recording, so a failure can
+  // be read after the fact — same as the POSIX path.
+  HANDLE log = CreateFileA ((r.path + ".log").c_str (), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+  STARTUPINFOA si{};
+  si.cb = sizeof (si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = rd;
+  si.hStdOutput = log != INVALID_HANDLE_VALUE ? log : GetStdHandle (STD_OUTPUT_HANDLE);
+  si.hStdError = log != INVALID_HANDLE_VALUE ? log : GetStdHandle (STD_ERROR_HANDLE);
+
+  std::string cmd = win_cmdline (args);
+  std::vector<char> mutable_cmd (cmd.begin (), cmd.end ());
+  mutable_cmd.push_back ('\0'); // CreateProcessA may write to this buffer
+
+  PROCESS_INFORMATION pi{};
+  BOOL ok = CreateProcessA (nullptr, mutable_cmd.data (), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                            &si, &pi);
+  CloseHandle (rd);
+  if (log != INVALID_HANDLE_VALUE)
+    CloseHandle (log);
+  if (!ok) {
+    CloseHandle (wr);
+    return false;
+  }
+  CloseHandle (pi.hThread);
+
+  // A CRT descriptor over the pipe is what keeps in_fd an int, so the writer
+  // thread and every close above this line are shared with POSIX.
+  int fd = _open_osfhandle ((intptr_t) wr, 0);
+  if (fd < 0) {
+    CloseHandle (wr);
+    TerminateProcess (pi.hProcess, 1);
+    CloseHandle (pi.hProcess);
+    return false;
+  }
+
+  r.pid = (ProcHandle) pi.hProcess;
+  r.in_fd = fd;
+  r.started_at = ImGui::GetTime ();
+  r.stopping = false;
+  r.bytes = 0;
+  return true;
+#else
   int fds[2];
   if (pipe (fds) != 0)
     return false;
@@ -1104,6 +1442,7 @@ spawn_recorder (Recorder & r, const std::vector<std::string> & args, bool nonblo
   r.stopping = false;
   r.bytes = 0;
   return true;
+#endif
 }
 
 static void
@@ -1115,10 +1454,10 @@ stop_recorder (Recorder & r, bool frames_on_stdin)
     // A feed recorder is told to quit; the canvas recorder simply gets EOF,
     // which finalises the file the same way.
     if (!frames_on_stdin) {
-      ssize_t n = write (r.in_fd, "q\n", 2);
+      ptrdiff_t n = pio_write (r.in_fd, "q\n", 2);
       (void) n;
     }
-    close (r.in_fd);
+    pio_close (r.in_fd);
     r.in_fd = -1;
   }
   r.stopping = true;
@@ -1127,26 +1466,49 @@ stop_recorder (Recorder & r, bool frames_on_stdin)
 
 // Called every frame. Reaping is deferred rather than waited on, so stopping a
 // recording never stalls the UI.
+// Has the child gone? Never blocks, and clears the slot when it has. Shared by
+// reap_recorder and the bounded wait during shutdown.
+static bool
+reap_if_exited (Recorder & r)
+{
+  if (r.pid <= 0)
+    return true;
+#if defined(_WIN32)
+  HANDLE h = (HANDLE) r.pid;
+  DWORD w = WaitForSingleObject (h, 0);
+  if (w != WAIT_OBJECT_0 && w != WAIT_FAILED)
+    return false;
+  CloseHandle (h);
+#else
+  int st = 0;
+  pid_t got = waitpid (r.pid, &st, WNOHANG);
+  if (got != r.pid && got >= 0)
+    return false;
+#endif
+  r.pid = -1;
+  r.stopping = false;
+  if (r.in_fd >= 0) {
+    pio_close (r.in_fd);
+    r.in_fd = -1;
+  }
+  return true;
+}
+
 static void
 reap_recorder (Recorder & r)
 {
   if (r.pid <= 0)
     return;
-  int st = 0;
-  pid_t got = waitpid (r.pid, &st, WNOHANG);
-  if (got == r.pid || got < 0) {
-    r.pid = -1;
-    r.stopping = false;
-    if (r.in_fd >= 0) {
-      close (r.in_fd);
-      r.in_fd = -1;
-    }
+  if (reap_if_exited (r))
     return;
-  }
   if (r.stopping && ImGui::GetTime () > r.kill_after) {
     // It will not go quietly; the file is likely unplayable, but a wedged
     // child is worse.
+#if defined(_WIN32)
+    TerminateProcess ((HANDLE) r.pid, 1);
+#else
     kill (r.pid, SIGKILL);
+#endif
     r.kill_after = ImGui::GetTime () + 5.0;
   }
 }
@@ -1277,7 +1639,7 @@ start_canvas_recording (App & app)
       const unsigned char * pp = frame.data ();
       size_t left = frame.size ();
       while (left > 0) {
-        ssize_t n = write (app.canvas_rec.in_fd, pp, left);
+        ptrdiff_t n = pio_write (app.canvas_rec.in_fd, pp, left);
         if (n > 0) {
           pp += n;
           left -= (size_t) n;
@@ -1285,7 +1647,7 @@ start_canvas_recording (App & app)
         }
         if (n < 0 && errno == EINTR)
           continue;
-        return; // EPIPE: the encoder is gone
+        return; // EPIPE (ERROR_BROKEN_PIPE): the encoder is gone
       }
       app.canvas_rec.bytes += frame.size ();
       {
@@ -1376,8 +1738,16 @@ recording_count (const App & app)
 static void
 stop_monitor (App & app)
 {
-  if (app.monitor.busy ())
+  if (app.monitor.busy ()) {
     stop_recorder (app.monitor, false);
+#if defined(_WIN32)
+    // The monitor is ffplay here (see below), which takes its keys from SDL
+    // rather than stdin, so the "q" stop_recorder just wrote is ignored. There
+    // is no file to finalise, so bring the kill-fallback forward instead of
+    // leaving the sound playing for the usual eight seconds.
+    app.monitor.kill_after = ImGui::GetTime ();
+#endif
+  }
   app.monitor_feed = -1;
 }
 
@@ -1389,10 +1759,21 @@ start_monitor (App & app, int idx)
     return;
   stop_monitor (app);
 
+#if defined(_WIN32)
+  // ffmpeg has no audio output device on Windows at all — dshow is capture
+  // only, and there is no wasapi/directsound muxer to write to. ffplay is the
+  // one player in the same distribution, so LISTEN uses it here and needs it
+  // present separately from ffmpeg.
+  if (g_ffplay.empty ()) {
+    set_status (app, "ffplay not found — cannot listen");
+    return;
+  }
+#else
   if (g_ffmpeg.empty ()) {
     set_status (app, "ffmpeg not found — cannot listen");
     return;
   }
+#endif
   Feed & f = app.feeds[(size_t) idx];
 
   // ffmpeg opens the URL itself, so this works whether or not the feed is
@@ -1400,6 +1781,25 @@ start_monitor (App & app, int idx)
   app.monitor.path = "/dev/null"; // only used to name the child's log
   // Same low-latency flags as the conference path: monitoring three seconds
   // behind the picture is not monitoring.
+#if defined(_WIN32)
+  std::vector<std::string> args = {g_ffplay,
+                                   "-hide_banner",
+                                   "-loglevel",
+                                   "error",
+                                   "-nodisp",  // audio only; the picture is already on the wall
+                                   "-autoexit", // follow the feed if it ends
+                                   "-fflags",
+                                   "nobuffer",
+                                   "-flags",
+                                   "low_delay",
+                                   "-probesize",
+                                   "32",
+                                   "-analyzeduration",
+                                   "0",
+                                   "-rtsp_transport",
+                                   app.cfg.rtsp_tcp ? "tcp" : "udp",
+                                   f.url};
+#else
   std::vector<std::string> args = {g_ffmpeg,
                                    "-hide_banner",
                                    "-loglevel",
@@ -1420,6 +1820,7 @@ start_monitor (App & app, int idx)
                                    "-f",
                                    "audiotoolbox",
                                    "-"};
+#endif
   if (!spawn_recorder (app.monitor, args, false)) {
     set_status (app, "Could not start the monitor");
     return;
@@ -1447,8 +1848,50 @@ start_monitor (App & app, int idx)
 // Spawn a child and keep its *stdout*, the mirror of spawn_recorder which keeps
 // the child's stdin.
 static bool
-spawn_reader (pid_t * pid_out, int * fd_out, const std::vector<std::string> & args)
+spawn_reader (ProcHandle * pid_out, int * fd_out, const std::vector<std::string> & args)
 {
+#if defined(_WIN32)
+  SECURITY_ATTRIBUTES sa{};
+  sa.nLength = sizeof (sa);
+  sa.bInheritHandle = TRUE;
+
+  HANDLE rd = nullptr, wr = nullptr;
+  if (!CreatePipe (&rd, &wr, &sa, 0))
+    return false;
+  SetHandleInformation (rd, HANDLE_FLAG_INHERIT, 0); // our read end stays ours
+
+  STARTUPINFOA si{};
+  si.cb = sizeof (si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = GetStdHandle (STD_INPUT_HANDLE);
+  si.hStdOutput = wr;
+  si.hStdError = INVALID_HANDLE_VALUE; // the POSIX path sends this to /dev/null
+
+  std::string cmd = win_cmdline (args);
+  std::vector<char> mutable_cmd (cmd.begin (), cmd.end ());
+  mutable_cmd.push_back ('\0');
+
+  PROCESS_INFORMATION pi{};
+  BOOL ok = CreateProcessA (nullptr, mutable_cmd.data (), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                            &si, &pi);
+  CloseHandle (wr);
+  if (!ok) {
+    CloseHandle (rd);
+    return false;
+  }
+  CloseHandle (pi.hThread);
+
+  int fd = _open_osfhandle ((intptr_t) rd, _O_RDONLY);
+  if (fd < 0) {
+    CloseHandle (rd);
+    TerminateProcess (pi.hProcess, 1);
+    CloseHandle (pi.hProcess);
+    return false;
+  }
+  *pid_out = (ProcHandle) pi.hProcess;
+  *fd_out = fd;
+  return true;
+#else
   int fds[2];
   if (pipe (fds) != 0)
     return false;
@@ -1480,12 +1923,31 @@ spawn_reader (pid_t * pid_out, int * fd_out, const std::vector<std::string> & ar
   *pid_out = pid;
   *fd_out = fds[0];
   return true;
+#endif
 }
 
 static void
 stop_air (App & app)
 {
   app.air_quit.store (true);
+#if defined(_WIN32)
+  // Order is reversed from POSIX on purpose. Closing a handle that another
+  // thread is blocked reading is not guaranteed to release it on Windows, so
+  // the child is killed first: that closes its end of the pipe, the reader
+  // sees EOF, and the thread leaves on its own.
+  if (app.air_pid > 0) {
+    TerminateProcess ((HANDLE) app.air_pid, 1);
+    WaitForSingleObject ((HANDLE) app.air_pid, INFINITE);
+    CloseHandle ((HANDLE) app.air_pid);
+    app.air_pid = -1;
+  }
+  if (app.air_thread.joinable ())
+    app.air_thread.join ();
+  if (app.air_fd >= 0) {
+    pio_close (app.air_fd);
+    app.air_fd = -1;
+  }
+#else
   if (app.air_fd >= 0) {
     // Close first so a blocked read returns and the thread can notice the flag.
     close (app.air_fd);
@@ -1499,6 +1961,7 @@ stop_air (App & app)
     waitpid (app.air_pid, &st, 0);
     app.air_pid = -1;
   }
+#endif
   app.air_feed = -1;
 }
 
@@ -1541,7 +2004,7 @@ start_air (App & app, int idx)
   app.air_thread = std::thread ([&app, fd] () {
     std::vector<int16_t> chunk (1024);
     while (!app.air_quit.load ()) {
-      ssize_t n = read (fd, chunk.data (), chunk.size () * sizeof (int16_t));
+      ptrdiff_t n = pio_read (fd, chunk.data (), chunk.size () * sizeof (int16_t));
       if (n <= 0)
         break; // EOF or the fd was closed under us by stop_air
       app.air_ring.write (chunk.data (), (size_t) n / sizeof (int16_t));
@@ -1730,6 +2193,15 @@ play_ring ()
     AudioServicesPlaySystemSound (sound);
   else
     AudioServicesPlayAlertSound (kSystemSoundID_UserPreferredAlert);
+}
+#elif defined(_WIN32)
+static void
+play_ring ()
+{
+  // Fire-and-forget, like the macOS path: one short system chime, retriggered
+  // by the ring timer, so an in-flight sound never outlives the call. Async so
+  // the UI thread never blocks on it.
+  PlaySoundW (L"SystemExclamation", nullptr, SND_ALIAS | SND_ASYNC | SND_NODEFAULT);
 }
 #else
 static void
@@ -2063,6 +2535,26 @@ sample_resources (App & app)
   if (now - app.stats_sampled_at < 1.0)
     return;
 
+#if defined(_WIN32)
+  FILETIME created{}, exited{}, kernel{}, user{};
+  if (GetProcessTimes (GetCurrentProcess (), &created, &exited, &kernel, &user)) {
+    // Both are 100ns ticks of consumed CPU, the same quantity getrusage
+    // reports, so the percentage below is computed identically.
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+    double cpu = (double) (k.QuadPart + u.QuadPart) / 1e7;
+    if (app.stats_sampled_at > 0.0)
+      app.proc_cpu_pct = 100.0 * (cpu - app.last_cpu_seconds) / (now - app.stats_sampled_at);
+    app.last_cpu_seconds = cpu;
+  }
+
+  PROCESS_MEMORY_COUNTERS pmc{};
+  if (GetProcessMemoryInfo (GetCurrentProcess (), &pmc, sizeof (pmc)))
+    app.proc_rss_mb = pmc.WorkingSetSize / (1024.0 * 1024.0);
+#else
   struct rusage ru;
   if (getrusage (RUSAGE_SELF, &ru) == 0) {
     double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
@@ -2083,6 +2575,7 @@ sample_resources (App & app)
       app.proc_rss_mb = pages_res * (double) sysconf (_SC_PAGESIZE) / (1024.0 * 1024.0);
     fclose (f);
   }
+#endif
 #endif
 
   // Outbound conference stats, straight from Pulse.
@@ -2426,9 +2919,14 @@ ui_inspector (App & app, ImVec2 at, float w)
   float y = at.y + pad;
   draw_label (app, dl, ImVec2 (at.x + pad, y), "INSPECTOR", theme::WhiteU32 (theme::TextLabel));
 
-  const char * state = stalled ? "STALLED" : feed_live (f) ? "LIVE" : "OFFLINE";
-  ImU32 state_col = stalled ? theme::HexU32 (theme::StatusWarn)
-                            : feed_live (f) ? theme::HexU32 (theme::StatusOnline) : theme::WhiteU32 (0.35f);
+  const char * state = stalled         ? "STALLED"
+                       : feed_live (f) ? "LIVE"
+                       : f.connecting  ? "CONNECTING"
+                                       : "OFFLINE";
+  ImU32 state_col = stalled         ? theme::HexU32 (theme::StatusWarn)
+                    : feed_live (f) ? theme::HexU32 (theme::StatusOnline)
+                    : f.connecting  ? theme::HexU32 (theme::AccentPrimary)
+                                    : theme::WhiteU32 (0.35f);
   dl->AddText (app.fonts.label, theme::fs (8.3f),
                ImVec2 (p1.x - pad - label_w (app, state, 8.3f), y), state_col, state);
   y += du (14.0f);
@@ -2526,13 +3024,13 @@ ui_inspector (App & app, ImVec2 at, float w)
       start_monitor (app, app.inspect_feed);
   }
   ImGui::SetCursorScreenPos (ImVec2 (at.x + pad, row2));
-  if (deck_button (app, "insp_rc", "RECONNECT", ImVec2 (bw, bh), theme::AccentPrimary, Btn::Fill)) {
+  // Disabled while a connect is in flight: another click would only disown
+  // the running attempt and start a second one.
+  if (deck_button (app, "insp_rc", "RECONNECT", ImVec2 (bw, bh), theme::AccentPrimary, Btn::Fill, !f.connecting)) {
     if (app.monitor_feed == app.inspect_feed)
       stop_monitor (app); // the instance is about to be torn down
     stop_feed (f);
     start_feed (f);
-    if (f.connected)
-      f.connected_at = ImGui::GetTime ();
   }
   ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + bw + gapb, row2));
   if (deck_button (app, "insp_rm", "REMOVE", ImVec2 (bw, bh), 0xFFFFFF, Btn::Outline)) {
@@ -2676,7 +3174,7 @@ ui_feed_rail (App & app, float w, float h)
         dl->AddLine (ImVec2 (t0.x, y), ImVec2 (t0.x, std::min (y + dash, t1.y)), theme::WhiteU32 (0.16f), 1.0f);
         dl->AddLine (ImVec2 (t1.x, y), ImVec2 (t1.x, std::min (y + dash, t1.y)), theme::WhiteU32 (0.16f), 1.0f);
       }
-      const char * msg = f.connected ? "waiting…" : "OFFLINE";
+      const char * msg = f.connecting ? "connecting…" : f.connected ? "waiting…" : "OFFLINE";
       float tw = label_w (app, msg, 8.3f);
       dl->AddText (app.fonts.label, theme::fs (8.3f),
                    ImVec2 ((t0.x + t1.x - tw) / 2, (t0.y + t1.y) / 2 - theme::fs (4.0f)), theme::WhiteU32 (0.35f),
@@ -2689,10 +3187,13 @@ ui_feed_rail (App & app, float w, float h)
     const float my = t1.y + du (3.0f);
     ImVec2 m0 (t0.x, my + (meta_h - du (5.0f)) / 2);
     // A square marker, not a dot: it reads as an indicator rather than a bullet.
+    // A connecting marker breathes — activity, not yet a state.
     dl->AddRectFilled (m0, ImVec2 (m0.x + du (5.0f), m0.y + du (5.0f)),
-                       live      ? theme::HexU32 (theme::StatusOnline)
-                       : stalled ? theme::HexU32 (theme::StatusWarn)
-                                 : theme::WhiteU32 (0.25f));
+                       live           ? theme::HexU32 (theme::StatusOnline)
+                       : stalled      ? theme::HexU32 (theme::StatusWarn)
+                       : f.connecting ? theme::HexU32 (theme::AccentPrimary,
+                                                       0.55f + 0.30f * (float) std::sin (ImGui::GetTime () * 5.0))
+                                      : theme::WhiteU32 (0.25f));
 
     char meta[96];
     if (f.connected && f.tex_w > 0) {
@@ -2705,6 +3206,8 @@ ui_feed_rail (App & app, float w, float h)
     }
     else if (f.connected)
       snprintf (meta, sizeof (meta), "no frames yet");
+    else if (f.connecting)
+      snprintf (meta, sizeof (meta), "connecting…");
     else if (!f.error.empty ())
       snprintf (meta, sizeof (meta), "error");
     else
@@ -2712,7 +3215,8 @@ ui_feed_rail (App & app, float w, float h)
     draw_mono (app, dl, ImVec2 (m0.x + du (5.0f) + du (5.0f), my + du (1.0f)), meta,
                f.error.empty () ? theme::WhiteU32 (0.55f) : theme::HexU32 (theme::StatusError, 0.75f), 9.2f);
 
-    if (toggle_switch (app, "sw", f.connected, ImVec2 (t1.x - du (22.0f), my + (meta_h - du (12.0f)) / 2)))
+    if (toggle_switch (app, "sw", f.connected || f.connecting != nullptr,
+                       ImVec2 (t1.x - du (22.0f), my + (meta_h - du (12.0f)) / 2)))
       toggle_feed = i;
     // Recording is independent of the wall: ffmpeg opens the URL itself, so a
     // feed can be captured whether or not it is connected here or on canvas.
@@ -2775,7 +3279,7 @@ ui_feed_rail (App & app, float w, float h)
   // after the loop rather than under the iteration.
   if (toggle_feed >= 0) {
     Feed & f = app.feeds[(size_t) toggle_feed];
-    if (f.connected) {
+    if (f.connected || f.connecting) { // toggling mid-connect abandons the attempt
       if (app.monitor_feed == toggle_feed)
         stop_monitor (app); // its Pulse instance is about to be freed
       stop_feed (f);
@@ -2783,8 +3287,6 @@ ui_feed_rail (App & app, float w, float h)
       app.fullscreen_feed = -1;
     } else {
       start_feed (f);
-      if (f.connected)
-        f.connected_at = ImGui::GetTime ();
     }
   }
 
@@ -3265,14 +3767,17 @@ ui_settings (App & app)
         f.url = ubuf;
 
       const float sx = r0.x + col_name + col_url + du (16.0f);
-      if (toggle_switch (app, "fsw", f.connected, ImVec2 (sx, r0.y + du (7.0f)), 26.0f, 14.0f))
+      if (toggle_switch (app, "fsw", f.connected || f.connecting != nullptr, ImVec2 (sx, r0.y + du (7.0f)), 26.0f,
+                         14.0f))
         toggle = i;
-      const char * st = feed_stalled (f)  ? "STALLED"
-                        : feed_live (f)   ? "LIVE"
+      const char * st = feed_stalled (f)    ? "STALLED"
+                        : feed_live (f)     ? "LIVE"
+                        : f.connecting      ? "CONNECTING"
                         : !f.error.empty () ? "ERROR"
                                             : "OFF";
       ImU32 sc = feed_stalled (f)     ? theme::HexU32 (theme::StatusWarn)
                  : feed_live (f)      ? theme::HexU32 (theme::StatusOnline)
+                 : f.connecting       ? theme::HexU32 (theme::AccentPrimary)
                  : !f.error.empty () ? theme::HexU32 (theme::StatusError)
                                      : theme::WhiteU32 (0.35f);
       rdl->AddText (app.fonts.label, theme::fs (8.3f), ImVec2 (sx + du (32.0f), r0.y + du (9.0f)), sc, st);
@@ -3285,14 +3790,12 @@ ui_settings (App & app)
 
     if (toggle >= 0) {
       Feed & f = app.feeds[(size_t) toggle];
-      if (f.connected) {
+      if (f.connected || f.connecting) {
         stop_feed (f);
         remove_feed_tiles (app, toggle);
         app.fullscreen_feed = -1;
       } else {
         start_feed (f);
-        if (f.connected)
-          f.connected_at = ImGui::GetTime ();
       }
     }
 
@@ -3717,9 +4220,7 @@ ui_feed_error (App & app, ImVec2 win_size)
   ImVec2 base = ImGui::GetCursorScreenPos ();
   if (deck_button (app, "fe_retry", "RETRY", ImVec2 (rw, bh), theme::AccentPrimary, Btn::Fill)) {
     stop_feed (f);
-    start_feed (f);
-    if (f.connected)
-      f.connected_at = ImGui::GetTime ();
+    start_feed (f); // clears f.error, which closes this window until the retry lands
   }
   ImGui::SetCursorScreenPos (ImVec2 (base.x + rw + du (8.0f), base.y));
   if (deck_button (app, "fe_udp", swlabel, ImVec2 (sw, bh), 0xFFFFFF, Btn::Outline)) {
@@ -3728,8 +4229,6 @@ ui_feed_error (App & app, ImVec2 win_size)
     g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
     stop_feed (f);
     start_feed (f);
-    if (f.connected)
-      f.connected_at = ImGui::GetTime ();
   }
   ImGui::SetCursorScreenPos (ImVec2 (base.x, base.y + bh));
 
@@ -4303,32 +4802,36 @@ ui_deck (App & app, float width, char * vmr_buf, size_t vmr_sz, char * pin_buf, 
   // ---- SOURCES ------------------------------------------------------------
   group_label ("SOURCES");
   {
-    int live = 0;
+    int live = 0, connecting = 0;
     bool any_off = false;
     for (const Feed & f : app.feeds) {
       if (f.connected)
         live++;
+      else if (f.connecting)
+        connecting++;
       else
         any_off = true;
     }
 
-    const char * lbl = any_off ? "CONNECT ALL" : "DISCONNECT ALL";
+    // While a batch is in flight the button is a status, not a control — the
+    // tally beside it counts the feeds up as they land.
+    const char * lbl = connecting > 0 ? "CONNECTING…" : any_off ? "CONNECT ALL" : "DISCONNECT ALL";
     const float bw = label_w (app, lbl, 9.5f) + du (12.0f) * 2;
     ImGui::SetCursorScreenPos (ImVec2 (x, ctrl_y));
     // Constructive gets a fill, destructive only an outline — the quieter of
     // the two is the one that throws work away.
-    if (deck_button (app, "connall", lbl, ImVec2 (bw, ch), any_off ? theme::StatusOnline : theme::StatusError,
-                     any_off ? Btn::Tinted : Btn::Outline)) {
+    if (deck_button (app, "connall", lbl, ImVec2 (bw, ch),
+                     connecting > 0 ? theme::AccentPrimary
+                     : any_off      ? theme::StatusOnline
+                                    : theme::StatusError,
+                     connecting > 0 || any_off ? Btn::Tinted : Btn::Outline, connecting == 0)) {
       if (!any_off)
         stop_monitor (app); // every instance is about to be freed
       for (Feed & f : app.feeds) {
-        if (any_off) {
+        if (any_off)
           start_feed (f);
-          if (f.connected)
-            f.connected_at = ImGui::GetTime ();
-        } else {
+        else
           stop_feed (f);
-        }
       }
       if (!any_off) {
         app.tiles.clear ();
@@ -4365,6 +4868,79 @@ ui_deck (App & app, float width, char * vmr_buf, size_t vmr_sz, char * pin_buf, 
   ImGui::Dummy (ImVec2 (width, h));
 }
 
+// Red sibling of the feed-loss bar: an async connect failed, seconds after
+// the click that started it and possibly while the operator was looking
+// elsewhere. Same shape and position as the stall bar, so failure and loss
+// read as one alerting system.
+static float
+ui_connect_fail_alert (App & app, float width)
+{
+  int nerr = 0, first = -1;
+  for (int i = 0; i < (int) app.feeds.size (); i++) {
+    if (app.feeds[(size_t) i].error.empty ())
+      continue;
+    nerr++;
+    if (first < 0)
+      first = i;
+  }
+  if (nerr == 0) {
+    // Every failure retried, reconnected or removed: fold the counters
+    // together so the next failure is a fresh episode.
+    app.connect_fail_dismissed_gen = app.connect_fail_gen;
+    app.connect_fail_rang_gen = app.connect_fail_gen;
+    return 0.0f;
+  }
+
+  // One cue per failure generation — a new failure rings even if an earlier
+  // bar was dismissed.
+  if (!app.cfg.alerts_muted && app.connect_fail_rang_gen != app.connect_fail_gen) {
+    play_ring ();
+    app.connect_fail_rang_gen = app.connect_fail_gen;
+  }
+  if (app.connect_fail_dismissed_gen == app.connect_fail_gen)
+    return 0.0f;
+
+  const float h = du (27.0f);
+  ImVec2 at = ImGui::GetCursorScreenPos ();
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 p1 (at.x + width, at.y + h);
+  dl->AddRectFilled (at, p1, theme::HexU32 (theme::StatusError, 0.13f), du (theme::RadiusControl2));
+  dl->AddRect (at, p1, theme::HexU32 (theme::StatusError, 0.40f), du (theme::RadiusControl2), 0, 1.0f);
+
+  const float cy = at.y + h / 2;
+  float x = at.x + du (10.0f);
+  dl->AddCircleFilled (ImVec2 (x + du (3.5f), cy), du (3.5f), theme::HexU32 (theme::StatusError));
+  x += du (7.0f) + du (8.0f);
+  dl->AddText (app.fonts.label, theme::fs (9.5f), ImVec2 (x, cy - theme::fs (9.5f) / 2 - du (1.0f)),
+               theme::HexU32 (theme::StatusError), "CONNECT FAILED");
+  x += label_w (app, "CONNECT FAILED", 9.5f) + du (8.0f);
+
+  char msg[256];
+  const Feed & ff = app.feeds[(size_t) first];
+  if (nerr > 1)
+    snprintf (msg, sizeof (msg), "%s — %s  and %d other%s", ff.name.c_str (), ff.error.c_str (), nerr - 1,
+              nerr == 2 ? "" : "s");
+  else
+    snprintf (msg, sizeof (msg), "%s — %s", ff.name.c_str (), ff.error.c_str ());
+  draw_mono (app, dl, ImVec2 (x, cy - theme::fs (10.5f) / 2), msg, theme::WhiteU32 (0.70f));
+
+  const float mw = label_w (app, "MUTE ALERTS", 9.2f) + du (16.0f);
+  const float dw = label_w (app, "DISMISS", 9.2f) + du (16.0f);
+  float rx = at.x + width - du (10.0f) - dw;
+  ImGui::SetCursorScreenPos (ImVec2 (rx, cy - h / 2));
+  if (deck_button (app, "cf_dis", "DISMISS", ImVec2 (dw, h), 0xFFFFFF, Btn::Ghost))
+    app.connect_fail_dismissed_gen = app.connect_fail_gen;
+  rx -= mw;
+  ImGui::SetCursorScreenPos (ImVec2 (rx, cy - h / 2));
+  if (deck_button (app, "cf_mute", app.cfg.alerts_muted ? "ALERTS MUTED" : "MUTE ALERTS", ImVec2 (mw, h), 0xFFFFFF,
+                   Btn::Ghost))
+    app.cfg.alerts_muted = !app.cfg.alerts_muted;
+
+  ImGui::SetCursorScreenPos (at);
+  ImGui::Dummy (ImVec2 (width, h));
+  return h;
+}
+
 // Amber bar between the deck and the body: a feed is connected but has stopped
 // delivering. Returns the height it consumed, so the body below can be sized.
 static float
@@ -4387,11 +4963,12 @@ ui_alert (App & app, float width)
 
   if (worst < 0) {
     // Everything recovered: clear the dismissal so a fresh stall re-raises,
-    // and re-arm the cue for the next episode.
+    // and re-arm the cue for the next episode. The slot then belongs to the
+    // quieter of the two alerts, a connect failure.
     app.alert_dismissed = false;
     app.alert_dismissed_feed = -1;
     app.alert_rang_at = 0.0;
-    return 0.0f;
+    return ui_connect_fail_alert (app, width);
   }
 
   // One cue per stall episode — armed by the recovery above, so a feed that
@@ -4570,11 +5147,36 @@ ui_footer (App & app, float width)
 // (deregister, stop recordings, disconnect) runs as if the window was closed.
 static volatile sig_atomic_t g_quit = 0;
 
+#if !defined(_WIN32)
 static void
 on_signal (int)
 {
   g_quit = 1; // async-signal-safe: set a flag, nothing else
 }
+#endif
+
+#if defined(_WIN32)
+// The console equivalent, and it covers rather more than Ctrl-C: closing the
+// console window and logging off arrive here too. Windows gives the handler a
+// few seconds before killing the process, which is enough for the shutdown
+// below — but it runs on its own thread, so it must only set the flag and wait
+// for the render loop to finish rather than tearing anything down here.
+static BOOL WINAPI
+on_console_ctrl (DWORD type)
+{
+  switch (type) {
+  case CTRL_C_EVENT:
+  case CTRL_BREAK_EVENT:
+  case CTRL_CLOSE_EVENT:
+  case CTRL_LOGOFF_EVENT:
+  case CTRL_SHUTDOWN_EVENT:
+    g_quit = 1;
+    return TRUE;
+  default:
+    return FALSE;
+  }
+}
+#endif
 
 // Registration requires a handle built by pulse_new_with_internal_sso_handling()
 // on macOS/Linux — plain pulse_new() fails with "missing sso callbacks" even for
@@ -4586,6 +5188,19 @@ on_sso_select (PulseSSOProviderList *, void *)
 {
   return -1;
 }
+
+#if defined(_WIN32)
+// Completing an SSO login means opening the IdP URL in a browser and receiving
+// the token back over a pexip-auth:// deep link — plumbing this demo does not
+// have. Decline, so an SSO-gated registration fails cleanly rather than
+// hanging. Password registration, which is all the wall uses, is unaffected.
+static bool
+on_sso_request (PulseSSOProviderRequest *, PulseSSOProviderSetToken *, void *)
+{
+  std::fprintf (stderr, "[uavwall] SSO login is not supported on Windows\n");
+  return false;
+}
+#endif
 
 int
 main (int argc, char ** argv)
@@ -4647,15 +5262,24 @@ main (int argc, char ** argv)
   // Resolved once, for both normal and bench starts.
   find_ffmpeg ();
 
+#if defined(_WIN32)
+  SetConsoleCtrlHandler (on_console_ctrl, TRUE);
+#else
   signal (SIGINT, on_signal);
   signal (SIGTERM, on_signal);
+#endif
 
   g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
   g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
 
   // Created before any feed instance and freed last: this is both the
   // conference instance and the one that keeps Pulse's global state alive.
-#if defined(HOST_WINDOWS)
+#if defined(_WIN32)
+  // The Windows Pulse build does not export the internal-SSO constructor at
+  // all; pulse.h's recipe there is pulse_new() plus explicit SSO callbacks,
+  // set immediately below. (This guard previously named HOST_WINDOWS, which
+  // only pexninja's CMakeLists ever defines — so on Windows it took the macOS
+  // branch and failed to link.)
   app.conf = pulse_new ();
 #else
   app.conf = pulse_new_with_internal_sso_handling (argc, (const char **) argv, on_sso_select, &app);
@@ -4664,6 +5288,20 @@ main (int argc, char ** argv)
     std::fprintf (stderr, "[uavwall] pulse_new() failed — cannot continue\n");
     return 1;
   }
+#if defined(_WIN32)
+  // These hooks must exist for pulse_register to work at all on Windows, even
+  // for plain password registration — the same requirement the internal-SSO
+  // constructor satisfies on macOS and Linux.
+  {
+    PulseSSOProviderCallbackConfig sso_cb{};
+    sso_cb.selection_callback = on_sso_select;
+    sso_cb.selection_callback_user_context = &app;
+    sso_cb.request_callback = on_sso_request;
+    sso_cb.request_callback_user_context = &app;
+    pulse_options_set_sso_provider_callbacks (app.conf, &sso_cb);
+  }
+#endif
+
   pulse_options_set_self_view_window_handle (app.conf, nullptr);
   pulse_options_set_remote_video_window_handle (app.conf, nullptr);
   pulse_options_set_presentation_video_window_handle (app.conf, nullptr);
@@ -4685,7 +5323,25 @@ main (int argc, char ** argv)
   float xscale = 1.0f, yscale = 1.0f;
   glfwGetWindowContentScale (window, &xscale, &yscale);
   theme::scale = app.cfg.ui_scale; // must precede font sizing
-  app.fonts = theme::LoadFonts (io, UAVWALL_ASSET_DIR "/fonts", xscale);
+  // The asset dir is baked in as an absolute source-tree path, which is right
+  // for a dev build but wrong for a copied/packaged binary. Fall back to an
+  // assets/ directory beside the executable, which is how the demo kit ships.
+  std::string asset_dir = UAVWALL_ASSET_DIR;
+#if defined(_WIN32)
+  {
+    std::error_code ec;
+    if (!std::filesystem::is_directory (asset_dir + "/fonts", ec)) {
+      char exe[MAX_PATH];
+      DWORD n = GetModuleFileNameA (nullptr, exe, MAX_PATH);
+      if (n > 0 && n < MAX_PATH) {
+        std::string beside = std::filesystem::path (exe).parent_path ().string () + "\\assets";
+        if (std::filesystem::is_directory (beside + "/fonts", ec))
+          asset_dir = beside;
+      }
+    }
+  }
+#endif
+  app.fonts = theme::LoadFonts (io, (asset_dir + "/fonts").c_str (), xscale);
   theme::Apply ();
 
   ImGui_ImplGlfw_InitForOpenGL (window, true);
@@ -4712,6 +5368,9 @@ main (int argc, char ** argv)
   while (!glfwWindowShouldClose (window) && !g_quit) {
     glfwPollEvents ();
 
+    // Land finished connects before pumping, so a feed adopted this frame
+    // can deliver its first frame this frame.
+    poll_connect_jobs (app);
 
     // Only feeds that are both placed on the canvas and being sent somewhere
     // need a CPU-side copy.
@@ -4928,19 +5587,31 @@ main (int argc, char ** argv)
     if (!any)
       break;
     std::this_thread::sleep_for (std::chrono::milliseconds (100));
-    int st = 0;
-    if (app.canvas_rec.pid > 0 && waitpid (app.canvas_rec.pid, &st, WNOHANG) == app.canvas_rec.pid)
-      app.canvas_rec.pid = -1;
+    reap_if_exited (app.canvas_rec);
     for (Feed & f : app.feeds)
-      if (f.rec.pid > 0 && waitpid (f.rec.pid, &st, WNOHANG) == f.rec.pid)
-        f.rec.pid = -1;
+      reap_if_exited (f.rec);
   }
 
   stop_monitor (app);
   stop_air (app);
   conf_disconnect (app);
   for (Feed & f : app.feeds)
-    stop_feed (f);
+    stop_feed (f); // disowns any connect still in flight into the orphan list
+
+  // A blocking connect cannot be cancelled, so give the in-flight calls a
+  // bounded window to return and free what they built. Past that, detach: a
+  // connect wedged in a TCP timeout to an unreachable host must not hold the
+  // window open. Each worker's own shared_ptr keeps its job alive.
+  for (int waited = 0; waited < 100 && !g_orphan_connects.empty (); waited++) {
+    reap_orphan_connects ();
+    if (g_orphan_connects.empty ())
+      break;
+    std::this_thread::sleep_for (std::chrono::milliseconds (100));
+  }
+  const bool connects_leaked = !g_orphan_connects.empty ();
+  for (auto & job : g_orphan_connects)
+    job->thread.detach ();
+
   if (app.conf) {
     // Drop the registration so the registrar releases the alias immediately
     // rather than waiting for it to expire. Blocking on purpose.
@@ -4948,7 +5619,19 @@ main (int argc, char ** argv)
       pulse_deregister (app.conf, nullptr);
     pulse_options_set_registration_state_callback (app.conf, nullptr);
     pulse_options_set_conference_state_callback (app.conf, nullptr);
-    pulse_free (app.conf); // last one out
+#if defined(_WIN32)
+    // Only Windows registers these explicitly (see pulse_new above), and
+    // pulse_free refuses to release the handle while any callback is still
+    // registered — it logs and leaks rather than freeing.
+    pulse_options_set_sso_provider_callbacks (app.conf, nullptr);
+#endif
+    if (connects_leaked) {
+      // A detached worker is still inside pulse_rtsp_session_connect_input();
+      // freeing the last instance would tear down global media state under
+      // it. The process is exiting — leave both to the OS.
+    } else {
+      pulse_free (app.conf); // last one out
+    }
     app.conf = nullptr;
   }
 

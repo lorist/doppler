@@ -60,9 +60,32 @@ cmake --build build -j --target uavwall
 ./build/run-uavwall.sh
 ```
 
+On Windows, build with MSVC from a developer prompt (`vcvars64.bat`) — the Pulse
+runtime comes from the in-repo NuGet automatically:
+
+```bat
+cmake -S . -B build-win -G Ninja
+cmake --build build-win --target uavwall
+build-win\run-uavwall.bat
+```
+
 Linux should build as-is (the SDK is x86-64 only, and the incoming-call and
-feed-loss sounds are silent there); Windows needs the recording layer ported off
-POSIX. [`docs/porting.md`](../../docs/porting.md) has the detail.
+feed-loss sounds are silent there). [`docs/porting.md`](../../docs/porting.md)
+has the detail on all three, including what differs on Windows: **LISTEN needs
+`ffplay`** rather than `ffmpeg`, and canvas recording encodes in software.
+
+### Windows demo kit
+
+[`make-demo-kit.ps1`](make-demo-kit.ps1) stages the whole rig — the app, the
+Pulse runtime, ffmpeg/ffplay, mediamtx, and looping demo clips prepared from
+up to four MP4s in `sample_videos/` — into one portable folder with a
+`start-demo.bat` that brings everything up and tears it down when the wall
+window closes. Copy the folder (or the `-Zip` archive) to any Windows 11 x64
+box; the target machine needs nothing installed. Clips are transcoded to
+Constrained Baseline once at kit-build time, both so publishing is a ~0% CPU
+stream-copy and because of the High-profile decode issue in
+[`docs/porting.md`](../../docs/porting.md). Registration credentials are
+deliberately not shipped; set them in Settings on the target machine.
 
 ## Test feeds
 
