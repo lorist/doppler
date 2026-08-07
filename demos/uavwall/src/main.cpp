@@ -73,6 +73,7 @@
 #include <fstream>
 #include <condition_variable>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <sstream>
@@ -352,6 +353,27 @@ struct RgbaImage
   std::vector<unsigned char> px;
 };
 
+// A feed connect in flight. pulse_rtsp_session_connect_input() blocks until
+// the SDP is fully negotiated — seconds per feed, longer when the source has
+// to be spun up on demand — so it runs on a worker thread: the UI keeps
+// drawing, and N feeds connect in parallel rather than serially. The job owns
+// everything it builds until poll_connect_jobs() adopts it into the feed;
+// inputs are copied in up front so a Settings save mid-flight changes nothing.
+struct ConnectJob
+{
+  std::string url;
+  bool tcp = true;
+  int latency_ms = 200;
+
+  Pulse * pulse = nullptr; // non-null on success once done
+  PulseRtspSessionID session = 0;
+  bool output_open = false;
+  std::string error;
+
+  std::atomic<bool> done{false};
+  std::thread thread;
+};
+
 struct Feed
 {
   std::string name;
@@ -361,6 +383,7 @@ struct Feed
   PulseRtspSessionID session = 0;
   bool connected = false;      // RTSP session established
   bool output_open = false;    // data-session output opened (see stop_feed)
+  std::shared_ptr<ConnectJob> connecting; // in-flight async connect, or null
   std::string error;
 
   GLuint texture = 0;
@@ -549,6 +572,14 @@ struct App
   bool alert_dismissed = false;
   int alert_dismissed_feed = -1;
   double alert_rang_at = 0.0;
+
+  // Connect-failure alert. A failed async connect lands seconds after the
+  // click that started it, possibly while the operator is looking elsewhere.
+  // Generation counters rather than flags: each new failure re-raises the bar
+  // past an old dismissal.
+  int connect_fail_gen = 0;
+  int connect_fail_dismissed_gen = 0;
+  int connect_fail_rang_gen = 0;
 
   // Long-press to store a layout preset: which slot, and since when.
   int preset_held = -1;
@@ -816,56 +847,119 @@ static void stop_feed (Feed & f);
 static bool g_cfg_rtsp_tcp = true;
 static int g_cfg_rtsp_latency_ms = 200;
 
+// The worker half of start_feed: every Pulse call for one feed's connect, on
+// its own thread. No GL in here — the texture is created at adoption, on the
+// GL thread. On failure the job frees what it made and carries only the error.
+static void
+connect_job_run (std::shared_ptr<ConnectJob> job)
+{
+  {
+    // Serialise instance creation only: the first pulse_new() initialises
+    // global media state, and racing N of them on first use is not a bet
+    // worth taking. The blocking connect below runs unserialised.
+    static std::mutex new_mutex;
+    std::lock_guard<std::mutex> lock (new_mutex);
+    job->pulse = pulse_new ();
+  }
+  if (!job->pulse) {
+    job->error = "pulse_new() failed";
+    job->done = true;
+    return;
+  }
+  pulse_options_set_self_view_window_handle (job->pulse, nullptr);
+  pulse_options_set_remote_video_window_handle (job->pulse, nullptr);
+  pulse_options_set_presentation_video_window_handle (job->pulse, nullptr);
+  pulse_options_set_application_user_agent_string (job->pulse, "uavwall/0.1");
+
+  PulseRtspInputConfig cfg{};
+  cfg.location = job->url.c_str ();
+  cfg.transport = job->tcp ? PULSE_RTSP_TRANSPORT_TCP : PULSE_RTSP_TRANSPORT_UDP;
+  cfg.latency_ms = (uint32_t) job->latency_ms;
+
+  PulseRtspSessionID session = 0;
+  PulseError err = pulse_rtsp_session_connect_input (job->pulse, &cfg, &session);
+  if (err != PULSE_SUCCESS) {
+    job->error = std::string ("connect: ") + pulse_strerror (err);
+    pulse_free (job->pulse);
+    job->pulse = nullptr;
+    job->done = true;
+    return;
+  }
+  job->session = session;
+
+  err = pulse_rtsp_session_bind_to_content (job->pulse, session, PULSE_MEDIA_CONTENT_MAIN);
+  if (err != PULSE_SUCCESS) {
+    job->error = std::string ("bind: ") + pulse_strerror (err);
+    pulse_rtsp_session_disconnect_input (job->pulse, session);
+    pulse_free (job->pulse);
+    job->pulse = nullptr;
+    job->session = 0;
+    job->done = true;
+    return;
+  }
+
+  PulseDataSessionConfig * dcfg = make_video_output_config ();
+  if (pulse_data_session_connect_output (job->pulse, dcfg, PULSE_MEDIA_CONTENT_SELFVIEW) == PULSE_SUCCESS)
+    job->output_open = true;
+  pulse_data_session_config_free (dcfg);
+
+  job->done = true;
+}
+
+// Free whatever a finished job built, for a job whose feed no longer wants it
+// (disconnected, removed, or the app is quitting). Mirrors stop_feed, minus
+// the GL state a never-adopted connect does not have.
+static void
+connect_job_discard (ConnectJob & job)
+{
+  if (!job.pulse)
+    return;
+  if (job.output_open)
+    pulse_data_session_disconnect (job.pulse, PULSE_MEDIA_VIDEO, PULSE_MEDIA_OUTPUT, PULSE_MEDIA_CONTENT_SELFVIEW);
+  if (job.session != 0)
+    pulse_rtsp_session_disconnect_input (job.pulse, job.session);
+  pulse_free (job.pulse);
+  job.pulse = nullptr;
+}
+
+// Connects whose feed stopped wanting them mid-flight (disconnect, remove,
+// quit). The blocking call cannot be cancelled, so the job runs to completion
+// here and is torn down when it lands.
+static std::vector<std::shared_ptr<ConnectJob>> g_orphan_connects;
+
+static void
+reap_orphan_connects ()
+{
+  for (size_t i = 0; i < g_orphan_connects.size ();) {
+    ConnectJob & job = *g_orphan_connects[i];
+    if (!job.done.load ()) {
+      i++;
+      continue;
+    }
+    if (job.thread.joinable ())
+      job.thread.join ();
+    connect_job_discard (job);
+    g_orphan_connects.erase (g_orphan_connects.begin () + (long) i);
+  }
+}
+
 // RTSP in, self-view out — the uniform local-source recipe from videowall.
+// pulse_rtsp_session_connect_input() blocks until the SDP is negotiated —
+// seconds per feed — so this only launches the worker; the feed shows as
+// connecting until poll_connect_jobs() adopts the result.
 static void
 start_feed (Feed & f)
 {
-  if (f.connected)
+  if (f.connected || f.connecting)
     return;
   f.error.clear ();
 
-  f.pulse = pulse_new ();
-  if (!f.pulse) {
-    f.error = "pulse_new() failed";
-    return;
-  }
-  pulse_options_set_self_view_window_handle (f.pulse, nullptr);
-  pulse_options_set_remote_video_window_handle (f.pulse, nullptr);
-  pulse_options_set_presentation_video_window_handle (f.pulse, nullptr);
-  pulse_options_set_application_user_agent_string (f.pulse, "uavwall/0.1");
-
-  PulseRtspInputConfig cfg{};
-  cfg.location = f.url.c_str ();
-  cfg.transport = g_cfg_rtsp_tcp ? PULSE_RTSP_TRANSPORT_TCP : PULSE_RTSP_TRANSPORT_UDP;
-  cfg.latency_ms = (uint32_t) g_cfg_rtsp_latency_ms;
-
-  PulseRtspSessionID session = 0;
-  PulseError err = pulse_rtsp_session_connect_input (f.pulse, &cfg, &session);
-  if (err != PULSE_SUCCESS) {
-    f.error = std::string ("connect: ") + pulse_strerror (err);
-    stop_feed (f);
-    return;
-  }
-  f.session = session;
-
-  err = pulse_rtsp_session_bind_to_content (f.pulse, session, PULSE_MEDIA_CONTENT_MAIN);
-  if (err != PULSE_SUCCESS) {
-    f.error = std::string ("bind: ") + pulse_strerror (err);
-    stop_feed (f);
-    return;
-  }
-
-  glGenTextures (1, &f.texture);
-  glBindTexture (GL_TEXTURE_2D, f.texture);
-  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-
-  PulseDataSessionConfig * dcfg = make_video_output_config ();
-  if (pulse_data_session_connect_output (f.pulse, dcfg, PULSE_MEDIA_CONTENT_SELFVIEW) == PULSE_SUCCESS)
-    f.output_open = true;
-  pulse_data_session_config_free (dcfg);
-
-  f.connected = true;
+  auto job = std::make_shared<ConnectJob> ();
+  job->url = f.url;
+  job->tcp = g_cfg_rtsp_tcp;
+  job->latency_ms = g_cfg_rtsp_latency_ms;
+  f.connecting = job;
+  job->thread = std::thread (connect_job_run, job);
 }
 
 // Safe on a never-started or half-started feed — the output session in
@@ -873,6 +967,11 @@ start_feed (Feed & f)
 static void
 stop_feed (Feed & f)
 {
+  // A connect still in flight cannot be cancelled — disown it and let
+  // reap_orphan_connects() free whatever it ends up building.
+  if (f.connecting)
+    g_orphan_connects.push_back (std::move (f.connecting));
+
   if (!f.pulse) {
     f.connected = false;
     return;
@@ -895,6 +994,40 @@ stop_feed (Feed & f)
   f.frame = RgbaImage{};
   f.tex_w = f.tex_h = 0;
   f.connected = false;
+}
+
+// The UI thread's half of start_feed, once per frame: adopt finished connects
+// into their feeds. The GL texture is created here because it needs the GL
+// context, and connected_at is stamped here so UPTIME starts when frames can
+// actually begin to arrive.
+static void
+poll_connect_jobs (App & app)
+{
+  for (Feed & f : app.feeds) {
+    if (!f.connecting || !f.connecting->done.load ())
+      continue;
+    std::shared_ptr<ConnectJob> job = std::move (f.connecting);
+    if (job->thread.joinable ())
+      job->thread.join ();
+
+    if (!job->pulse) {
+      f.error = job->error;
+      app.connect_fail_gen++; // each new failure re-raises the alert bar
+      continue;
+    }
+    f.pulse = job->pulse;
+    f.session = job->session;
+    f.output_open = job->output_open;
+
+    glGenTextures (1, &f.texture);
+    glBindTexture (GL_TEXTURE_2D, f.texture);
+    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+
+    f.connected = true;
+    f.connected_at = ImGui::GetTime ();
+  }
+  reap_orphan_connects ();
 }
 
 static void
@@ -2786,9 +2919,14 @@ ui_inspector (App & app, ImVec2 at, float w)
   float y = at.y + pad;
   draw_label (app, dl, ImVec2 (at.x + pad, y), "INSPECTOR", theme::WhiteU32 (theme::TextLabel));
 
-  const char * state = stalled ? "STALLED" : feed_live (f) ? "LIVE" : "OFFLINE";
-  ImU32 state_col = stalled ? theme::HexU32 (theme::StatusWarn)
-                            : feed_live (f) ? theme::HexU32 (theme::StatusOnline) : theme::WhiteU32 (0.35f);
+  const char * state = stalled         ? "STALLED"
+                       : feed_live (f) ? "LIVE"
+                       : f.connecting  ? "CONNECTING"
+                                       : "OFFLINE";
+  ImU32 state_col = stalled         ? theme::HexU32 (theme::StatusWarn)
+                    : feed_live (f) ? theme::HexU32 (theme::StatusOnline)
+                    : f.connecting  ? theme::HexU32 (theme::AccentPrimary)
+                                    : theme::WhiteU32 (0.35f);
   dl->AddText (app.fonts.label, theme::fs (8.3f),
                ImVec2 (p1.x - pad - label_w (app, state, 8.3f), y), state_col, state);
   y += du (14.0f);
@@ -2886,13 +3024,13 @@ ui_inspector (App & app, ImVec2 at, float w)
       start_monitor (app, app.inspect_feed);
   }
   ImGui::SetCursorScreenPos (ImVec2 (at.x + pad, row2));
-  if (deck_button (app, "insp_rc", "RECONNECT", ImVec2 (bw, bh), theme::AccentPrimary, Btn::Fill)) {
+  // Disabled while a connect is in flight: another click would only disown
+  // the running attempt and start a second one.
+  if (deck_button (app, "insp_rc", "RECONNECT", ImVec2 (bw, bh), theme::AccentPrimary, Btn::Fill, !f.connecting)) {
     if (app.monitor_feed == app.inspect_feed)
       stop_monitor (app); // the instance is about to be torn down
     stop_feed (f);
     start_feed (f);
-    if (f.connected)
-      f.connected_at = ImGui::GetTime ();
   }
   ImGui::SetCursorScreenPos (ImVec2 (at.x + pad + bw + gapb, row2));
   if (deck_button (app, "insp_rm", "REMOVE", ImVec2 (bw, bh), 0xFFFFFF, Btn::Outline)) {
@@ -3036,7 +3174,7 @@ ui_feed_rail (App & app, float w, float h)
         dl->AddLine (ImVec2 (t0.x, y), ImVec2 (t0.x, std::min (y + dash, t1.y)), theme::WhiteU32 (0.16f), 1.0f);
         dl->AddLine (ImVec2 (t1.x, y), ImVec2 (t1.x, std::min (y + dash, t1.y)), theme::WhiteU32 (0.16f), 1.0f);
       }
-      const char * msg = f.connected ? "waiting…" : "OFFLINE";
+      const char * msg = f.connecting ? "connecting…" : f.connected ? "waiting…" : "OFFLINE";
       float tw = label_w (app, msg, 8.3f);
       dl->AddText (app.fonts.label, theme::fs (8.3f),
                    ImVec2 ((t0.x + t1.x - tw) / 2, (t0.y + t1.y) / 2 - theme::fs (4.0f)), theme::WhiteU32 (0.35f),
@@ -3049,10 +3187,13 @@ ui_feed_rail (App & app, float w, float h)
     const float my = t1.y + du (3.0f);
     ImVec2 m0 (t0.x, my + (meta_h - du (5.0f)) / 2);
     // A square marker, not a dot: it reads as an indicator rather than a bullet.
+    // A connecting marker breathes — activity, not yet a state.
     dl->AddRectFilled (m0, ImVec2 (m0.x + du (5.0f), m0.y + du (5.0f)),
-                       live      ? theme::HexU32 (theme::StatusOnline)
-                       : stalled ? theme::HexU32 (theme::StatusWarn)
-                                 : theme::WhiteU32 (0.25f));
+                       live           ? theme::HexU32 (theme::StatusOnline)
+                       : stalled      ? theme::HexU32 (theme::StatusWarn)
+                       : f.connecting ? theme::HexU32 (theme::AccentPrimary,
+                                                       0.55f + 0.30f * (float) std::sin (ImGui::GetTime () * 5.0))
+                                      : theme::WhiteU32 (0.25f));
 
     char meta[96];
     if (f.connected && f.tex_w > 0) {
@@ -3065,6 +3206,8 @@ ui_feed_rail (App & app, float w, float h)
     }
     else if (f.connected)
       snprintf (meta, sizeof (meta), "no frames yet");
+    else if (f.connecting)
+      snprintf (meta, sizeof (meta), "connecting…");
     else if (!f.error.empty ())
       snprintf (meta, sizeof (meta), "error");
     else
@@ -3072,7 +3215,8 @@ ui_feed_rail (App & app, float w, float h)
     draw_mono (app, dl, ImVec2 (m0.x + du (5.0f) + du (5.0f), my + du (1.0f)), meta,
                f.error.empty () ? theme::WhiteU32 (0.55f) : theme::HexU32 (theme::StatusError, 0.75f), 9.2f);
 
-    if (toggle_switch (app, "sw", f.connected, ImVec2 (t1.x - du (22.0f), my + (meta_h - du (12.0f)) / 2)))
+    if (toggle_switch (app, "sw", f.connected || f.connecting != nullptr,
+                       ImVec2 (t1.x - du (22.0f), my + (meta_h - du (12.0f)) / 2)))
       toggle_feed = i;
     // Recording is independent of the wall: ffmpeg opens the URL itself, so a
     // feed can be captured whether or not it is connected here or on canvas.
@@ -3135,7 +3279,7 @@ ui_feed_rail (App & app, float w, float h)
   // after the loop rather than under the iteration.
   if (toggle_feed >= 0) {
     Feed & f = app.feeds[(size_t) toggle_feed];
-    if (f.connected) {
+    if (f.connected || f.connecting) { // toggling mid-connect abandons the attempt
       if (app.monitor_feed == toggle_feed)
         stop_monitor (app); // its Pulse instance is about to be freed
       stop_feed (f);
@@ -3143,8 +3287,6 @@ ui_feed_rail (App & app, float w, float h)
       app.fullscreen_feed = -1;
     } else {
       start_feed (f);
-      if (f.connected)
-        f.connected_at = ImGui::GetTime ();
     }
   }
 
@@ -3625,14 +3767,17 @@ ui_settings (App & app)
         f.url = ubuf;
 
       const float sx = r0.x + col_name + col_url + du (16.0f);
-      if (toggle_switch (app, "fsw", f.connected, ImVec2 (sx, r0.y + du (7.0f)), 26.0f, 14.0f))
+      if (toggle_switch (app, "fsw", f.connected || f.connecting != nullptr, ImVec2 (sx, r0.y + du (7.0f)), 26.0f,
+                         14.0f))
         toggle = i;
-      const char * st = feed_stalled (f)  ? "STALLED"
-                        : feed_live (f)   ? "LIVE"
+      const char * st = feed_stalled (f)    ? "STALLED"
+                        : feed_live (f)     ? "LIVE"
+                        : f.connecting      ? "CONNECTING"
                         : !f.error.empty () ? "ERROR"
                                             : "OFF";
       ImU32 sc = feed_stalled (f)     ? theme::HexU32 (theme::StatusWarn)
                  : feed_live (f)      ? theme::HexU32 (theme::StatusOnline)
+                 : f.connecting       ? theme::HexU32 (theme::AccentPrimary)
                  : !f.error.empty () ? theme::HexU32 (theme::StatusError)
                                      : theme::WhiteU32 (0.35f);
       rdl->AddText (app.fonts.label, theme::fs (8.3f), ImVec2 (sx + du (32.0f), r0.y + du (9.0f)), sc, st);
@@ -3645,14 +3790,12 @@ ui_settings (App & app)
 
     if (toggle >= 0) {
       Feed & f = app.feeds[(size_t) toggle];
-      if (f.connected) {
+      if (f.connected || f.connecting) {
         stop_feed (f);
         remove_feed_tiles (app, toggle);
         app.fullscreen_feed = -1;
       } else {
         start_feed (f);
-        if (f.connected)
-          f.connected_at = ImGui::GetTime ();
       }
     }
 
@@ -4077,9 +4220,7 @@ ui_feed_error (App & app, ImVec2 win_size)
   ImVec2 base = ImGui::GetCursorScreenPos ();
   if (deck_button (app, "fe_retry", "RETRY", ImVec2 (rw, bh), theme::AccentPrimary, Btn::Fill)) {
     stop_feed (f);
-    start_feed (f);
-    if (f.connected)
-      f.connected_at = ImGui::GetTime ();
+    start_feed (f); // clears f.error, which closes this window until the retry lands
   }
   ImGui::SetCursorScreenPos (ImVec2 (base.x + rw + du (8.0f), base.y));
   if (deck_button (app, "fe_udp", swlabel, ImVec2 (sw, bh), 0xFFFFFF, Btn::Outline)) {
@@ -4088,8 +4229,6 @@ ui_feed_error (App & app, ImVec2 win_size)
     g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
     stop_feed (f);
     start_feed (f);
-    if (f.connected)
-      f.connected_at = ImGui::GetTime ();
   }
   ImGui::SetCursorScreenPos (ImVec2 (base.x, base.y + bh));
 
@@ -4663,32 +4802,36 @@ ui_deck (App & app, float width, char * vmr_buf, size_t vmr_sz, char * pin_buf, 
   // ---- SOURCES ------------------------------------------------------------
   group_label ("SOURCES");
   {
-    int live = 0;
+    int live = 0, connecting = 0;
     bool any_off = false;
     for (const Feed & f : app.feeds) {
       if (f.connected)
         live++;
+      else if (f.connecting)
+        connecting++;
       else
         any_off = true;
     }
 
-    const char * lbl = any_off ? "CONNECT ALL" : "DISCONNECT ALL";
+    // While a batch is in flight the button is a status, not a control — the
+    // tally beside it counts the feeds up as they land.
+    const char * lbl = connecting > 0 ? "CONNECTING…" : any_off ? "CONNECT ALL" : "DISCONNECT ALL";
     const float bw = label_w (app, lbl, 9.5f) + du (12.0f) * 2;
     ImGui::SetCursorScreenPos (ImVec2 (x, ctrl_y));
     // Constructive gets a fill, destructive only an outline — the quieter of
     // the two is the one that throws work away.
-    if (deck_button (app, "connall", lbl, ImVec2 (bw, ch), any_off ? theme::StatusOnline : theme::StatusError,
-                     any_off ? Btn::Tinted : Btn::Outline)) {
+    if (deck_button (app, "connall", lbl, ImVec2 (bw, ch),
+                     connecting > 0 ? theme::AccentPrimary
+                     : any_off      ? theme::StatusOnline
+                                    : theme::StatusError,
+                     connecting > 0 || any_off ? Btn::Tinted : Btn::Outline, connecting == 0)) {
       if (!any_off)
         stop_monitor (app); // every instance is about to be freed
       for (Feed & f : app.feeds) {
-        if (any_off) {
+        if (any_off)
           start_feed (f);
-          if (f.connected)
-            f.connected_at = ImGui::GetTime ();
-        } else {
+        else
           stop_feed (f);
-        }
       }
       if (!any_off) {
         app.tiles.clear ();
@@ -4725,6 +4868,79 @@ ui_deck (App & app, float width, char * vmr_buf, size_t vmr_sz, char * pin_buf, 
   ImGui::Dummy (ImVec2 (width, h));
 }
 
+// Red sibling of the feed-loss bar: an async connect failed, seconds after
+// the click that started it and possibly while the operator was looking
+// elsewhere. Same shape and position as the stall bar, so failure and loss
+// read as one alerting system.
+static float
+ui_connect_fail_alert (App & app, float width)
+{
+  int nerr = 0, first = -1;
+  for (int i = 0; i < (int) app.feeds.size (); i++) {
+    if (app.feeds[(size_t) i].error.empty ())
+      continue;
+    nerr++;
+    if (first < 0)
+      first = i;
+  }
+  if (nerr == 0) {
+    // Every failure retried, reconnected or removed: fold the counters
+    // together so the next failure is a fresh episode.
+    app.connect_fail_dismissed_gen = app.connect_fail_gen;
+    app.connect_fail_rang_gen = app.connect_fail_gen;
+    return 0.0f;
+  }
+
+  // One cue per failure generation — a new failure rings even if an earlier
+  // bar was dismissed.
+  if (!app.cfg.alerts_muted && app.connect_fail_rang_gen != app.connect_fail_gen) {
+    play_ring ();
+    app.connect_fail_rang_gen = app.connect_fail_gen;
+  }
+  if (app.connect_fail_dismissed_gen == app.connect_fail_gen)
+    return 0.0f;
+
+  const float h = du (27.0f);
+  ImVec2 at = ImGui::GetCursorScreenPos ();
+  ImDrawList * dl = ImGui::GetWindowDrawList ();
+  ImVec2 p1 (at.x + width, at.y + h);
+  dl->AddRectFilled (at, p1, theme::HexU32 (theme::StatusError, 0.13f), du (theme::RadiusControl2));
+  dl->AddRect (at, p1, theme::HexU32 (theme::StatusError, 0.40f), du (theme::RadiusControl2), 0, 1.0f);
+
+  const float cy = at.y + h / 2;
+  float x = at.x + du (10.0f);
+  dl->AddCircleFilled (ImVec2 (x + du (3.5f), cy), du (3.5f), theme::HexU32 (theme::StatusError));
+  x += du (7.0f) + du (8.0f);
+  dl->AddText (app.fonts.label, theme::fs (9.5f), ImVec2 (x, cy - theme::fs (9.5f) / 2 - du (1.0f)),
+               theme::HexU32 (theme::StatusError), "CONNECT FAILED");
+  x += label_w (app, "CONNECT FAILED", 9.5f) + du (8.0f);
+
+  char msg[256];
+  const Feed & ff = app.feeds[(size_t) first];
+  if (nerr > 1)
+    snprintf (msg, sizeof (msg), "%s — %s  and %d other%s", ff.name.c_str (), ff.error.c_str (), nerr - 1,
+              nerr == 2 ? "" : "s");
+  else
+    snprintf (msg, sizeof (msg), "%s — %s", ff.name.c_str (), ff.error.c_str ());
+  draw_mono (app, dl, ImVec2 (x, cy - theme::fs (10.5f) / 2), msg, theme::WhiteU32 (0.70f));
+
+  const float mw = label_w (app, "MUTE ALERTS", 9.2f) + du (16.0f);
+  const float dw = label_w (app, "DISMISS", 9.2f) + du (16.0f);
+  float rx = at.x + width - du (10.0f) - dw;
+  ImGui::SetCursorScreenPos (ImVec2 (rx, cy - h / 2));
+  if (deck_button (app, "cf_dis", "DISMISS", ImVec2 (dw, h), 0xFFFFFF, Btn::Ghost))
+    app.connect_fail_dismissed_gen = app.connect_fail_gen;
+  rx -= mw;
+  ImGui::SetCursorScreenPos (ImVec2 (rx, cy - h / 2));
+  if (deck_button (app, "cf_mute", app.cfg.alerts_muted ? "ALERTS MUTED" : "MUTE ALERTS", ImVec2 (mw, h), 0xFFFFFF,
+                   Btn::Ghost))
+    app.cfg.alerts_muted = !app.cfg.alerts_muted;
+
+  ImGui::SetCursorScreenPos (at);
+  ImGui::Dummy (ImVec2 (width, h));
+  return h;
+}
+
 // Amber bar between the deck and the body: a feed is connected but has stopped
 // delivering. Returns the height it consumed, so the body below can be sized.
 static float
@@ -4747,11 +4963,12 @@ ui_alert (App & app, float width)
 
   if (worst < 0) {
     // Everything recovered: clear the dismissal so a fresh stall re-raises,
-    // and re-arm the cue for the next episode.
+    // and re-arm the cue for the next episode. The slot then belongs to the
+    // quieter of the two alerts, a connect failure.
     app.alert_dismissed = false;
     app.alert_dismissed_feed = -1;
     app.alert_rang_at = 0.0;
-    return 0.0f;
+    return ui_connect_fail_alert (app, width);
   }
 
   // One cue per stall episode — armed by the recovery above, so a feed that
@@ -5151,6 +5368,9 @@ main (int argc, char ** argv)
   while (!glfwWindowShouldClose (window) && !g_quit) {
     glfwPollEvents ();
 
+    // Land finished connects before pumping, so a feed adopted this frame
+    // can deliver its first frame this frame.
+    poll_connect_jobs (app);
 
     // Only feeds that are both placed on the canvas and being sent somewhere
     // need a CPU-side copy.
@@ -5376,7 +5596,22 @@ main (int argc, char ** argv)
   stop_air (app);
   conf_disconnect (app);
   for (Feed & f : app.feeds)
-    stop_feed (f);
+    stop_feed (f); // disowns any connect still in flight into the orphan list
+
+  // A blocking connect cannot be cancelled, so give the in-flight calls a
+  // bounded window to return and free what they built. Past that, detach: a
+  // connect wedged in a TCP timeout to an unreachable host must not hold the
+  // window open. Each worker's own shared_ptr keeps its job alive.
+  for (int waited = 0; waited < 100 && !g_orphan_connects.empty (); waited++) {
+    reap_orphan_connects ();
+    if (g_orphan_connects.empty ())
+      break;
+    std::this_thread::sleep_for (std::chrono::milliseconds (100));
+  }
+  const bool connects_leaked = !g_orphan_connects.empty ();
+  for (auto & job : g_orphan_connects)
+    job->thread.detach ();
+
   if (app.conf) {
     // Drop the registration so the registrar releases the alias immediately
     // rather than waiting for it to expire. Blocking on purpose.
@@ -5390,7 +5625,13 @@ main (int argc, char ** argv)
     // registered — it logs and leaks rather than freeing.
     pulse_options_set_sso_provider_callbacks (app.conf, nullptr);
 #endif
-    pulse_free (app.conf); // last one out
+    if (connects_leaked) {
+      // A detached worker is still inside pulse_rtsp_session_connect_input();
+      // freeing the last instance would tear down global media state under
+      // it. The process is exiting — leave both to the OS.
+    } else {
+      pulse_free (app.conf); // last one out
+    }
     app.conf = nullptr;
   }
 
