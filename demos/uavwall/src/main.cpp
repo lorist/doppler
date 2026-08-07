@@ -106,7 +106,9 @@
 // ----------------------------------------------------------------------------
 
 #if defined(_WIN32)
-using ProcHandle = intptr_t; // a HANDLE, kept in a pid-shaped slot
+// A HANDLE kept in a pid-shaped slot. Not named ProcHandle: MacTypes.h
+// claims that name, and AudioToolbox drags it in on macOS.
+using ChildProc = intptr_t;
 static inline ptrdiff_t
 pio_read (int fd, void * buf, size_t n)
 {
@@ -163,7 +165,7 @@ win_cmdline (const std::vector<std::string> & args)
   return cmd;
 }
 #else
-using ProcHandle = pid_t;
+using ChildProc = pid_t;
 static inline ptrdiff_t
 pio_read (int fd, void * buf, size_t n)
 {
@@ -255,7 +257,7 @@ struct Config
 
 struct Recorder
 {
-  ProcHandle pid = -1;
+  ChildProc pid = -1;
   int in_fd = -1; // ffmpeg's stdin: "q" for a feed, raw frames for the canvas
   std::string path;
   double started_at = 0.0;
@@ -559,7 +561,7 @@ struct App
 
   // The one feed whose audio is sent into the conference, or -1 for silence.
   int air_feed = -1;
-  ProcHandle air_pid = -1;
+  ChildProc air_pid = -1;
   int air_fd = -1;
   std::thread air_thread;
   std::atomic<bool> air_quit{false};
@@ -1392,7 +1394,7 @@ spawn_recorder (Recorder & r, const std::vector<std::string> & args, bool nonblo
     return false;
   }
 
-  r.pid = (ProcHandle) pi.hProcess;
+  r.pid = (ChildProc) pi.hProcess;
   r.in_fd = fd;
   r.started_at = ImGui::GetTime ();
   r.stopping = false;
@@ -1848,7 +1850,7 @@ start_monitor (App & app, int idx)
 // Spawn a child and keep its *stdout*, the mirror of spawn_recorder which keeps
 // the child's stdin.
 static bool
-spawn_reader (ProcHandle * pid_out, int * fd_out, const std::vector<std::string> & args)
+spawn_reader (ChildProc * pid_out, int * fd_out, const std::vector<std::string> & args)
 {
 #if defined(_WIN32)
   SECURITY_ATTRIBUTES sa{};
@@ -1888,7 +1890,7 @@ spawn_reader (ProcHandle * pid_out, int * fd_out, const std::vector<std::string>
     CloseHandle (pi.hProcess);
     return false;
   }
-  *pid_out = (ProcHandle) pi.hProcess;
+  *pid_out = (ChildProc) pi.hProcess;
   *fd_out = fd;
   return true;
 #else
