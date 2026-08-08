@@ -178,6 +178,29 @@ shows offline in the rail, which costs nothing.
 > explicit Save is not. To keep both, make it a real feed and simply leave it
 > disconnected.
 
+### Using your own video files
+
+**Settings → Feeds → + ADD FILE** points the wall at a clip on disk. No media
+server and no RTSP: Pulse decodes the file directly, and it behaves like any
+other feed — rail card, canvas tile, recording, LISTEN.
+
+The clip is **transcoded once on import** to Constrained Baseline 1080p, the
+same recipe [`scripts/prepare-footage.sh`](../../scripts/prepare-footage.sh)
+uses, and cached against the source's size and modification time so adding it
+again is instant. The footer shows a `PREPARING` cell while that runs.
+
+That step is not optional. Pulse decodes High-profile H.264 badly — macroblocked
+through the video mixer on macOS, around 8fps through the file session — and
+libx264's default, along with every phone, camera and editor, produces High. A
+clip added without preparing looks like a stream with heavy packet loss.
+
+> This is an SDK-level defect rather than something the demo ought to be working
+> around; [`docs/porting.md`](../../docs/porting.md) records the same profile
+> problem on Windows. Worth raising with Pexip.
+
+Without ffmpeg the file is added unprepared and the status line says so, rather
+than failing silently.
+
 ### Real devices pushing in — wearables and body cameras
 
 The generator publishes feeds *to* the wall. Real devices work the other way:

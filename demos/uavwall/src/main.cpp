@@ -413,6 +413,13 @@ struct PcmRing
   }
 };
 
+struct Prepare
+{
+  ChildProc pid = -1;
+  std::string src, dst, name;
+  double started_at = 0.0;
+};
+
 struct RgbaImage
 {
   int w = 0, h = 0;
@@ -627,6 +634,7 @@ struct App
   // downlinks playing at once is noise, not information.
   int monitor_feed = -1;
   Recorder monitor; // an ffmpeg child playing the selected feed's audio
+  std::vector<Prepare> preparing; // clips being transcoded before becoming feeds
 
   // The one feed whose audio is sent into the conference, or -1 for silence.
   int air_feed = -1;
@@ -2183,6 +2191,135 @@ start_air (App & app, int idx)
     }
   });
   set_status (app, "Sending " + f.name + " audio to the VMR");
+}
+
+
+// ----------------------------------------------------------------------------
+//  Preparing an imported clip
+//
+//  Pulse decodes High-profile H.264 badly — macroblocked through the video
+//  mixer on macOS, ~8fps through the file session — and libx264's default, and
+//  every phone, camera and editor, produces High. So a clip an operator picks
+//  is transcoded once to Constrained Baseline before it becomes a feed, with
+//  the same recipe scripts/prepare-footage.sh uses.
+//
+//  The result is cached against the source path and its modification time, so
+//  adding the same file again is instant, and editing it re-prepares.
+// ----------------------------------------------------------------------------
+
+// Where prepared copies live: beside the config, so a bundled app keeps them
+// with its other per-user state rather than next to the operator's originals.
+static std::string
+prepared_dir ()
+{
+  const std::string cfg = config_path ();
+  const std::size_t slash = cfg.find_last_of ('/');
+  const std::string base = slash == std::string::npos ? std::string (".") : cfg.substr (0, slash);
+  return base + "/prepared";
+}
+
+// Cache key: name, size and mtime, so a changed file is not served stale.
+static std::string
+prepared_path_for (const std::string & src)
+{
+  std::error_code ec;
+  const auto sz = std::filesystem::file_size (src, ec);
+  const auto tm = std::filesystem::last_write_time (src, ec);
+  std::string base = std::filesystem::path (src).stem ().string ();
+  for (char & c : base)
+    if (!isalnum ((unsigned char) c))
+      c = '-';
+  char tail[64];
+  snprintf (tail, sizeof (tail), "-%llu-%lld.mp4", (unsigned long long) sz,
+            (long long) tm.time_since_epoch ().count ());
+  return prepared_dir () + "/" + base + tail;
+}
+
+// Kick off a transcode. Returns false if it could not be started, in which case
+// the caller falls back to using the original file as-is.
+static bool
+start_prepare (App & app, const std::string & src, const std::string & name)
+{
+  if (g_ffmpeg.empty ())
+    return false;
+  std::error_code ec;
+  std::filesystem::create_directories (prepared_dir (), ec);
+
+  Prepare pr;
+  pr.src = src;
+  pr.dst = prepared_path_for (src);
+  pr.name = name;
+
+  std::vector<std::string> args = {g_ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+                                   "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,"
+                                          "pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25",
+                                   "-an", "-c:v", "libx264", "-profile:v", "baseline", "-level", "4.0",
+                                   "-preset", "veryfast", "-crf", "23", "-movflags", "+faststart", pr.dst};
+  Recorder tmp; // reuse the spawn helper; its stdin pipe is simply unused here
+  tmp.path = pr.dst;
+  if (!spawn_recorder (tmp, args, false))
+    return false;
+  pr.pid = tmp.pid;
+  pr.started_at = ImGui::GetTime ();
+  if (tmp.in_fd >= 0)
+    pio_close (tmp.in_fd);
+  app.preparing.push_back (pr);
+  set_status (app, "Preparing " + name + "…");
+  return true;
+}
+
+// Add a picked file as a feed, transcoding first unless a prepared copy is
+// already cached.
+static void
+add_file_feed (App & app, const std::string & path)
+{
+  std::string name = std::filesystem::path (path).stem ().string ();
+  for (char & c : name)
+    c = (char) toupper ((unsigned char) c);
+  if (name.empty ())
+    name = "CLIP";
+
+  std::error_code ec;
+  const std::string cached = prepared_path_for (path);
+  if (std::filesystem::exists (cached, ec)) {
+    Feed f;
+    f.name = name;
+    f.url = cached;
+    app.feeds.push_back (std::move (f));
+    set_status (app, "Added " + name);
+    return;
+  }
+  if (!start_prepare (app, path, name)) {
+    // No ffmpeg: use the original and accept whatever Pulse makes of it.
+    Feed f;
+    f.name = name;
+    f.url = path;
+    app.feeds.push_back (std::move (f));
+    set_status (app, "Added " + name + " unprepared — ffmpeg not found");
+  }
+}
+
+// Called every frame; adds the feed once its transcode finishes.
+static void
+poll_prepares (App & app)
+{
+  for (size_t i = 0; i < app.preparing.size ();) {
+    Prepare & pr = app.preparing[i];
+    int st = 0;
+    ChildProc got = waitpid (pr.pid, &st, WNOHANG);
+    if (got != pr.pid && got >= 0) {
+      i++;
+      continue;
+    }
+    std::error_code ec;
+    const bool ok = std::filesystem::exists (pr.dst, ec) && std::filesystem::file_size (pr.dst, ec) > 0;
+    Feed f;
+    f.name = pr.name;
+    f.url = ok ? pr.dst : pr.src; // fall back to the original if it failed
+    app.feeds.push_back (std::move (f));
+    set_status (app, ok ? ("Added " + pr.name) : ("Could not prepare " + pr.name + " — added as-is"));
+    app.preparing.erase (app.preparing.begin () + (long) i);
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -4143,21 +4280,8 @@ ui_settings (App & app)
     g_browse_open = false;
   }
   if (g_browser.showFileDialog ("Choose a video file", imgui_addons::ImGuiFileBrowser::DialogMode::OPEN,
-                                ImVec2 (720, 420), ".mp4,.mov,.m4v,.MP4,.MOV")) {
-    Feed nf;
-    const std::string & path = g_browser.selected_path;
-    std::string base = path.substr (path.find_last_of ('/') + 1);
-    std::size_t dot = base.find_last_of ('.');
-    if (dot != std::string::npos)
-      base = base.substr (0, dot);
-    // Uppercase, so a chosen file reads like the callsigns beside it.
-    for (char & c : base)
-      c = (char) toupper ((unsigned char) c);
-    nf.name = base.empty () ? "CLIP" : base;
-    nf.url = path;
-    app.feeds.push_back (std::move (nf));
-    set_status (app, "Added " + nf.name);
-  }
+                                ImVec2 (720, 420), ".mp4,.mov,.m4v,.MP4,.MOV"))
+    add_file_feed (app, g_browser.selected_path);
 }
 
 // A coloured strip along the top edge of an overlay window — the same tally
@@ -5297,6 +5421,18 @@ ui_footer (App & app, float width)
     }
   }
 
+  // A clip being transcoded before it can become a feed. Shown for the same
+  // reason as REC: the operator asked for something and it has not appeared yet.
+  if (!app.preparing.empty ()) {
+    char v[96];
+    const int secs = (int) (ImGui::GetTime () - app.preparing.front ().started_at);
+    if (app.preparing.size () == 1)
+      snprintf (v, sizeof (v), "%s  %ds", app.preparing.front ().name.c_str (), secs);
+    else
+      snprintf (v, sizeof (v), "%d clips  %ds", (int) app.preparing.size (), secs);
+    cell ("PREPARING", v, theme::HexU32 (theme::StatusWarn, 0.95f));
+  }
+
   // Recording is a state the operator must not lose track of, so it earns a
   // cell of its own — but only while it is happening.
   {
@@ -5631,6 +5767,7 @@ main (int argc, char ** argv)
 
     // Reap finished recorders. Deferred rather than waited on, so stopping a
     // recording never stalls a frame.
+    poll_prepares (app);
     reap_recorder (app.canvas_rec);
     reap_recorder (app.monitor);
     for (Feed & f : app.feeds)
