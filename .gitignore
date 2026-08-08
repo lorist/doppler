@@ -33,6 +33,11 @@ uavwall.conf
 # Demo footage — large binaries, and usually not ours to redistribute
 UAV_footage/
 
+# Clips uavwall transcodes on import, cached beside its config. Derived from
+# whatever the operator browsed to, so never ours to commit — and the same name
+# is used for UAV_footage/prepared, which prepare-footage.sh generates.
+prepared/
+
 # Recordings written by uavwall. The folder is tracked so a fresh checkout has
 # somewhere to write; the captures themselves never are.
 recordings/*
