@@ -11,11 +11,16 @@
 #
 # Optional extras, only needed for features that shell out:
 #
-#     ./demos/uavwall/make-bundle.sh --with-tools
+#     FFMPEG_STATIC=/path/to/static/ffmpeg \
+#       ./demos/uavwall/make-bundle.sh --with-tools
 #
-# copies ffmpeg and mediamtx in as well, enabling recording, LISTEN and the
-# wearable ingest path. Note that Homebrew's ffmpeg links ~58 Homebrew dylibs
-# and is NOT portable — see the warning below.
+# copies ffmpeg and mediamtx in as well. ffmpeg is what prepares an imported
+# clip (Pulse decodes High-profile H.264 badly, so + ADD FILE transcodes first)
+# and what records; mediamtx is only needed for wearables pushing in.
+#
+# Homebrew's ffmpeg links ~58 Homebrew dylibs and is NOT portable, so pass
+# FFMPEG_STATIC pointing at a static build — the script checks what it copied
+# and says which you got.
 #
 # What this does NOT do is sign anything. An unsigned app copied to another Mac
 # is blocked by Gatekeeper, and the recipient has to right-click > Open. For
@@ -70,20 +75,28 @@ install_name_tool -id @rpath/libpexlgpl.dylib \
 
 if [ "$WITH_TOOLS" -eq 1 ]; then
     mkdir -p "$APP/Contents/Resources/tools"
-    for t in ffmpeg ffplay mediamtx; do
+    # ffplay is a Windows-only need (LISTEN uses ffmpeg's audiotoolbox output on
+    # macOS), so it is not copied here.
+    for t in ffmpeg mediamtx; do
         p="$(command -v "$t" 2>/dev/null || true)"
-        [ -n "$p" ] && cp "$p" "$APP/Contents/Resources/tools/" && echo "  bundled $t"
+        [ "$t" = "ffmpeg" ] && [ -n "$FFMPEG_STATIC" ] && p="$FFMPEG_STATIC"
+        [ -n "$p" ] && cp "$p" "$APP/Contents/Resources/tools/" && echo "  bundled $t ($p)"
     done
-    # Homebrew's ffmpeg is dynamically linked against dozens of Homebrew
-    # dylibs, so copying the binary alone produces something that will not run
-    # on a machine without Homebrew. Say so rather than shipping a trap.
-    if [ -n "$(command -v ffmpeg)" ] && \
-       otool -L "$(command -v ffmpeg)" | grep -q "/opt/homebrew\|/usr/local/Cellar"; then
-        echo
-        echo "  WARNING: the bundled ffmpeg links Homebrew libraries and will NOT"
-        echo "           run on a machine without them. For distribution, replace"
-        echo "           Contents/Resources/tools/ffmpeg with a static build"
-        echo "           (e.g. from evermeet.cx)."
+    # A copied ffmpeg is only useful if it is self-contained. Check the one that
+    # actually landed rather than whatever is on PATH.
+    BUNDLED_FF="$APP/Contents/Resources/tools/ffmpeg"
+    if [ -x "$BUNDLED_FF" ]; then
+        NONSYS=$(otool -L "$BUNDLED_FF" | tail -n +2 | grep -cv '/usr/lib/\|/System/' || true)
+        if [ "$NONSYS" -gt 0 ]; then
+            echo
+            echo "  WARNING: the bundled ffmpeg links $NONSYS non-system libraries and"
+            echo "           will NOT run on a machine without them. Re-run with a"
+            echo "           static build, e.g.:"
+            echo "             FFMPEG_STATIC=/path/to/static/ffmpeg \\"
+            echo "               ./demos/uavwall/make-bundle.sh --with-tools"
+        else
+            echo "  ffmpeg is self-contained ($NONSYS non-system libraries)"
+        fi
     fi
 fi
 
