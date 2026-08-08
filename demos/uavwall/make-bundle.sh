@@ -100,6 +100,17 @@ if [ "$WITH_TOOLS" -eq 1 ]; then
     fi
 fi
 
+# Ad-hoc sign, last, after install_name_tool has finished rewriting load
+# commands — every one of those invalidates the signature the linker applied.
+# On Apple silicon an invalid signature is worse than no Developer ID: macOS
+# reports "the app is damaged and can't be opened", which reads as corruption
+# rather than as an unsigned app. This does not avoid the Gatekeeper prompt, but
+# it makes the app launchable and the prompt an ordinary one.
+#
+# Set CODESIGN_ID to a Developer ID Application identity to sign properly
+# instead; notarisation is still a separate step.
+SIGN_ID="${CODESIGN_ID:--}"
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -121,6 +132,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 echo "</plist>" >> "$APP/Contents/Info.plist"
 
+codesign --force --deep --timestamp=none --sign "$SIGN_ID" "$APP" 2>/dev/null \
+    && echo "  signed: $([ "$SIGN_ID" = "-" ] && echo "ad-hoc (unidentified developer)" || echo "$SIGN_ID")" \
+    || echo "  WARNING: codesign failed — the app may not launch"
+
 echo
 echo "Built: $APP"
 du -sh "$APP" | awk '{print "  size: " $1}'
@@ -128,5 +143,11 @@ echo
 echo "  Config:     ~/Library/Application Support/UAV Wall/uavwall.conf"
 echo "  Recordings: ~/Movies/UAV Wall"
 echo
-echo "  Unsigned: on another Mac the recipient must right-click > Open the"
-echo "  first time. Developer ID signing and notarisation remove that."
+if [ "$SIGN_ID" = "-" ]; then
+    echo "  Ad-hoc signed only, so Gatekeeper will reject it on another Mac."
+    echo "  The recipient must: try to open it, then System Settings >"
+    echo "  Privacy & Security > Open Anyway, then open it again."
+    echo
+    echo "  To avoid that entirely: CODESIGN_ID=\"Developer ID Application: ...\""
+    echo "  and notarise the result with notarytool."
+fi
