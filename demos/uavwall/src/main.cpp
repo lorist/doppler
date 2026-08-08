@@ -434,6 +434,7 @@ struct ConnectJob
   Pulse * pulse = nullptr; // non-null on success once done
   PulseRtspSessionID session = 0;
   bool output_open = false;
+  bool failed = false;  // connect failed; the UI thread frees the handle
   bool is_file = false; // a local clip rather than a stream
   PulseVideoMixInputID mix_input = 0; // non-zero when the mixer path was used
   std::string error;
@@ -991,8 +992,7 @@ connect_job_run (std::shared_ptr<ConnectJob> job)
       PulseError merr = pulse_video_mix_input_from_file_with_loop (job->pulse, job->url.c_str (), true, &in_id);
       if (merr != PULSE_SUCCESS) {
         job->error = std::string ("mix input: ") + pulse_strerror (merr);
-        pulse_free (job->pulse);
-        job->pulse = nullptr;
+        job->failed = true;
         job->done = true;
         return;
       }
@@ -1011,8 +1011,7 @@ connect_job_run (std::shared_ptr<ConnectJob> job)
       if (merr != PULSE_SUCCESS) {
         job->error = std::string ("mix connect: ") + pulse_strerror (merr);
         pulse_video_mix_input_release (job->pulse, in_id);
-        pulse_free (job->pulse);
-        job->pulse = nullptr;
+      job->failed = true;
         job->done = true;
         return;
       }
@@ -1022,8 +1021,7 @@ connect_job_run (std::shared_ptr<ConnectJob> job)
                                                           PULSE_MEDIA_CONTENT_MAIN);
       if (ferr != PULSE_SUCCESS) {
         job->error = std::string ("open: ") + pulse_strerror (ferr);
-        pulse_free (job->pulse);
-        job->pulse = nullptr;
+      job->failed = true;
         job->done = true;
         return;
       }
@@ -1040,8 +1038,7 @@ connect_job_run (std::shared_ptr<ConnectJob> job)
     PulseError err = pulse_rtsp_session_connect_input (job->pulse, &cfg, &session);
     if (err != PULSE_SUCCESS) {
       job->error = std::string ("connect: ") + pulse_strerror (err);
-      pulse_free (job->pulse);
-      job->pulse = nullptr;
+      job->failed = true;
       job->done = true;
       return;
     }
@@ -1051,9 +1048,7 @@ connect_job_run (std::shared_ptr<ConnectJob> job)
     if (err != PULSE_SUCCESS) {
       job->error = std::string ("bind: ") + pulse_strerror (err);
       pulse_rtsp_session_disconnect_input (job->pulse, session);
-      pulse_free (job->pulse);
-      job->pulse = nullptr;
-      job->session = 0;
+      job->failed = true;
       job->done = true;
       return;
     }
@@ -1180,9 +1175,14 @@ poll_connect_jobs (App & app)
     if (job->thread.joinable ())
       job->thread.join ();
 
-    if (!job->pulse) {
+    if (job->failed || !job->pulse) {
       f.error = job->error;
       app.connect_fail_gen++; // each new failure re-raises the alert bar
+      // Free here rather than in the worker. Pulse tears its video sink down on
+      // the main dispatch queue, and freeing a half-built instance off-thread
+      // segfaults in _pex_avf_video_sink_set_layer — which is what made every
+      // failed connect (a stopped media server, a wrong URL) crash the app.
+      connect_job_discard (*job);
       continue;
     }
     f.pulse = job->pulse;
