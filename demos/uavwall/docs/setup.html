@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>UAV Wall — setup</title>
+<style>
+  /* A4 portrait, printed by scripts/make-setup-pdf.sh via headless Chrome.
+     Colours match the app so the guide and the thing it describes look related. */
+  @page { size: A4; margin: 0; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { background: #0d1220; }
+  body {
+    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #e8eaf0;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .page {
+    width: 210mm; height: 297mm;
+    padding: 18mm 20mm;
+    position: relative;
+    overflow: hidden;
+    page-break-after: always;
+    background: linear-gradient(135deg, #0d1220 0%, #111827 40%, #0d1a2a 100%);
+  }
+  .page:last-child { page-break-after: auto; }
+
+  .kicker { font-size: 10px; letter-spacing: 2.4px; font-weight: 600;
+            color: #5B6CE8; text-transform: uppercase; margin-bottom: 10px; }
+  h1 { font-size: 34px; font-weight: 600; letter-spacing: -0.5px; }
+  h2 { font-size: 20px; font-weight: 600; margin: 22px 0 10px; }
+  h3 { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: #fff; }
+  p  { font-size: 12.5px; line-height: 1.62; color: rgba(255,255,255,0.72); margin-bottom: 9px; }
+  .lede { font-size: 15px; line-height: 1.55; color: rgba(255,255,255,0.6); margin-top: 14px; }
+
+  ul { list-style: none; margin: 6px 0 10px; }
+  li { font-size: 12.5px; line-height: 1.6; color: rgba(255,255,255,0.72);
+       padding-left: 16px; position: relative; margin-bottom: 6px; }
+  li:before { content: "›"; position: absolute; left: 0; color: #5B6CE8; font-weight: 700; }
+  b { color: #fff; font-weight: 600; }
+  .accent { color: #5B6CE8; font-weight: 600; }
+
+  code, .mono { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; }
+  code { font-size: 11.5px; color: #9fb4ff; }
+  pre { background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.09);
+        border-radius: 7px; padding: 11px 13px; margin: 8px 0 12px;
+        font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+        font-size: 11.5px; line-height: 1.6; color: #cfe0ff; white-space: pre-wrap;
+        word-break: break-all; }
+
+  .steps { counter-reset: s; margin: 8px 0 4px; }
+  .step { counter-increment: s; position: relative; padding-left: 30px; margin-bottom: 13px; }
+  .step:before {
+    content: counter(s); position: absolute; left: 0; top: -1px;
+    width: 21px; height: 21px; border-radius: 11px; background: #5B6CE8;
+    color: #fff; font-size: 11.5px; font-weight: 700; text-align: center; line-height: 21px;
+  }
+  .step p { margin-bottom: 0; }
+
+  .note { border-left: 3px solid #5B6CE8; background: rgba(91,108,232,0.09);
+          border-radius: 0 7px 7px 0; padding: 10px 14px; margin: 10px 0 12px; }
+  .note p { margin-bottom: 0; font-size: 12px; }
+  .warn { border-left-color: #E8A33D; background: rgba(232,163,61,0.09); }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 10px 0; }
+  .card { background: rgba(255,255,255,0.045); border: 1px solid rgba(255,255,255,0.09);
+          border-radius: 9px; padding: 13px 15px; }
+  .card p { font-size: 11.5px; margin-bottom: 0; color: rgba(255,255,255,0.6); }
+
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; }
+  th { text-align: left; font-size: 9.5px; letter-spacing: 1.6px; text-transform: uppercase;
+       color: rgba(255,255,255,0.4); font-weight: 600; padding: 0 12px 8px 0; }
+  td { font-size: 12px; padding: 7px 12px 7px 0; border-top: 1px solid rgba(255,255,255,0.075);
+       color: rgba(255,255,255,0.8); vertical-align: top; }
+  td.k { color: #fff; font-weight: 600; white-space: nowrap; }
+
+  .foot { position: absolute; left: 20mm; right: 20mm; bottom: 12mm;
+          display: flex; justify-content: space-between;
+          font-size: 9.5px; color: rgba(255,255,255,0.28); }
+</style>
+</head>
+<body>
+
+<!-- ─────────────────────────────  1  ───────────────────────────── -->
+<div class="page">
+  <div class="kicker">Pexip · Internal demonstration</div>
+  <h1>UAV Wall — setup</h1>
+  <p class="lede">
+    A wall of live video feeds, composed onto one canvas and sent into a Pexip
+    VMR as a single participant. This guide covers opening it, and installing
+    the optional extras if you want recording, your own video files, or audio.
+  </p>
+
+  <h2>Before you start</h2>
+  <table>
+    <tr><td class="k">Mac</td><td>Apple silicon (M1 or later), macOS 14 or newer. Intel Macs are not supported.</td></tr>
+    <tr><td class="k">To install</td><td><b>Nothing.</b> The app is self-contained. Extras are optional and covered on page 3.</td></tr>
+    <tr><td class="k">For a VMR</td><td>The conference alias and, if it has one, its PIN.</td></tr>
+  </table>
+
+  <h2>Opening it the first time</h2>
+  <p>
+    The app is not signed by an identified developer, so macOS blocks it once.
+    This is expected and only happens on the first run.
+  </p>
+  <div class="steps">
+    <div class="step"><p>Drag <b>UAV Wall</b> to your <b>Applications</b> folder.</p></div>
+    <div class="step"><p>Double-click it. macOS refuses and says it cannot verify the developer. Click <b>Done</b>.</p></div>
+    <div class="step"><p>Open <b>System Settings › Privacy &amp; Security</b>, scroll to the bottom, and click <b>Open Anyway</b> next to the UAV Wall message.</p></div>
+    <div class="step"><p>Double-click the app again and click <b>Open</b>. It will start normally every time after this.</p></div>
+  </div>
+
+  <div class="note">
+    <p><b>It opens onto a working wall.</b> Four demo clips are built in and loop
+    continuously, so you can try the layouts and send to a VMR without any
+    cameras or setup.</p>
+  </div>
+
+  <div class="note warn">
+    <p><b>If it says the app is damaged</b> — or nothing happens at all — macOS has
+    quarantined it because it arrived over the network. Open <b>Terminal</b>
+    (Applications&nbsp;› Utilities) and paste this one line, then open the app again:</p>
+  </div>
+  <pre>xattr -dr com.apple.quarantine "/Applications/UAV Wall.app"</pre>
+  <p>That clears the download marker. It does not change the app, and you only
+  ever need it once.</p>
+
+  <div class="foot"><span>UAV Wall — setup</span><span>1 / 4</span></div>
+</div>
+
+<!-- ─────────────────────────────  2  ───────────────────────────── -->
+<div class="page">
+  <div class="kicker">Using it</div>
+  <h1>The basics</h1>
+
+  <h2>Putting feeds on the canvas</h2>
+  <p>
+    Sources are listed down the left. Switch one on with its toggle, then use a
+    layout button — <b>1-UP</b>, <b>2×2</b>, <b>3×3</b> or <b>PIP</b> — to place
+    whatever is connected. Drag a tile to move it, drag its corner to resize.
+    Double-click any tile or card to punch that feed full screen, and again to go
+    back. <b>A / B / C</b> store layouts: click to recall, press and hold to save.
+  </p>
+
+  <h2>Sending it to a VMR</h2>
+  <p>
+    Type <code>alias@server</code> into <b>DESTINATION</b>, add the PIN if the
+    VMR has one, and press <b>SEND TO VMR</b>. Everyone in the conference sees
+    the composed canvas as one participant's video. <b>Settings › Canvas &amp;
+    sending</b> switches it to the presentation stream instead, so it appears
+    alongside the participants rather than as one of them.
+  </p>
+
+  <h2>Adding your own sources</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>An IP camera (RTSP)</h3>
+      <p>Settings › Feeds › <b>+ ADD FEED</b>, then type the camera's address, e.g.
+      <code>rtsp://10.0.1.50:554/stream1</code>. Works straight away — nothing to install.</p>
+    </div>
+    <div class="card">
+      <h3>A phone, wearable or drone (RTMP/SRT)</h3>
+      <p>These push video out rather than serving it, so the app runs a receiver
+      for them. See page 4 — also nothing to install.</p>
+    </div>
+    <div class="card">
+      <h3>A video file</h3>
+      <p>Settings › Feeds › <b>+ ADD FILE</b>. Needs <b>ffmpeg</b> — see page 3.</p>
+    </div>
+    <div class="card">
+      <h3>Recording</h3>
+      <p>Capture any feed, or the whole canvas, to an MP4 in <code>~/Movies/UAV Wall</code>.
+      Needs <b>ffmpeg</b> — see page 3.</p>
+    </div>
+  </div>
+
+  <div class="note warn">
+    <p><b>Cameras with a password.</b> Put it in the address as
+    <code>rtsp://user:pass@host/path</code>. It is stored in plain text in the
+    app's settings file, so do not use a camera whose password matters.</p>
+  </div>
+
+  <h2>Where things are kept</h2>
+  <table>
+    <tr><td class="k">Settings</td><td><code>~/Library/Application Support/UAV Wall/uavwall.conf</code></td></tr>
+    <tr><td class="k">Recordings</td><td><code>~/Movies/UAV Wall</code></td></tr>
+  </table>
+
+  <div class="foot"><span>UAV Wall — setup</span><span>2 / 4</span></div>
+</div>
+
+<!-- ─────────────────────────────  3  ───────────────────────────── -->
+<div class="page">
+  <div class="kicker">Optional</div>
+  <h1>Installing ffmpeg</h1>
+  <p class="lede">
+    Only needed for four things: adding your own video files, recording,
+    listening to a feed's audio, and sending a feed's audio into the VMR.
+    Everything else — the demo clips, RTSP cameras, layouts, sending the canvas —
+    works without it.
+  </p>
+
+  <div class="note">
+    <p><b>Why isn't it included?</b> ffmpeg is licensed under the GPL. Bundling it
+    would add licensing obligations to this app, so you install it yourself
+    instead, direct from its own distributor. The app finds it automatically
+    afterwards.</p>
+  </div>
+
+  <h2>Step 1 — Install Homebrew</h2>
+  <p>Homebrew installs command-line software on a Mac. Skip this if you already have it
+  (type <code>brew --version</code> in Terminal to check).</p>
+  <p>Open <b>Terminal</b> (Applications › Utilities) and paste in one line:</p>
+  <pre>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"</pre>
+  <p>It asks for your Mac password and takes a few minutes. At the end it prints two
+  <code>echo</code> commands under <b>Next steps</b> — run those as well, or the
+  <code>brew</code> command will not be found.</p>
+
+  <h2>Step 2 — Install ffmpeg</h2>
+  <pre>brew install ffmpeg</pre>
+  <p>Several minutes, and a few hundred megabytes.</p>
+
+  <h2>Step 3 — Restart UAV Wall</h2>
+  <p>
+    Quit the app and open it again. It looks for ffmpeg at startup, so a running
+    app will not notice a new installation. <b>+ ADD FILE</b> and the record
+    buttons become available.
+  </p>
+
+  <div class="note warn">
+    <p><b>How to tell it worked.</b> Without ffmpeg the app shows
+    <span class="mono">ffmpeg not found — import, recording and audio are off</span>
+    along the bottom when it starts. With it installed, that message is gone.</p>
+  </div>
+
+  <h2>Imported files are converted first</h2>
+  <p>
+    When you add a video file the app re-encodes it before use, which takes a few
+    seconds per clip. This is deliberate: the video engine decodes some
+    high-quality H.264 files badly, and they appear heavily blocky. The converted
+    copies are cached, so a file added a second time is instant.
+  </p>
+
+  <div class="foot"><span>UAV Wall — setup</span><span>3 / 4</span></div>
+</div>
+
+<!-- ─────────────────────────────  4  ───────────────────────────── -->
+<div class="page">
+  <div class="kicker">Phones, wearables and drones</div>
+  <h1>The RTMP / SRT receiver</h1>
+  <p class="lede">
+    An IP camera serves video and the wall fetches it. A phone or wearable does
+    the opposite — it pushes video to an address you give it. The app includes a
+    receiver for exactly that. <b>Nothing to install.</b>
+  </p>
+
+  <div class="steps">
+    <div class="step"><p>Open <b>Settings › Feeds</b> and switch on <b>Receiver (RTMP/SRT)</b>. It should say <span class="accent">LISTENING</span> within a second or two.</p></div>
+    <div class="step"><p>Note the <b>NEXT · RTMP</b> address shown, e.g. <code>rtmp://10.0.1.12:1935/live/source-01</code>. Click it to copy it.</p></div>
+    <div class="step"><p>Press <b>+ ADD RECEIVER FEED</b>. A source appears in the list, ready and waiting.</p></div>
+    <div class="step"><p>In your streaming app on the phone, set that address as the destination and start streaming.</p></div>
+    <div class="step"><p>Switch the new source on. It shows <span class="mono">waiting for the device…</span> until the stream arrives, then goes live on its own.</p></div>
+  </div>
+
+  <p>Repeat for as many devices as you like — each press of <b>+ ADD RECEIVER FEED</b>
+  gives out the next address. Every source's own push address is shown in the
+  inspector at the bottom of the list when you select it; hover any line to see
+  it in full, click to copy.</p>
+
+  <h2>Two settings on the device that matter</h2>
+  <table>
+    <tr><td class="k">Baseline profile</td>
+        <td>Set the encoder to <b>Baseline</b>. Higher profiles decode badly and the picture breaks up. Most apps expose this directly.</td></tr>
+    <tr><td class="k">Same network</td>
+        <td>The phone must be on the same Wi-Fi as the Mac. A guest network or mobile data will not reach it.</td></tr>
+  </table>
+
+  <h2>If the device will not connect</h2>
+  <ul>
+    <li>Check the address on the device <b>exactly</b> — including <code>/live/</code>. Some apps reject an address without two parts after the host.</li>
+    <li>Give it a moment. A phone can take several seconds to negotiate; the source picks it up on its own.</li>
+    <li>Confirm the receiver says <span class="accent">LISTENING</span>. If it reports an error, something else on the Mac is already using the same ports.</li>
+  </ul>
+
+  <div class="note">
+    <p><b>Something to be aware of.</b> While the receiver is on, your Mac accepts
+    incoming video from anything on the network that knows the address. Switch it
+    off when you have finished demonstrating.</p>
+  </div>
+
+  <div class="foot"><span>UAV Wall — setup · Pexip internal</span><span>4 / 4</span></div>
+</div>
+
+</body>
+</html>
