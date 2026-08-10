@@ -51,13 +51,20 @@ for f in "$SRC"/*.mp4 "$SRC"/*.MP4 "$SRC"/*.mov "$SRC"/*.MOV; do
     fi
 
     echo "  $base -> ${WIDTH}x${HEIGHT} @ ${FPS}fps"
+    # Constrained Baseline, not libx264's default of High: Pulse decodes High
+    # profile badly — corrupt through the video mixer on macOS, and slow through
+    # the file session — so a clip played directly from disk comes out
+    # macroblocked. uav-streams.sh already re-encodes to baseline when it
+    # publishes, which is why RTSP feeds never showed this and file feeds do.
+    #
     # Letterbox rather than crop, so nothing is lost from the frame. Audio is
     # dropped: the generator adds its own, and real downlink audio is rarely
     # what you want playing in a conference room.
     ffmpeg -hide_banner -loglevel error -i "$f" \
         -vf "scale=$WIDTH:$HEIGHT:force_original_aspect_ratio=decrease,\
 pad=$WIDTH:$HEIGHT:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=$FPS" \
-        -an -c:v libx264 -preset medium -crf 23 -movflags +faststart -y "$dest"
+        -an -c:v libx264 -profile:v baseline -level 4.0 \
+        -preset medium -crf 23 -movflags +faststart -y "$dest"
     n=$((n + 1))
 done
 
