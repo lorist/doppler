@@ -142,6 +142,58 @@ Feed paths persist as absolute, so moving the app to `/Applications` after first
 run would strand them; the app re-points any bundled clip at its own copy on
 load.
 
+### Windows app bundle
+
+[`make-bundle.ps1`](make-bundle.ps1) is the same thing for Windows: a flat
+portable folder (Windows has no `.app` spine — DLLs beside the exe is the one
+layout that loads with no launcher and no PATH edits), staged from the MSVC
+build:
+
+```powershell
+.\demos\uavwall\make-bundle.ps1 -Zip     # build-win\UAV Wall + UAV Wall.zip
+```
+
+Copy the folder (or send the zip) to any Windows 11 x64 machine and
+double-click `uavwall.exe` — nothing to install, no terminal. The app finds the
+Pulse runtime beside itself and sets `PEX_BASE_PATH` on its own. Everything the
+macOS section says about clips, mediamtx, ffmpeg and `-WithTools` (spelled
+`--with-tools` there) applies here too, with the Windows differences:
+
+* **Config lives in the folder** (`uavwall.conf` beside the exe — the folder is
+  the install), recordings in `%USERPROFILE%\Videos\UAV Wall`. The `clips\`
+  directory is also the marker by which the app knows it is running bundled, so
+  the script creates it even when there is no footage to fill it.
+* **SmartScreen, not Gatekeeper**: an unsigned exe gets the "unrecognised app"
+  screen, cleared with **More info › Run anyway**. Authenticode signing is the
+  way past that, as Developer ID + notarisation is on the Mac.
+* **`-WithTools` also copies ffplay** — LISTEN plays audio through ffplay on
+  Windows — and takes the ffmpeg from `PATH` (the `winget install Gyan.FFmpeg`
+  full build is a portable single exe, so there is no Windows fetch-ffmpeg
+  step). Pass the source offer as `-SourceOffer "You <you@example.com>"`.
+* **The receiver wants ffmpeg on Windows.** Phones push High-profile H.264,
+  which the Windows Pulse decoder smears ([`docs/porting.md`](../../docs/porting.md)),
+  so receiver feeds are pulled through an on-demand Baseline relay — which is
+  an ffmpeg. Without one the app falls back to reading the push directly and
+  says so in the status bar. For a phone-demo machine: ship `-WithTools`
+  (accepting the GPL obligations), or have the recipient run
+  `winget install Gyan.FFmpeg` once — the app finds it and the relay arms
+  itself.
+* **The import-table check replaces the `otool` walk**: the script fails the
+  build if any DLL the exe or the bundled DLLs import is missing from both the
+  bundle and Windows itself (it needs MSVC's `dumpbin`, and warns rather than
+  guesses when that is absent). The VC++ runtime is the one assumed presence —
+  near-universal, and a truly bare machine needs Microsoft's `vc_redist.x64.exe`
+  once.
+
+**Licensing is the same position as the macOS bundle**: the default build ships
+no copyleft binaries. Beyond what the `.app` carries, the Windows runtime adds
+the Intel compiler runtime (`libmmd.dll`, `svml_dispmd.dll` — redistributable
+support DLLs) and oneTBB (`tbb12.dll`, Apache-2.0); `pexlgpl.dll` is the same
+LGPL-isolation library as its dylib twin, shipped as its own replaceable DLL,
+which is how LGPL §4 is satisfied. `THIRD-PARTY-NOTICES.txt` at the folder root
+is generated from what the build actually contains, licence texts in
+`licenses\`.
+
 ### RTMP / SRT receiver
 
 Pulse speaks RTSP and only RTSP. A camera suits that — it serves a URL and the
@@ -207,8 +259,10 @@ exactly the host and port a device needs, so **hovering any row shows the full
 value and clicking copies it**. The receiver panel's own address lines copy the
 same way.
 
-The app writes mediamtx's config itself on every start (to
-`~/Library/Application Support/UAV Wall/mediamtx.yml`, overwritten each time),
+The app writes mediamtx's config itself on every start (beside `uavwall.conf` —
+`~/Library/Application Support/UAV Wall/mediamtx.yml` from the Mac bundle, the
+bundle folder on Windows, the working directory for a source build; overwritten
+each time),
 owns the process, and stops it on exit so its listening sockets do not block the
 next run. Everything not needed is switched off: HLS, WebRTC, the API and
 metrics would all be listeners exposed for no reason, and MoQ additionally
@@ -223,8 +277,11 @@ Two traps worth knowing, both found against real devices:
 * **The RTMP path needs two segments.** `/live/wearable` works; `/wearable` is
   rejected outright by Larix and others. mediamtx accepts either, so testing
   with ffmpeg alone never shows it.
-* **Set the device to Baseline profile.** High-profile H.264 breaks up badly —
-  see [`docs/porting.md`](../../docs/porting.md).
+* **High-profile H.264 breaks up on Windows** — see
+  [`docs/porting.md`](../../docs/porting.md). The Windows receiver relays each
+  pushed stream through a Baseline transcode automatically when ffmpeg is
+  present, so this is only something to think about when ffmpeg is absent
+  (set the device to Baseline profile instead). macOS decodes High cleanly.
 
 ### Windows demo kit
 

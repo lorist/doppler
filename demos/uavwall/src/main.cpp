@@ -49,6 +49,8 @@
 #include <mach/mach.h>
 #endif
 #if defined(_WIN32)
+#include <winsock2.h> // before windows.h; port_answers probes the receiver
+#include <iphlpapi.h> // GetAdaptersAddresses — the LAN address for push URLs
 #include <windows.h>
 #include <fcntl.h>    // _O_RDONLY
 #include <io.h>       // _open_osfhandle / _read / _write / _close
@@ -117,10 +119,22 @@
 //      none" convention the rest of the file relies on survives intact.
 // ----------------------------------------------------------------------------
 
+// Where to send an operator for the optional tools, phrased per platform.
+#if defined(_WIN32)
+#define INSTALL_FFMPEG_HINT "winget install Gyan.FFmpeg"
+#define INSTALL_MEDIAMTX_HINT "winget install bluenviron.mediamtx"
+#else
+#define INSTALL_FFMPEG_HINT "brew install ffmpeg"
+#define INSTALL_MEDIAMTX_HINT "brew install mediamtx"
+#endif
+
 #if defined(_WIN32)
 // A HANDLE kept in a pid-shaped slot. Not named ProcHandle: MacTypes.h
 // claims that name, and AudioToolbox drags it in on macOS.
 using ChildProc = intptr_t;
+#ifndef R_OK
+#define R_OK 4 // io.h has access(), but not the POSIX mode names
+#endif
 static inline ptrdiff_t
 pio_read (int fd, void * buf, size_t n)
 {
@@ -228,29 +242,49 @@ exe_dir ()
 #endif
 }
 
-// True when the executable sits in Foo.app/Contents/MacOS.
+// True when running from a distributable bundle: Foo.app/Contents/MacOS on
+// macOS; on Windows a flat portable folder, recognised by the clips directory
+// make-bundle.ps1 always creates. Deliberately not assets/ or tools/, which
+// the demo kit ships too — the kit keeps its config in its own folder via the
+// working directory, and must stay that way.
 static bool
 in_app_bundle ()
 {
   const std::string d = exe_dir ();
+#if defined(_WIN32)
+  std::error_code ec;
+  return !d.empty () && std::filesystem::is_directory (d + "\\clips", ec);
+#else
   return d.size () > 15 && d.compare (d.size () - 15, 15, "/Contents/MacOS") == 0;
+#endif
 }
 
 static std::string
 home_dir ()
 {
+#if defined(_WIN32)
+  const char * up = getenv ("USERPROFILE");
+  if (up)
+    return up;
+#endif
   const char * h = getenv ("HOME");
   return h ? h : ".";
 }
 
-// Contents/Resources/<name> when running from a .app, empty otherwise.
+// Contents/Resources/<name> when running from a .app, <name> beside the exe in
+// the flat Windows bundle, empty otherwise. Forward slashes on both platforms:
+// callers split on '/' (prepared_dir), and Windows APIs accept either.
 static std::string
 bundle_resource_dir (const char * name)
 {
   if (!in_app_bundle ())
     return "";
+#if defined(_WIN32)
+  return std::filesystem::path (exe_dir ()).generic_string () + "/" + name;
+#else
   const std::string d = exe_dir (); // .../Contents/MacOS
   return d.substr (0, d.size () - 5) + "Resources/" + name;
+#endif
 }
 
 static std::string
@@ -750,10 +784,16 @@ config_path ()
   if (!cached.empty ())
     return cached;
   if (in_app_bundle ()) {
+#if defined(_WIN32)
+    // Portable-app convention: the folder is the install, so state stays in
+    // it — robust against whatever working directory a shortcut supplies.
+    cached = std::filesystem::path (exe_dir ()).generic_string () + "/uavwall.conf";
+#else
     const std::string dir = home_dir () + "/Library/Application Support/UAV Wall";
     std::error_code ec;
     std::filesystem::create_directories (dir, ec);
     cached = dir + "/uavwall.conf";
+#endif
   } else {
     cached = "uavwall.conf";
   }
@@ -929,10 +969,23 @@ load_config (App & app)
   const std::string clips = bundle_resource_dir ("clips");
   if (!clips.empty ()) {
     for (Feed & f : app.feeds) {
+#if defined(_WIN32)
+      // The flat bundle has no /Contents/Resources spine to key on — any
+      // clips directory component marks a bundled clip's path.
+      std::string u = f.url;
+      for (char & c : u)
+        if (c == '\\')
+          c = '/';
+      const std::size_t at = u.find ("/clips/");
+      if (at == std::string::npos || access (f.url.c_str (), R_OK) == 0)
+        continue;
+      const std::string here = clips + u.substr (at + 6); // keeps the leading '/'
+#else
       const std::size_t at = f.url.find ("/Contents/Resources/clips/");
       if (at == std::string::npos || access (f.url.c_str (), R_OK) == 0)
         continue;
       const std::string here = clips + f.url.substr (at + 25); // keeps the leading '/'
+#endif
       if (access (here.c_str (), R_OK) == 0)
         f.url = here;
     }
@@ -1656,6 +1709,18 @@ find_tool (const char * name)
 {
 #if defined(_WIN32)
   const std::string exe = std::string (name) + ".exe";
+  // A bundled copy wins, for the same reasons as on macOS below: it is the
+  // build the app was tested against, and an absolute path inside the bundle
+  // cannot be shadowed by a writable PATH entry.
+  {
+    const std::string tools = bundle_resource_dir ("tools");
+    if (!tools.empty ()) {
+      const std::string p = tools + "/" + exe;
+      std::error_code ec;
+      if (std::filesystem::is_regular_file (p, ec))
+        return p;
+    }
+  }
   const char * path = getenv ("PATH");
   if (!path)
     return {};
@@ -1914,6 +1979,28 @@ stop_recorder (Recorder & r, bool frames_on_stdin)
   r.kill_after = ImGui::GetTime () + 8.0;
 }
 
+// Has the child gone? Never blocks; on Windows the exited child's HANDLE is
+// closed here, so a true result consumes the ChildProc.
+static bool
+child_exited (ChildProc pid)
+{
+  if (pid <= 0)
+    return true;
+#if defined(_WIN32)
+  HANDLE h = (HANDLE) pid;
+  DWORD w = WaitForSingleObject (h, 0);
+  if (w != WAIT_OBJECT_0 && w != WAIT_FAILED)
+    return false;
+  CloseHandle (h);
+#else
+  int st = 0;
+  pid_t got = waitpid (pid, &st, WNOHANG);
+  if (got != pid && got >= 0)
+    return false;
+#endif
+  return true;
+}
+
 // Called every frame. Reaping is deferred rather than waited on, so stopping a
 // recording never stalls the UI.
 // Has the child gone? Never blocks, and clears the slot when it has. Shared by
@@ -1921,20 +2008,8 @@ stop_recorder (Recorder & r, bool frames_on_stdin)
 static bool
 reap_if_exited (Recorder & r)
 {
-  if (r.pid <= 0)
-    return true;
-#if defined(_WIN32)
-  HANDLE h = (HANDLE) r.pid;
-  DWORD w = WaitForSingleObject (h, 0);
-  if (w != WAIT_OBJECT_0 && w != WAIT_FAILED)
+  if (!child_exited (r.pid))
     return false;
-  CloseHandle (h);
-#else
-  int st = 0;
-  pid_t got = waitpid (r.pid, &st, WNOHANG);
-  if (got != r.pid && got >= 0)
-    return false;
-#endif
   r.pid = -1;
   r.stopping = false;
   if (r.in_fd >= 0) {
@@ -1977,7 +2052,37 @@ static std::string
 lan_ipv4 ()
 {
 #if defined(_WIN32)
-  return "";
+  // GetAdaptersAddresses rather than getifaddrs. Tunnels and PPP are the
+  // Windows spelling of "the VPN wins by enumeration order": prefer a real
+  // Ethernet/Wi-Fi interface, as the branch below prefers en0.
+  ULONG sz = 16 * 1024;
+  std::vector<unsigned char> mem (sz);
+  auto * aa = (IP_ADAPTER_ADDRESSES *) mem.data ();
+  if (GetAdaptersAddresses (AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                            nullptr, aa, &sz) != NO_ERROR)
+    return "";
+  std::string best;
+  for (auto * a = aa; a; a = a->Next) {
+    if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+        a->IfType == IF_TYPE_TUNNEL || a->IfType == IF_TYPE_PPP)
+      continue;
+    const bool physical = a->IfType == IF_TYPE_ETHERNET_CSMACD || a->IfType == IF_TYPE_IEEE80211;
+    for (auto * u = a->FirstUnicastAddress; u; u = u->Next) {
+      if (!u->Address.lpSockaddr || u->Address.lpSockaddr->sa_family != AF_INET)
+        continue;
+      auto * sin = (sockaddr_in *) u->Address.lpSockaddr;
+      const unsigned char * b = (const unsigned char *) &sin->sin_addr;
+      if (b[0] == 169 && b[1] == 254)
+        continue; // link-local: no DHCP answered, useless to a device
+      char host[16];
+      snprintf (host, sizeof (host), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+      if (best.empty () || physical)
+        best = host;
+      if (physical)
+        return best;
+    }
+  }
+  return best;
 #else
   struct ifaddrs * ifa = nullptr;
   if (getifaddrs (&ifa) != 0)
@@ -2011,8 +2116,24 @@ static bool
 port_answers (int port)
 {
 #if defined(_WIN32)
-  (void) port;
-  return true;
+  static bool wsa = [] {
+    WSADATA d;
+    return WSAStartup (MAKEWORD (2, 2), &d) == 0;
+  } ();
+  if (!wsa)
+    return false;
+  SOCKET s = socket (AF_INET, SOCK_STREAM, 0);
+  if (s == INVALID_SOCKET)
+    return false;
+  sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons ((uint16_t) port);
+  a.sin_addr.s_addr = htonl (INADDR_LOOPBACK);
+  const DWORD tv = 200; // ms
+  setsockopt (s, SOL_SOCKET, SO_SNDTIMEO, (const char *) &tv, sizeof (tv));
+  const bool ok = connect (s, (sockaddr *) &a, sizeof (a)) == 0;
+  closesocket (s);
+  return ok;
 #else
   int s = socket (AF_INET, SOCK_STREAM, 0);
   if (s < 0)
@@ -2068,6 +2189,26 @@ write_ingest_config (App & app, const std::string & path)
   ofs << "pprof: no\n";
   ofs << "playback: no\n";
   ofs << "paths:\n";
+#if defined(_WIN32)
+  // The Windows Pulse decoder breaks up High-profile H.264 (docs/porting.md),
+  // and phones push High profile. So the wall does not read a pushed stream
+  // directly here: it reads relay/<slot>, and mediamtx starts an ffmpeg on
+  // demand that round-trips live/<slot> through a Constrained Baseline
+  // transcode (which also gives the two tracks distinct RTP payload types —
+  // mediamtx's RTMP conversion hands both PT 96, and Pulse demuxes by PT).
+  // The demo kit proved this shape with a fixed path; the regex group makes
+  // one entry serve every device. Without ffmpeg the feeds fall back to
+  // reading the push directly — see ingest_pull_path().
+  if (!g_ffmpeg.empty ()) {
+    ofs << "  '~^relay/(.+)$':\n";
+    ofs << "    runOnDemand: '\"" << g_ffmpeg << "\" -hide_banner -loglevel warning"
+        << " -rtsp_transport tcp -i rtsp://127.0.0.1:" << app.cfg.ingest_rtsp_port << "/live/$G1"
+        << " -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -pix_fmt yuv420p"
+        << " -g 30 -b:v 4M -c:a copy -f rtsp -rtsp_transport tcp"
+        << " rtsp://127.0.0.1:" << app.cfg.ingest_rtsp_port << "/relay/$G1'\n";
+    ofs << "    runOnDemandRestart: yes\n";
+  }
+#endif
   ofs << "  all_others:\n";
   return true;
 }
@@ -2083,7 +2224,7 @@ start_ingest (App & app)
   const std::string exe = find_tool ("mediamtx");
   if (exe.empty ()) {
     app.ingest_error = "mediamtx not found";
-    set_status (app, "Receiver needs mediamtx — install it with: brew install mediamtx");
+    set_status (app, "Receiver needs mediamtx — install it with: " INSTALL_MEDIAMTX_HINT);
     return false;
   }
   const std::string cfg = ingest_dir () + "/mediamtx.yml";
@@ -2101,7 +2242,17 @@ start_ingest (App & app)
     return false;
   }
   app.ingest_next_probe = ImGui::GetTime () + 0.3;
+#if defined(_WIN32)
+  // Without ffmpeg there is no Baseline relay, and most phones push High
+  // profile, which the Windows Pulse decoder smears (docs/porting.md). Say so
+  // now rather than letting it be discovered on the canvas.
+  if (g_ffmpeg.empty ())
+    set_status (app, "Receiver starting — without ffmpeg, phone video may break up. " INSTALL_FFMPEG_HINT);
+  else
+    set_status (app, "Receiver starting…");
+#else
   set_status (app, "Receiver starting…");
+#endif
   return true;
 }
 
@@ -2111,8 +2262,13 @@ stop_ingest (App & app)
   if (app.ingest.pid <= 0 || app.ingest.stopping)
     return;
   // mediamtx ignores stdin and has no quit command, so ask it politely with a
-  // signal; reap_recorder's timer escalates if it does not go.
-#if !defined(_WIN32)
+  // signal; reap_recorder's timer escalates if it does not go. Windows has no
+  // polite signal for a console-less child, and mediamtx holds no files that
+  // need finalising — terminate it directly rather than waiting out the
+  // 8-second escalation with the listening ports still held.
+#if defined(_WIN32)
+  TerminateProcess ((HANDLE) app.ingest.pid, 0);
+#else
   kill (app.ingest.pid, SIGTERM);
 #endif
   stop_recorder (app.ingest, false);
@@ -2151,7 +2307,28 @@ ingest_path_of (App & app, const Feed & f)
 {
   char pre[64];
   snprintf (pre, sizeof (pre), "rtsp://127.0.0.1:%d/", app.cfg.ingest_rtsp_port);
-  return is_ingest_feed (app, f) ? f.url.substr (strlen (pre)) : std::string ();
+  if (!is_ingest_feed (app, f))
+    return {};
+  std::string p = f.url.substr (strlen (pre));
+  // The wall may be reading the Baseline relay (Windows); the device still
+  // pushes to live/<slot>, which is the name every caller here wants.
+  if (p.compare (0, 6, "relay/") == 0)
+    p = "live/" + p.substr (6);
+  return p;
+}
+
+// What the wall should read for a push slot: the Baseline relay on Windows
+// (see write_ingest_config), the pushed path itself elsewhere — or when there
+// is no ffmpeg to relay with, in which case High-profile devices will smear
+// and the Settings hint says so.
+static std::string
+ingest_pull_path (const std::string & push_path)
+{
+#if defined(_WIN32)
+  if (!g_ffmpeg.empty () && push_path.compare (0, 5, "live/") == 0)
+    return "relay/" + push_path.substr (5);
+#endif
+  return push_path;
 }
 
 // The next unused slot, so pressing + ADD twice gives two distinct devices.
@@ -2175,7 +2352,7 @@ ingest_push_rtmp (App & app, const std::string & path)
 {
   const std::string h = lan_ipv4 ();
   char b[256];
-  snprintf (b, sizeof (b), "rtmp://%s:%d/%s", h.empty () ? "<this-mac>" : h.c_str (), app.cfg.ingest_rtmp_port,
+  snprintf (b, sizeof (b), "rtmp://%s:%d/%s", h.empty () ? "<this-machine>" : h.c_str (), app.cfg.ingest_rtmp_port,
             path.c_str ());
   return b;
 }
@@ -2185,7 +2362,7 @@ ingest_push_srt (App & app, const std::string & path)
 {
   const std::string h = lan_ipv4 ();
   char b[256];
-  snprintf (b, sizeof (b), "srt://%s:%d?streamid=publish:%s", h.empty () ? "<this-mac>" : h.c_str (),
+  snprintf (b, sizeof (b), "srt://%s:%d?streamid=publish:%s", h.empty () ? "<this-machine>" : h.c_str (),
             app.cfg.ingest_srt_port, path.c_str ());
   return b;
 }
@@ -2470,7 +2647,7 @@ start_monitor (App & app, int idx)
   }
 #else
   if (g_ffmpeg.empty ()) {
-    set_status (app, "ffmpeg not found — install it with: brew install ffmpeg");
+    set_status (app, "ffmpeg not found — install it with: " INSTALL_FFMPEG_HINT);
     return;
   }
 #endif
@@ -2672,7 +2849,7 @@ start_air (App & app, int idx)
     return;
   stop_air (app);
   if (g_ffmpeg.empty ()) {
-    set_status (app, "ffmpeg not found — install it with: brew install ffmpeg");
+    set_status (app, "ffmpeg not found — install it with: " INSTALL_FFMPEG_HINT);
     return;
   }
   Feed & f = app.feeds[(size_t) idx];
@@ -2816,7 +2993,7 @@ add_file_feed (App & app, const std::string & path)
     f.url = path;
     app.feeds.push_back (std::move (f));
     set_status (app, "Added " + name + " unprepared — it may look blocky. "
-                      "Install ffmpeg (brew install ffmpeg) and re-add it.");
+                      "Install ffmpeg (" INSTALL_FFMPEG_HINT ") and re-add it.");
   }
 }
 
@@ -2826,9 +3003,7 @@ poll_prepares (App & app)
 {
   for (size_t i = 0; i < app.preparing.size ();) {
     Prepare & pr = app.preparing[i];
-    int st = 0;
-    ChildProc got = waitpid (pr.pid, &st, WNOHANG);
-    if (got != pr.pid && got >= 0) {
+    if (!child_exited (pr.pid)) {
       i++;
       continue;
     }
@@ -4712,7 +4887,8 @@ ui_settings (App & app)
           snprintf (nb, sizeof (nb), "%s", path.c_str () + 5); // "live/" prefix off
           for (char * c = nb; *c; ++c)
             *c = *c == '-' ? ' ' : (char) toupper ((unsigned char) *c);
-          snprintf (ub, sizeof (ub), "rtsp://127.0.0.1:%d/%s", app.cfg.ingest_rtsp_port, path.c_str ());
+          snprintf (ub, sizeof (ub), "rtsp://127.0.0.1:%d/%s", app.cfg.ingest_rtsp_port,
+                    ingest_pull_path (path).c_str ());
           nf.name = nb;
           nf.url = ub;
           app.feeds.push_back (std::move (nf));
@@ -4861,7 +5037,7 @@ ui_settings (App & app)
                  ok ? theme::WhiteU32 (0.60f) : theme::HexU32 (theme::StatusError, 0.90f), 9.5f);
       if (!ok)
         dl->AddText (app.fonts.body, theme::fs (11.0f), ImVec2 (at.x, at.y + du (16.0f)), theme::WhiteU32 (0.40f),
-                     "Install it (brew install ffmpeg) to enable the record controls.");
+                     "Install it (" INSTALL_FFMPEG_HINT ") to enable the record controls.");
       seek (at.y + du (ok ? 22.0f : 38.0f));
     }
     gap (8.0f);
@@ -6225,6 +6401,20 @@ on_sso_request (PulseSSOProviderRequest *, PulseSSOProviderSetToken *, void *)
 int
 main (int argc, char ** argv)
 {
+#if defined(_WIN32)
+  // The bundle is double-clicked, not launched through run-uavwall.bat, so
+  // nothing has exported PEX_BASE_PATH — and the Pulse runtime aborts at
+  // startup without it. When the runtime sits beside the exe (which is how
+  // make-bundle.ps1 lays it out), point the variable there ourselves. An
+  // already-set value wins, so the dev launchers keep working unchanged.
+  if (!getenv ("PEX_BASE_PATH")) {
+    const std::string d = exe_dir ();
+    std::error_code ec;
+    if (!d.empty () && std::filesystem::exists (d + "\\pexpulse.dll", ec))
+      _putenv_s ("PEX_BASE_PATH", d.c_str ());
+  }
+#endif
+
   if (!glfwInit ()) {
     std::fprintf (stderr, "glfwInit failed\n");
     return 1;
@@ -6280,7 +6470,11 @@ main (int argc, char ** argv)
   // user's Movies folder before the config is read — an explicit record_dir in
   // the file still wins.
   if (in_app_bundle ())
+#if defined(_WIN32)
+    app.cfg.record_dir = home_dir () + "/Videos/UAV Wall";
+#else
     app.cfg.record_dir = home_dir () + "/Movies/UAV Wall";
+#endif
   load_config (app);
   }
 
@@ -6293,7 +6487,7 @@ main (int argc, char ** argv)
   // rather than leaving someone clicking a dead button.
   if (g_ffmpeg.empty ())
     set_status (app, "ffmpeg not found — import, recording and audio are off. "
-                     "Install it with: brew install ffmpeg");
+                     "Install it with: " INSTALL_FFMPEG_HINT);
 
   // Bring the receiver up before the feeds connect, so an autoconnect against
   // an ingest path finds something listening rather than failing once.
@@ -6654,7 +6848,9 @@ main (int argc, char ** argv)
     reap_if_exited (app.ingest);
   }
   if (app.ingest.pid > 0) {
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    TerminateProcess ((HANDLE) app.ingest.pid, 1);
+#else
     kill (app.ingest.pid, SIGKILL);
 #endif
     reap_if_exited (app.ingest);

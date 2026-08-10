@@ -166,6 +166,11 @@ fonts (DM Sans, IBM Plex Mono) needed nothing.
   profile** (Larix exposes this directly), or relay through ffmpeg with
   `-profile:v baseline`; the four Baseline test feeds and pexclient's
   conference video are unaffected. Worth reporting to Pexip with this repro.
+  uavwall's built-in receiver applies the relay automatically on Windows when
+  ffmpeg is present: receiver feeds read `relay/<slot>`, an on-demand Baseline
+  round-trip of the pushed `live/<slot>` (which also gives the two tracks
+  distinct payload types). Without ffmpeg it falls back to the direct pull and
+  the status bar says what to expect.
 
 ## Rough effort
 
