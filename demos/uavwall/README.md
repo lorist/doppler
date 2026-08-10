@@ -42,6 +42,9 @@ this participant's video — so everyone in the VMR sees the composed picture.
   the canvas.
 * **Recording** — capture any feed (stream-copied, so the file is the original
   picture) or the composed canvas to MP4, into `recordings/`.
+* **RTMP/SRT receiver** — run a bundled mediamtx from Settings so a wearable or
+  phone can push into the wall; it is republished as RTSP and shown like any
+  other feed.
 * **Registration** — register to Infinity with a username and password so the
   wall can be *dialled into*, search the directory for VMRs and devices, and
   answer incoming calls (including while already in one).
@@ -73,6 +76,155 @@ Linux should build as-is (the SDK is x86-64 only, and the incoming-call and
 feed-loss sounds are silent there). [`docs/porting.md`](../../docs/porting.md)
 has the detail on all three, including what differs on Windows: **LISTEN needs
 `ffplay`** rather than `ffmpeg`, and canvas recording encodes in software.
+
+### macOS app bundle
+
+[`make-bundle.sh`](make-bundle.sh) wraps the built binary into
+`build/UAV Wall.app` — the Pulse runtime, the fonts and four looping demo clips
+all inside it. Double-clicking it on any Apple-silicon Mac gives a working wall
+with no server, no script and no terminal; the recipient swaps in their own
+footage through **Settings › Feeds › + ADD FILE**.
+
+```bash
+./demos/uavwall/make-bundle.sh                     # 109MB — this is what you ship
+```
+
+That carries the app, the Pulse runtime, the fonts, four demo clips and
+**mediamtx** — everything the demo actually needs, all of it MIT or permissive.
+Send it with [`docs/uavwall-setup.pdf`](docs/uavwall-setup.pdf), which walks a
+non-technical recipient through Gatekeeper, the wall itself, the receiver, and
+installing ffmpeg if they want the extras.
+
+**ffmpeg is deliberately not included.** It is GPL, so bundling it makes handing
+the app to someone a distribution of GPL software with a source-offer attached —
+and nothing in the demo needs it. The clips are transcoded here at build time and
+Pulse decodes RTSP itself. It is wanted only for **+ ADD FILE**, recording,
+LISTEN and sending feed audio, and a recipient who wants those runs
+`brew install ffmpeg`, obtaining it from its own distributor. The app says so at
+startup when it is missing, and finds it automatically once installed.
+
+To include it anyway, accepting the obligations:
+
+```bash
+./demos/uavwall/fetch-ffmpeg.sh                    # once: a portable arm64 build
+SOURCE_OFFER="You <you@example.com>, Pexip" \
+  ./demos/uavwall/make-bundle.sh --with-tools      # 172MB
+```
+
+The clips are built from `UAV_footage/prepared/feed{1..4}.mp4` if present, cut
+to `CLIP_SECONDS` (default 20) at 720p — without them the app falls back to the
+`rtsp://127.0.0.1:8554/uavN` URLs, which is what a source build wants.
+
+If you do bundle ffmpeg it must be a *portable* build: Homebrew's links ~58
+Homebrew dylibs, so copying that gives the recipient an app whose import and
+record buttons fail. `fetch-ffmpeg.sh` downloads a static arm64 build, refuses it
+unless `otool` shows zero non-system links and every codec uavwall calls is
+present, and records its licence; `make-bundle.sh` then prefers it over anything
+on `PATH`. Use your own with `FFMPEG_STATIC=/path/to/ffmpeg`. `NO_MEDIAMTX=1`
+drops the media server if you only ever use RTSP cameras.
+
+**Licensing.** The bundle carries `Contents/Resources/THIRD-PARTY-NOTICES.txt`,
+generated from what that build actually contains, with the licence texts in
+`Contents/Resources/licenses/`. The default build has **no copyleft binaries**:
+five components, all permissive, plus the Pexip SDK agreement. Adding
+`--with-tools` adds a GPL-3.0 ffmpeg and with it a source-offer obligation —
+set `SOURCE_OFFER` and the notice carries a proper three-year written offer,
+leave it unset and the build warns you before you hand it over. The demo clips
+are Pexels footage; mediamtx is MIT.
+[`docs/third-party.md`](../../docs/third-party.md) has the full position.
+
+The bundle is **ad-hoc signed**, so Gatekeeper stops it on another Mac: the
+recipient opens it, is refused, allows it once under System Settings › Privacy &
+Security › Open Anyway, and opens it again. A Developer ID plus notarisation
+(`CODESIGN_ID=…`) is the only way to remove that step.
+
+Feed paths persist as absolute, so moving the app to `/Applications` after first
+run would strand them; the app re-points any bundled clip at its own copy on
+load.
+
+### RTMP / SRT receiver
+
+Pulse speaks RTSP and only RTSP. A camera suits that — it serves a URL and the
+wall pulls it. A wearable or a phone does the opposite: it **pushes**, dialling
+out to a server, so something has to be listening and republishing. That is the
+whole job of mediamtx, and with `--with-tools` the app carries one and runs it
+itself.
+
+**Settings › Feeds › Receiver (RTMP/SRT)**. Switch it on and the panel reports
+`LISTENING`, how many devices are provisioned, and the RTMP and SRT addresses
+the **next** device should use — with this Mac's LAN address already filled in.
+
+**Several devices at once is the normal case**, so the receiver is a list of
+slots rather than one fixed address. Each press of **+ ADD RECEIVER FEED** takes
+the next free path — `live/source-01`, `live/source-02`, … — and creates the
+matching feed. mediamtx serves any path, so no server-side change is needed per
+device. The workflow is: read the `NEXT · RTMP` address, set the device to it,
+press **+ ADD RECEIVER FEED**, then connect that feed once the device is
+pushing.
+
+`source` is only the default. What pushes in might be a wearable, a UAV, a drone
+or a phone, so **Name slots** in the same panel (or `ingest_prefix` in
+`uavwall.conf`) sets it — `uav` gives `live/uav-01` and a feed called `UAV 01`.
+It is sanitised to lowercase alphanumerics, `-` and `_`, since it goes straight
+into a URL path.
+
+**Order does not matter.** A device takes several seconds to finish its RTMP
+handshake, and mediamtx serves nothing on the path until it does — so connecting
+the feed even slightly early used to fail permanently, with a `no stream is
+available` that only a manual Reconnect would clear. A receiver feed now retries
+every two seconds instead, showing *waiting for the device to start pushing…*
+rather than raising the feed-loss alert, and comes up on its own whenever the
+device appears. Switching the feed off, or stopping the receiver, ends the wait.
+
+### Why a connect is probed first
+
+`connect_job_run()` opens a plain socket and sends an RTSP `DESCRIBE` before it
+builds anything. This is not an optimisation — it is a crash fix. A failed
+connect makes Pulse tear its AVF video sink down on the main dispatch queue, and
+doing that repeatedly or concurrently segfaults inside
+`_pex_avf_video_sink_set_layer`: **CONNECT ALL across several dead feeds crashed
+the app outright**, and so did a retry loop waiting on a device. Never building
+the instance removes the whole class of failure.
+
+Three details matter if this is ever touched:
+
+* **Only `404` and an unreachable host count as absent.** A `401` wanting
+  credentials, or a hostname rather than an address, returns *unknown* and goes
+  through to Pulse unchanged — treating those as absent would strand every
+  password-protected camera.
+* **It runs on the connect worker, not the UI thread.** It costs a round trip,
+  which the UI must never pay.
+* **The connect is non-blocking with `poll()`.** `SO_SNDTIMEO` does *not* bound
+  `connect()` on macOS — a host that silently drops SYNs takes the full
+  75-second TCP timeout, measured. A blocking probe would freeze the window for
+  over a minute per unreachable camera.
+
+Once a slot exists, its own push addresses live in **that feed's inspector**,
+alongside its URL and uptime — which is where you look when you are working on
+one particular device, and it avoids a settings panel that grows a block per
+camera. Inspector values are tail-elided to keep the card narrow, which cuts
+exactly the host and port a device needs, so **hovering any row shows the full
+value and clicking copies it**. The receiver panel's own address lines copy the
+same way.
+
+The app writes mediamtx's config itself on every start (to
+`~/Library/Application Support/UAV Wall/mediamtx.yml`, overwritten each time),
+owns the process, and stops it on exit so its listening sockets do not block the
+next run. Everything not needed is switched off: HLS, WebRTC, the API and
+metrics would all be listeners exposed for no reason, and MoQ additionally
+writes a TLS key into the working directory — which for a bundled app is `/`.
+Ports are `ingest_rtsp_port` / `ingest_rtmp_port` / `ingest_srt_port` in
+`uavwall.conf`, defaulting to 8554 / 1935 / 8890. If one is already taken — most
+likely by a mediamtx you started yourself — the receiver reports the bind error
+in the panel and switches itself back off.
+
+Two traps worth knowing, both found against real devices:
+
+* **The RTMP path needs two segments.** `/live/wearable` works; `/wearable` is
+  rejected outright by Larix and others. mediamtx accepts either, so testing
+  with ffmpeg alone never shows it.
+* **Set the device to Baseline profile.** High-profile H.264 breaks up badly —
+  see [`docs/porting.md`](../../docs/porting.md).
 
 ### Windows demo kit
 
