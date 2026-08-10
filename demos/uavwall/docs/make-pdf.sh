@@ -23,8 +23,18 @@ render () {
     src="$DIR/$1.html"
     out="$DIR/$2.pdf"
     [ -f "$src" ] || { echo "error: no $src" >&2; exit 1; }
+    # Under Git Bash on Windows the POSIX path (/d/...) means nothing to the
+    # browser — it quietly prints its own error page instead of the document.
+    # cygpath exists exactly there, so use it to hand over a real Windows path.
+    if command -v cygpath >/dev/null 2>&1; then
+        src="$(cygpath -m "$src")"
+        out="$(cygpath -m "$out")"
+    fi
+    # --allow-file-access-from-files: the documents @font-face the app's own
+    # fonts out of ../assets/fonts, and file:// pages cannot fetch file://
+    # fonts without it (file origins are opaque, so the CORS check fails).
     "$CHROME" --headless --disable-gpu --no-sandbox \
-        --no-pdf-header-footer \
+        --no-pdf-header-footer --allow-file-access-from-files \
         --print-to-pdf="$out" "file://$src" >/dev/null 2>&1
     [ -s "$out" ] || { echo "error: produced nothing for $1" >&2; exit 1; }
     echo "  $(basename "$out")  ($(du -h "$out" | awk '{print $1}'))"
