@@ -117,6 +117,34 @@ install_name_tool -id @rpath/libpexpulse.dylib \
 install_name_tool -id @rpath/libpexlgpl.dylib \
     "$APP/Contents/Frameworks/libpexlgpl.dylib"
 
+# Everything else the binary links. Naming the Pulse libraries individually was
+# never enough: CMake also links GLFW, and on a machine with Homebrew that
+# resolves to /opt/homebrew/opt/glfw/lib/libglfw.3.dylib — an absolute path that
+# does not exist on the recipient's Mac, so the app died in dyld before main().
+# Walk the real dependency list instead, recursively, and rewrite each to
+# @rpath. Anything already inside the bundle, in /usr/lib or in /System is left
+# alone; those are present everywhere.
+bundle_deps () {
+    otool -L "$1" | tail -n +2 | awk '{print $1}' |
+        grep -v '^/usr/lib/\|^/System/\|^@rpath/\|^@loader_path/\|^@executable_path/' |
+        while read -r dep; do
+            base="$(basename "$dep")"
+            if [ ! -f "$APP/Contents/Frameworks/$base" ]; then
+                cp "$dep" "$APP/Contents/Frameworks/$base"
+                chmod u+w "$APP/Contents/Frameworks/$base"
+                install_name_tool -id "@rpath/$base" "$APP/Contents/Frameworks/$base"
+                echo "  bundled $base ($dep)"
+                bundle_deps "$APP/Contents/Frameworks/$base"
+            fi
+            install_name_tool -change "$dep" "@rpath/$base" "$1"
+        done
+}
+
+bundle_deps "$APP/Contents/MacOS/uavwall"
+for d in "$APP/Contents/Frameworks"/*.dylib; do
+    bundle_deps "$d"
+done
+
 # mediamtx ships by default. The app runs it itself for the RTMP/SRT receiver
 # (Settings > Feeds), writing its config and owning the process, so nothing
 # needs a terminal — and it is MIT, so it adds attribution and no more.
@@ -163,6 +191,38 @@ if [ -n "$TOOLS" ]; then
         fi
     fi
 fi
+
+# --- Self-containment check ---------------------------------------------
+#
+# The whole point of the bundle is that it runs on a Mac with nothing
+# installed, and there is exactly one way to be sure: no load command may point
+# outside the bundle. This shipped once without it — a Homebrew libglfw path
+# survived, and the app died in dyld before main() on the recipient's machine
+# with "Library not loaded". A build that cannot satisfy this should fail here,
+# loudly, rather than at a colleague's desk.
+LEAKS=""
+# Helper tools are checked too, and more strictly: they are standalone
+# executables with no rpath into our Frameworks, so for them anything outside
+# /usr/lib and /System is a leak. This is what catches a Homebrew ffmpeg.
+for f in "$APP/Contents/MacOS/uavwall" "$APP/Contents/Frameworks"/*.dylib \
+         "$APP/Contents/Resources/tools"/*; do
+    [ -f "$f" ] || continue
+    case "$f" in
+        */Resources/tools/*) allow='^/usr/lib/\|^/System/' ;;
+        *)                   allow='^/usr/lib/\|^/System/\|^@rpath/\|^@loader_path/\|^@executable_path/' ;;
+    esac
+    bad="$(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -v "$allow" || true)"
+    [ -n "$bad" ] && LEAKS="$LEAKS
+  $(basename "$f") -> $(echo "$bad" | tr '\n' ' ')"
+done
+if [ -n "$LEAKS" ]; then
+    echo >&2
+    echo "error: the bundle is NOT self-contained. These will not exist on" >&2
+    echo "       another Mac, and the app will die in dyld before it starts:" >&2
+    echo "$LEAKS" >&2
+    exit 1
+fi
+echo "  self-contained: every library resolves inside the bundle"
 
 # --- Licence notices ------------------------------------------------------
 #
