@@ -3507,6 +3507,19 @@ on_sso_select (PulseSSOProviderList * list, void * user_context)
   return choice;
 }
 
+#if defined(_WIN32)
+// Completing an SSO login means opening the IdP URL in a browser and getting
+// the resulting token back via a pexip-auth:// deep link — plumbing this demo
+// doesn't have on Windows (pexninja shows the full recipe with pulse_ipc).
+// Decline, so an SSO-gated join/registration fails cleanly instead of hanging.
+static bool
+on_sso_request (PulseSSOProviderRequest *, PulseSSOProviderSetToken *, void *)
+{
+  std::fprintf (stderr, "[pexclient] SSO login not supported on Windows\n");
+  return false;
+}
+#endif
+
 int
 main (int argc, char ** argv)
 {
@@ -3567,10 +3580,13 @@ main (int argc, char ** argv)
   // The logger must be installed before the first pulse_new* call.
   pulse_global_logger_callback (on_pulse_log, nullptr);
 #if defined(_WIN32)
-  // The Windows Pulse build does not export the internal-SSO constructor (no
-  // pexip-auth:// deep-link plumbing there yet), so SSO joins/registration
-  // are unavailable on this platform — everything else works identically.
-  (void) &on_sso_select;
+  // The Windows Pulse build does not export the internal-SSO constructor;
+  // pulse.h says the supported recipe there is pulse_new() plus
+  // pulse_options_set_sso_provider_callbacks(). Those hooks must exist for
+  // pulse_register to work at all — even for plain password registration.
+  // Actually *completing* an SSO login needs pexip-auth:// deep-link plumbing
+  // this demo doesn't have on Windows, so the request callback declines and
+  // SSO-gated joins/registrations fail cleanly instead of hanging.
   app.pulse = pulse_new ();
 #else
   app.pulse = pulse_new_with_internal_sso_handling (argc, (const char **) argv, on_sso_select, &app);
@@ -3579,6 +3595,15 @@ main (int argc, char ** argv)
     std::fprintf (stderr, "pulse_new() returned NULL\n");
     return 1;
   }
+
+#if defined(_WIN32)
+  PulseSSOProviderCallbackConfig sso_cb{};
+  sso_cb.selection_callback = on_sso_select;
+  sso_cb.selection_callback_user_context = &app;
+  sso_cb.request_callback = on_sso_request;
+  sso_cb.request_callback_user_context = &app;
+  pulse_options_set_sso_provider_callbacks (app.pulse, &sso_cb);
+#endif
 
   // We render all video ourselves.
   pulse_options_set_self_view_window_handle (app.pulse, nullptr);
