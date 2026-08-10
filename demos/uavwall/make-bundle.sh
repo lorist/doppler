@@ -2,25 +2,32 @@
 # make-bundle.sh — wrap the built uavwall binary into a self-contained macOS .app.
 #
 # The result runs on any Apple-silicon Mac with nothing installed: the Pulse
-# runtime, the fonts and the app itself all live inside the bundle. An operator
-# adds their own footage with Settings > Feeds > + ADD FILE, which Pulse decodes
-# directly — no ffmpeg and no media server involved.
+# runtime, the fonts, four demo clips and the app itself all live inside the
+# bundle. It opens onto a working wall; an operator swaps in their own footage
+# with Settings > Feeds > + ADD FILE, which Pulse decodes directly — no media
+# server involved.
 #
 #     ./demos/uavwall/make-bundle.sh
 #     open build/UAV\ Wall.app
 #
-# Optional extras, only needed for features that shell out:
+# mediamtx is included, so the RTMP/SRT receiver works out of the box. ffmpeg
+# is NOT: it is GPL, and shipping it turns handing over the app into a GPL
+# distribution. Nothing in the demo needs it, and a recipient who wants import,
+# recording or audio monitoring runs `brew install ffmpeg` — which the app tells
+# them, and then finds automatically. docs/uavwall-setup.pdf is the guide to
+# give them.
 #
-#     FFMPEG_STATIC=/path/to/static/ffmpeg \
+# To include it anyway (accepting the obligations — see docs/third-party.md):
+#
+#     ./demos/uavwall/fetch-ffmpeg.sh          # once: a portable arm64 build
+#     SOURCE_OFFER="You <you@example.com>" \
 #       ./demos/uavwall/make-bundle.sh --with-tools
 #
-# copies ffmpeg and mediamtx in as well. ffmpeg is what prepares an imported
-# clip (Pulse decodes High-profile H.264 badly, so + ADD FILE transcodes first)
-# and what records; mediamtx is only needed for wearables pushing in.
+# Homebrew's ffmpeg links ~58 Homebrew dylibs and is NOT portable, so use
+# fetch-ffmpeg.sh or pass FFMPEG_STATIC — the script checks what it copied.
 #
-# Homebrew's ffmpeg links ~58 Homebrew dylibs and is NOT portable, so pass
-# FFMPEG_STATIC pointing at a static build — the script checks what it copied
-# and says which you got.
+# NO_MEDIAMTX=1 drops the media server. CLIP_SECONDS sets how much of each demo
+# clip to carry (default 20).
 #
 # What this does NOT do is sign anything. An unsigned app copied to another Mac
 # is blocked by Gatekeeper, and the recipient has to right-click > Open. For
@@ -35,6 +42,18 @@ ASSETS="$ROOT/demos/uavwall/assets"
 APP="$ROOT/build/UAV Wall.app"
 WITH_TOOLS=0
 
+# --- Fill this in before the bundle leaves your machine -------------------
+#
+# The ffmpeg build carried by --with-tools is GPL, and GPL requires that a
+# recipient be able to get the corresponding source. A written offer naming a
+# real contact is the usual way to satisfy that. Put yours here (or pass
+# SOURCE_OFFER=... on the command line) and it goes into the bundle's
+# THIRD-PARTY-NOTICES.txt; leave it empty and the build warns.
+#
+# Something like:
+#   SOURCE_OFFER="Ada Lovelace <ada@example.com>, Example Ltd, 1 Somewhere St."
+SOURCE_OFFER="${SOURCE_OFFER:-}"
+
 [ "$1" = "--with-tools" ] && WITH_TOOLS=1
 
 [ -x "$BIN" ] || { echo "error: build the uavwall target first" >&2; exit 1; }
@@ -45,6 +64,31 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resourc
 cp "$BIN" "$APP/Contents/MacOS/uavwall"
 cp "$SDK/libpexpulse.dylib" "$SDK/libpexlgpl.dylib" "$APP/Contents/Frameworks/"
 cp -R "$ASSETS" "$APP/Contents/Resources/assets"
+
+# Four demo clips, so the app shows a live wall the moment it is opened. The
+# app falls back to the rtsp://127.0.0.1:8554/uavN URLs when these are absent,
+# which is what a source build wants — so this stays optional.
+#
+# Built from UAV_footage/prepared, downscaled and clipped: those masters are
+# 144MB and would dominate the bundle. 720p at CRF 28 is well beyond what a
+# tile shows, and Pulse needs Constrained Baseline either way (it decodes High
+# profile badly — the same reason + ADD FILE transcodes on import).
+if [ -d "$ROOT/UAV_footage/prepared" ] && command -v ffmpeg >/dev/null 2>&1; then
+    mkdir -p "$APP/Contents/Resources/clips"
+    for n in 1 2 3 4; do
+        src="$ROOT/UAV_footage/prepared/feed$n.mp4"
+        [ -f "$src" ] || continue
+        ffmpeg -nostdin -hide_banner -loglevel error -i "$src" -t "${CLIP_SECONDS:-20}" -an \
+            -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25" \
+            -c:v libx264 -profile:v baseline -level 3.1 -preset veryfast -crf 28 -movflags +faststart \
+            -y "$APP/Contents/Resources/clips/feed$n.mp4"
+    done
+    echo "  bundled $(ls "$APP/Contents/Resources/clips" | wc -l | tr -d ' ') demo clips" \
+         "($(du -sh "$APP/Contents/Resources/clips" | awk '{print $1}'))"
+else
+    echo "  no demo clips (needs UAV_footage/prepared and ffmpeg) —"
+    echo "    the app will default to the rtsp://127.0.0.1:8554/uavN feeds instead"
+fi
 
 # The dylibs carry absolute install names from Pexip's build machine; discover
 # them rather than hard-coding.
@@ -73,13 +117,34 @@ install_name_tool -id @rpath/libpexpulse.dylib \
 install_name_tool -id @rpath/libpexlgpl.dylib \
     "$APP/Contents/Frameworks/libpexlgpl.dylib"
 
-if [ "$WITH_TOOLS" -eq 1 ]; then
-    mkdir -p "$APP/Contents/Resources/tools"
+# mediamtx ships by default. The app runs it itself for the RTMP/SRT receiver
+# (Settings > Feeds), writing its config and owning the process, so nothing
+# needs a terminal — and it is MIT, so it adds attribution and no more.
+# NO_MEDIAMTX=1 leaves it out if you only ever use RTSP cameras.
+#
+# ffmpeg does NOT ship by default, and that is deliberate: it is GPL, which
+# makes handing the bundle to someone a distribution of GPL software with a
+# source-offer obligation attached. Nothing in the demo needs it — the clips
+# are transcoded here at build time and Pulse decodes RTSP itself. A recipient
+# who wants import, recording or audio monitoring installs it themselves with
+# `brew install ffmpeg`, obtaining it (and accepting its licence) from its own
+# distributor. See docs/third-party.md.
+mkdir -p "$APP/Contents/Resources/tools"
+TOOLS=""
+[ -z "$NO_MEDIAMTX" ] && TOOLS="mediamtx"
+[ "$WITH_TOOLS" -eq 1 ] && TOOLS="$TOOLS ffmpeg"
+
+if [ -n "$TOOLS" ]; then
     # ffplay is a Windows-only need (LISTEN uses ffmpeg's audiotoolbox output on
     # macOS), so it is not copied here.
-    for t in ffmpeg mediamtx; do
+    for t in $TOOLS; do
         p="$(command -v "$t" 2>/dev/null || true)"
-        [ "$t" = "ffmpeg" ] && [ -n "$FFMPEG_STATIC" ] && p="$FFMPEG_STATIC"
+        # For ffmpeg, prefer a portable build over whatever is on PATH:
+        # FFMPEG_STATIC if given, else what fetch-ffmpeg.sh installed.
+        if [ "$t" = "ffmpeg" ]; then
+            [ -x "$ROOT/build/tools/ffmpeg" ] && p="$ROOT/build/tools/ffmpeg"
+            [ -n "$FFMPEG_STATIC" ] && p="$FFMPEG_STATIC"
+        fi
         [ -n "$p" ] && cp "$p" "$APP/Contents/Resources/tools/" && echo "  bundled $t ($p)"
     done
     # A copied ffmpeg is only useful if it is self-contained. Check the one that
@@ -90,15 +155,141 @@ if [ "$WITH_TOOLS" -eq 1 ]; then
         if [ "$NONSYS" -gt 0 ]; then
             echo
             echo "  WARNING: the bundled ffmpeg links $NONSYS non-system libraries and"
-            echo "           will NOT run on a machine without them. Re-run with a"
-            echo "           static build, e.g.:"
-            echo "             FFMPEG_STATIC=/path/to/static/ffmpeg \\"
-            echo "               ./demos/uavwall/make-bundle.sh --with-tools"
+            echo "           will NOT run on a machine without them. Import and record"
+            echo "           will fail for the recipient. Fix with:"
+            echo "             ./demos/uavwall/fetch-ffmpeg.sh"
         else
             echo "  ffmpeg is self-contained ($NONSYS non-system libraries)"
         fi
     fi
 fi
+
+# --- Licence notices ------------------------------------------------------
+#
+# Assembled here rather than kept as a static file, because what the bundle
+# owes depends on what went into it: the fonts and the SDK always, ffmpeg only
+# with --with-tools, and not at all under NO_MEDIAMTX. ffmpeg's terms are read
+# from the binary that was actually copied (fetch-ffmpeg.sh records them) —
+# --enable-gpl and --enable-version3 are what decide GPL-2 vs GPL-3, and
+# guessing from the vendor gets that wrong.
+NOTICES="$APP/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+LICDIR="$APP/Contents/Resources/licenses"
+mkdir -p "$LICDIR"
+
+{
+    echo "UAV Wall — third-party notices"
+    echo
+    echo "This application includes the components below. Licence texts are in"
+    echo "Contents/Resources/licenses/ inside this bundle."
+    echo
+    echo "── Pexip Pulse SDK ──────────────────────────────────────────────"
+    echo "libpexpulse.dylib is proprietary, licensed under the Pexip Software"
+    echo "Development Kit License Agreement — see licenses/Pexip-SDK-LICENSE.txt,"
+    echo "which also carries Pexip's own open-source notices for the components"
+    echo "inside the runtime."
+    echo
+    echo "SCOPE: redistribution of the SDK inside this bundle was confirmed with"
+    echo "Pexip on 10 August 2026 for INTERNAL PEXIP USE ONLY, to demonstrate the"
+    echo "functionality. This app is not cleared for customers, partners, or"
+    echo "anyone outside Pexip. Do not forward it externally without going back"
+    echo "to Pexip for a wider clearance."
+    echo
+    echo "libpexlgpl.dylib carries the LGPL dependencies (GStreamer, GLib,"
+    echo "libav/ffmpeg, OpenSSL, Opus) that Pexip deliberately separated out. It"
+    echo "is shipped as its own shared library, dynamically linked and therefore"
+    echo "replaceable by the user, which is how LGPL s4 is satisfied. Do not"
+    echo "merge or statically absorb it."
+    echo
+    echo "── Dear ImGui (MIT) and GLFW (zlib/libpng) ──────────────────────"
+    echo "Compiled into the application binary. Permissive; attribution only."
+    echo
+    echo "── DM Sans, IBM Plex Mono (SIL Open Font License 1.1) ───────────"
+    echo "See licenses/LICENSE-DMSans.txt and licenses/LICENSE-IBMPlexMono.txt."
+    echo "The OFL requires its text to travel with the fonts."
+    echo
+} > "$NOTICES"
+
+cp "$ASSETS/fonts/LICENSE-DMSans.txt" "$ASSETS/fonts/LICENSE-IBMPlexMono.txt" "$LICDIR/" 2>/dev/null || true
+
+# The macOS SDK ships no licence file — only the two dylibs. The agreement, and
+# with it Pexip's open-source notices for what is inside the runtime, is in the
+# Windows NuGet, and the same terms govern every platform's artifacts. Extract
+# it rather than keeping a 1MB copy in the tree.
+NUPKG=$(ls "$ROOT"/sdk/windows/*.nupkg 2>/dev/null | head -1)
+if [ -n "$NUPKG" ] && unzip -p "$NUPKG" LICENSE.txt > "$LICDIR/Pexip-SDK-LICENSE.txt" 2>/dev/null \
+   && [ -s "$LICDIR/Pexip-SDK-LICENSE.txt" ]; then
+    :
+else
+    rm -f "$LICDIR/Pexip-SDK-LICENSE.txt"
+    echo "  WARNING: could not extract the Pexip SDK licence from sdk/windows/*.nupkg"
+    echo "           — the bundle is missing licenses/Pexip-SDK-LICENSE.txt"
+fi
+
+if [ -d "$APP/Contents/Resources/clips" ]; then
+    {
+        echo "── Demo clips ───────────────────────────────────────────────────"
+        echo "Contents/Resources/clips/feed1-4.mp4 are downscaled excerpts of"
+        echo "stock footage from Pexels (https://www.pexels.com), used under the"
+        echo "Pexels License: free for commercial and non-commercial use, no"
+        echo "attribution required, but the clips may not be sold unaltered and"
+        echo "may not be used to imply endorsement by people shown in them."
+        echo "Replace them if either restriction is awkward for your use."
+        echo
+    } >> "$NOTICES"
+fi
+
+if [ -x "$APP/Contents/Resources/tools/ffmpeg" ]; then
+    FFLIC="$(cat "$ROOT/build/tools/ffmpeg-LICENSE-ID.txt" 2>/dev/null || echo "GPL — check the build")"
+    FFVER="$("$APP/Contents/Resources/tools/ffmpeg" -version 2>/dev/null | head -1)"
+    {
+        echo "── ffmpeg ($FFLIC) ──────────────────────────────────"
+        echo "$FFVER"
+        echo
+        echo "Bundled at Contents/Resources/tools/ffmpeg and run as a separate"
+        echo "process — it is not linked into this application. Invoking a"
+        echo "copyleft program as a subprocess does not make the calling program"
+        echo "a derived work, but SHIPPING the binary is a distribution, and the"
+        echo "obligations attach to it:"
+        echo
+        echo "  * the licence text must travel with it — see"
+        echo "    licenses/ffmpeg-LICENSE.txt;"
+        echo "  * corresponding source must be provided or offered. FFmpeg's"
+        echo "    source is at https://ffmpeg.org/download.html and the exact"
+        echo "    build's configuration is recorded in licenses/ffmpeg-BUILD.txt."
+        echo
+        if [ -n "$SOURCE_OFFER" ]; then
+            echo "    WRITTEN OFFER: for three years from receipt of this software,"
+            echo "    the distributor named below will supply, on request, the"
+            echo "    complete corresponding source for the bundled ffmpeg, for no"
+            echo "    more than the cost of distribution:"
+            echo
+            echo "      $SOURCE_OFFER"
+        else
+            echo "    A written offer valid for three years is the usual way to"
+            echo "    satisfy this. NO OFFER HAS BEEN SET FOR THIS BUILD — rebuild"
+            echo "    with SOURCE_OFFER set (see the top of make-bundle.sh) before"
+            echo "    distributing this app."
+        fi
+        echo
+        echo "An LGPL-only ffmpeg build would avoid the GPL obligation, at the"
+        echo "cost of the encoders those builds omit (libx264 among them, which"
+        echo "this app uses to prepare imported clips)."
+        echo
+    } >> "$NOTICES"
+    cp "$ROOT/build/tools/ffmpeg-LICENSE.txt" "$LICDIR/" 2>/dev/null || true
+    cp "$ROOT/build/tools/ffmpeg-BUILD.txt" "$LICDIR/" 2>/dev/null || true
+fi
+
+if [ -x "$APP/Contents/Resources/tools/mediamtx" ]; then
+    {
+        echo "── mediamtx (MIT) ───────────────────────────────────────────────"
+        echo "Bundled at Contents/Resources/tools/mediamtx and run as a separate"
+        echo "process. Attribution only; see https://github.com/bluenviron/mediamtx."
+        echo
+    } >> "$NOTICES"
+fi
+
+echo "  wrote THIRD-PARTY-NOTICES.txt ($(grep -c '^── ' "$NOTICES") components)"
 
 # Ad-hoc sign, last, after install_name_tool has finished rewriting load
 # commands — every one of those invalidates the signature the linker applied.
@@ -143,6 +334,18 @@ echo
 echo "  Config:     ~/Library/Application Support/UAV Wall/uavwall.conf"
 echo "  Recordings: ~/Movies/UAV Wall"
 echo
+if [ -x "$APP/Contents/Resources/tools/ffmpeg" ] && [ -z "$SOURCE_OFFER" ]; then
+    echo "  WARNING: this bundle carries GPL ffmpeg with NO source offer."
+    echo "  Set SOURCE_OFFER before giving it to anyone:"
+    echo
+    echo "    SOURCE_OFFER=\"Your Name <you@example.com>, Company, Address\" \\"
+    echo "      ./demos/uavwall/make-bundle.sh --with-tools"
+    echo
+    echo "  Or edit the SOURCE_OFFER line at the top of make-bundle.sh so every"
+    echo "  build gets it. See docs/third-party.md."
+    echo
+fi
+
 if [ "$SIGN_ID" = "-" ]; then
     echo "  Ad-hoc signed only, so Gatekeeper will reject it on another Mac."
     echo "  The recipient must: try to open it, then System Settings >"
