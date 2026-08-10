@@ -59,8 +59,15 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <arpa/inet.h>  // inet_ntop — the LAN address shown for RTMP/SRT push
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 #include <cctype>
@@ -236,14 +243,20 @@ home_dir ()
   return h ? h : ".";
 }
 
-// Contents/Resources/assets when running from a .app, empty otherwise.
+// Contents/Resources/<name> when running from a .app, empty otherwise.
 static std::string
-bundle_asset_dir ()
+bundle_resource_dir (const char * name)
 {
   if (!in_app_bundle ())
     return "";
   const std::string d = exe_dir (); // .../Contents/MacOS
-  return d.substr (0, d.size () - 5) + "Resources/assets";
+  return d.substr (0, d.size () - 5) + "Resources/" + name;
+}
+
+static std::string
+bundle_asset_dir ()
+{
+  return bundle_resource_dir ("assets");
 }
 
 // Everything an operator might reasonably want to change, with defaults chosen
@@ -283,6 +296,20 @@ struct Config
   bool rtsp_tcp = true;                  // TCP suits most IP cameras
   int rtsp_latency_ms = 200;
   bool autoconnect = false;              // connect every feed at startup
+
+  // Ingest: a bundled mediamtx the app runs itself, so a wearable can push
+  // RTMP or SRT into the wall without anyone opening a terminal. Pulse only
+  // speaks RTSP, and RTMP/SRT are push protocols — something has to listen and
+  // republish, which is the whole job of this server.
+  bool ingest = false;                   // run the receiver at startup
+  int ingest_rtsp_port = 8554;
+  int ingest_rtmp_port = 1935;
+  int ingest_srt_port = 8890;
+  // Names the slots the receiver hands out: live/<prefix>-01, -02, and so on,
+  // and the feed created for each. "source" because what pushes in might be a
+  // wearable, a UAV, a drone or a phone — set it to whatever this demo is
+  // about and the addresses read sensibly.
+  std::string ingest_prefix = "source";
 
   // Where recordings are written. Relative paths resolve against the working
   // directory, same as uavwall.conf itself.
@@ -469,6 +496,12 @@ struct Feed
   RgbaImage frame; // CPU copy for the compositor
   double last_frame_at = 0.0;
   double connected_at = 0.0;   // for the inspector's UPTIME
+
+  // Receiver feeds only: when to try again. A device takes a few seconds to
+  // finish its RTMP handshake, and mediamtx serves nothing on the path until
+  // it does — so connecting a moment early fails permanently unless something
+  // retries. Zero means "not waiting on anything".
+  double retry_at = 0.0;
   Recorder rec;                // per-feed capture, stream-copied
 
   // Measured locally: Pulse exposes no RTSP-level counters, so decoded-frame
@@ -635,6 +668,15 @@ struct App
   int monitor_feed = -1;
   Recorder monitor; // an ffmpeg child playing the selected feed's audio
   std::vector<Prepare> preparing; // clips being transcoded before becoming feeds
+
+  // The RTMP/SRT receiver: a mediamtx child, owned by the app so nobody has to
+  // start one by hand. `ready` means its RTSP port answered, which is the only
+  // thing worth reporting — the process being alive says nothing about whether
+  // it managed to bind.
+  Recorder ingest;
+  bool ingest_ready = false;
+  double ingest_next_probe = 0;
+  std::string ingest_error;
 
   // The one feed whose audio is sent into the conference, or -1 for silence.
   int air_feed = -1;
@@ -806,6 +848,23 @@ load_config (App & app)
       app.cfg.send_as_content = (v == "content");
     else if (k == "record_dir")
       app.cfg.record_dir = v;
+    else if (k == "ingest")
+      app.cfg.ingest = (v == "true" || v == "1");
+    else if (k == "ingest_rtsp_port")
+      app.cfg.ingest_rtsp_port = std::max (1, std::min (65535, atoi (v.c_str ())));
+    else if (k == "ingest_rtmp_port")
+      app.cfg.ingest_rtmp_port = std::max (1, std::min (65535, atoi (v.c_str ())));
+    else if (k == "ingest_srt_port")
+      app.cfg.ingest_srt_port = std::max (1, std::min (65535, atoi (v.c_str ())));
+    else if (k == "ingest_prefix") {
+      // Goes straight into a URL path, so keep it to what is safe there.
+      std::string p;
+      for (char c : v)
+        if (isalnum ((unsigned char) c) || c == '-' || c == '_')
+          p += (char) tolower ((unsigned char) c);
+      if (!p.empty ())
+        app.cfg.ingest_prefix = p;
+    }
     else if (k == "audio_delay_ms")
       app.cfg.audio_delay_ms = std::max (0, std::min (2000, atoi (v.c_str ())));
     else if (k == "preset_a")
@@ -840,16 +899,42 @@ load_config (App & app)
 
   stamp_config (app);
 
-  // Still nothing: default to what scripts/uav-streams.sh publishes, so a
-  // fresh checkout demonstrates itself.
+  // Still nothing: give the operator four feeds that work on first launch.
+  //
+  // From a .app that carries clips, those clips — the recipient double-clicks
+  // the icon and sees a live wall with no server, no script and no terminal.
+  // Otherwise the RTSP URLs scripts/uav-streams.sh publishes, so a fresh
+  // checkout still demonstrates itself.
   if (app.feeds.empty ()) {
     // Matches the callsigns scripts/uav-streams.sh burns into its overlays.
     static const char * kCallsigns[] = {"HAWKEYE 21", "KESTREL 33", "NOMAD 14", "OSPREY 12"};
+    const std::string clips = bundle_resource_dir ("clips");
     for (int i = 0; i < 4; i++) {
       Feed f;
       f.name = kCallsigns[i];
-      f.url = "rtsp://127.0.0.1:8554/uav" + std::to_string (i + 1);
+      const std::string clip = clips.empty ()
+                                 ? std::string ()
+                                 : clips + "/feed" + std::to_string (i + 1) + ".mp4";
+      f.url = (!clip.empty () && access (clip.c_str (), R_OK) == 0)
+                ? clip
+                : "rtsp://127.0.0.1:8554/uav" + std::to_string (i + 1);
       app.feeds.push_back (std::move (f));
+    }
+  }
+
+  // Feeds are saved as absolute paths, so a bundled clip's URL names wherever
+  // the .app happened to be on first run. Dragging it to /Applications
+  // afterwards — the first thing anyone does — would break all four. Re-point
+  // any missing clip at this bundle's copy.
+  const std::string clips = bundle_resource_dir ("clips");
+  if (!clips.empty ()) {
+    for (Feed & f : app.feeds) {
+      const std::size_t at = f.url.find ("/Contents/Resources/clips/");
+      if (at == std::string::npos || access (f.url.c_str (), R_OK) == 0)
+        continue;
+      const std::string here = clips + f.url.substr (at + 25); // keeps the leading '/'
+      if (access (here.c_str (), R_OK) == 0)
+        f.url = here;
     }
   }
 }
@@ -895,6 +980,15 @@ save_config (App & app, bool force = true)
   ofs << "rtsp_transport=" << (app.cfg.rtsp_tcp ? "tcp" : "udp") << "\n";
   ofs << "rtsp_latency_ms=" << app.cfg.rtsp_latency_ms << "\n";
   ofs << "autoconnect=" << (app.cfg.autoconnect ? "true" : "false") << "\n\n";
+  ofs << "# Receiver for wearables that push RTMP or SRT. Republished as RTSP\n";
+  ofs << "# on ingest_rtsp_port, which is what the wall then connects to.\n";
+  ofs << "ingest=" << (app.cfg.ingest ? "true" : "false") << "\n";
+  ofs << "ingest_rtsp_port=" << app.cfg.ingest_rtsp_port << "\n";
+  ofs << "ingest_rtmp_port=" << app.cfg.ingest_rtmp_port << "\n";
+  ofs << "ingest_srt_port=" << app.cfg.ingest_srt_port << "\n";
+  ofs << "# Slot naming: live/<prefix>-01, -02 ... Set it to uav, drone, cam,\n";
+  ofs << "# wearable, or whatever this wall is showing.\n";
+  ofs << "ingest_prefix=" << app.cfg.ingest_prefix << "\n\n";
   ofs << "# Interface. ui_scale applies on next start.\n";
   ofs << "ui_scale=" << app.cfg.ui_scale << "\n";
   ofs << "show_stats=" << (app.cfg.show_stats ? "true" : "false") << "\n\n";
@@ -947,6 +1041,9 @@ static void stop_feed (Feed & f);
 // rather than thread the whole Config through it.
 static bool g_cfg_rtsp_tcp = true;
 static int g_cfg_rtsp_latency_ms = 200;
+// The receiver's RTSP port, or 0 when it is off. start_feed needs to tell a
+// feed served by our own mediamtx from an ordinary camera, and it has no App.
+static int g_ingest_port = 0;
 
 // The worker half of start_feed: every Pulse call for one feed's connect, on
 // its own thread. No GL in here — the texture is created at adoption, on the
@@ -960,9 +1057,117 @@ source_is_file (const std::string & s)
   return s.find ("://") == std::string::npos;
 }
 
+// Does this RTSP path actually carry a stream right now?
+//
+// This exists because retrying a connect is not cheap or safe: each attempt
+// builds a Pulse instance and, on failure, tears it down — and that teardown
+// runs on the main dispatch queue, where repeated cycles segfault inside
+// _pex_avf_video_sink_set_layer. So ask the server first, over a plain socket.
+// RTSP is a text protocol and DESCRIBE answers exactly this question: 200 when
+// a publisher exists, 404 when the path is empty.
+enum RtspProbe
+{
+  RtspReady,   // a publisher is there — connecting will work
+  RtspAbsent,  // definitively nothing there; connecting would fail
+  RtspUnknown  // cannot tell (needs auth, odd host, timeout) — let Pulse try
+};
+
+static RtspProbe
+rtsp_probe (const std::string & url, int timeout_ms)
+{
+#if defined(_WIN32)
+  (void) url;
+  return RtspUnknown;
+#else
+  if (url.compare (0, 7, "rtsp://") != 0)
+    return RtspUnknown;
+  const std::size_t hs = 7;
+  const std::size_t slash = url.find ('/', hs);
+  std::string hostport = url.substr (hs, slash == std::string::npos ? std::string::npos : slash - hs);
+  const std::size_t colon = hostport.find (':');
+  std::string host = colon == std::string::npos ? hostport : hostport.substr (0, colon);
+  int port = colon == std::string::npos ? 554 : atoi (hostport.c_str () + colon + 1);
+
+  struct sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons ((uint16_t) port);
+  if (inet_pton (AF_INET, host.c_str (), &a.sin_addr) != 1)
+    return RtspUnknown; // a hostname; resolving it here would duplicate Pulse
+  int s = socket (AF_INET, SOCK_STREAM, 0);
+  if (s < 0)
+    return RtspUnknown;
+
+  // The timeout has to be real: SO_SNDTIMEO does NOT bound connect() on macOS.
+  // A host that silently drops SYNs takes the full 75-second TCP timeout —
+  // measured — so a blocking connect here would wedge the caller for over a
+  // minute per unreachable camera. Non-blocking connect plus poll() is the only
+  // way to hold it to the budget.
+  const int kTimeoutMs = timeout_ms;
+  int fl = fcntl (s, F_GETFL, 0);
+  fcntl (s, F_SETFL, fl | O_NONBLOCK);
+
+  bool connected = false;
+  if (connect (s, (struct sockaddr *) &a, sizeof (a)) == 0) {
+    connected = true;
+  } else if (errno == EINPROGRESS) {
+    struct pollfd pfd{s, POLLOUT, 0};
+    if (poll (&pfd, 1, kTimeoutMs) > 0) {
+      int err = 0;
+      socklen_t len = sizeof (err);
+      if (getsockopt (s, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0)
+        connected = true;
+    }
+  }
+  fcntl (s, F_SETFL, fl); // blocking again for the request/response exchange
+  struct timeval tv{0, kTimeoutMs * 1000};
+  setsockopt (s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
+  setsockopt (s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
+
+  // A connect that never completed inside the budget counts as absent: this
+  // runs on the connect worker with seconds to spare, so a camera that cannot
+  // answer in that time was not going to serve video either.
+  RtspProbe r = RtspAbsent;
+  if (connected) {
+    std::string req = "DESCRIBE " + url + " RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n";
+    if (send (s, req.data (), req.size (), 0) == (ssize_t) req.size ()) {
+      char buf[256] = {0};
+      ssize_t n = recv (s, buf, sizeof (buf) - 1, 0);
+      if (n > 12) {
+        // 200 is a stream. 404 is definitively no stream. Anything else —
+        // 401/407 wanting credentials most of all — is Pulse's business, and
+        // treating it as absent would break every password-protected camera.
+        if (strncmp (buf, "RTSP/1.0 200", 12) == 0)
+          r = RtspReady;
+        else if (strncmp (buf, "RTSP/1.0 404", 12) == 0)
+          r = RtspAbsent;
+      }
+    }
+  }
+  close (s);
+  return r;
+#endif
+}
+
 static void
 connect_job_run (std::shared_ptr<ConnectJob> job)
 {
+  // Ask the server whether the stream exists before building anything.
+  //
+  // A failed connect is not free: Pulse tears its AVF video sink down on the
+  // main dispatch queue, and doing that repeatedly — CONNECT ALL over several
+  // dead feeds, or a retry loop waiting for a device — segfaults inside
+  // _pex_avf_video_sink_set_layer. A DESCRIBE over a plain socket answers the
+  // same question for the cost of one round trip, and this is the connect
+  // worker, so the wait costs the UI nothing. Anything the probe cannot settle
+  // — a camera wanting credentials, a hostname rather than an address — still
+  // goes through to Pulse unchanged.
+  if (job->url.compare (0, 7, "rtsp://") == 0 && rtsp_probe (job->url, 2000) == RtspAbsent) {
+    job->error = "no stream at that address";
+    job->failed = true;
+    job->done = true;
+    return;
+  }
+
   {
     // Serialise instance creation only: the first pulse_new() initialises
     // global media state, and racing N of them on first use is not a bet
@@ -1107,6 +1312,7 @@ reap_orphan_connects ()
   }
 }
 
+
 // RTSP in, self-view out — the uniform local-source recipe from videowall.
 // pulse_rtsp_session_connect_input() blocks until the SDP is negotiated —
 // seconds per feed — so this only launches the worker; the feed shows as
@@ -1117,6 +1323,18 @@ start_feed (Feed & f)
   if (f.connected || f.connecting)
     return;
   f.error.clear ();
+
+  // A push protocol in the feed list is the one mistake this design invites:
+  // the receiver panel shows an rtmp:// address, and it is natural to paste it
+  // here. But that address is where the *device* sends to. Pulse only pulls
+  // RTSP, so say what to use instead rather than failing as a bad RTSP URL.
+  for (const char * scheme : {"rtmp://", "rtmps://", "srt://"})
+    if (f.url.compare (0, strlen (scheme), scheme) == 0) {
+      f.error = std::string (scheme).substr (0, strlen (scheme) - 3)
+                + " is a push protocol — point the device at it, and use the "
+                  "receiver's rtsp:// address here";
+      return;
+    }
 
   auto job = std::make_shared<ConnectJob> ();
   job->url = f.url;
@@ -1131,6 +1349,8 @@ start_feed (Feed & f)
 static void
 stop_feed (Feed & f)
 {
+  f.retry_at = 0.0; // switching a feed off ends any wait for its device
+
   // A connect still in flight cannot be cancelled — disown it and let
   // reap_orphan_connects() free whatever it ends up building.
   if (f.connecting)
@@ -1173,6 +1393,10 @@ stop_feed (Feed & f)
 // into their feeds. The GL texture is created here because it needs the GL
 // context, and connected_at is stamped here so UPTIME starts when frames can
 // actually begin to arrive.
+// Defined with the rest of the ingest machinery, further down; needed here to
+// tell a feed backed by the built-in receiver from an ordinary RTSP camera.
+static bool is_ingest_feed (App & app, const Feed & f);
+
 static void
 poll_connect_jobs (App & app)
 {
@@ -1185,7 +1409,19 @@ poll_connect_jobs (App & app)
 
     if (job->failed || !job->pulse) {
       f.error = job->error;
-      app.connect_fail_gen++; // each new failure re-raises the alert bar
+      // A receiver feed that failed because the device has not finished its
+      // handshake is not really an error — it is "not yet". Keep trying rather
+      // than making the operator notice and press Reconnect, which is the one
+      // thing they will not think to do while looking at the phone.
+      // Deliberately not gated on ingest_ready: at startup the receiver is
+      // still binding when autoconnect fires, so that is precisely when the
+      // first failure happens and precisely when a retry is most needed.
+      if (is_ingest_feed (app, f) && app.cfg.ingest) {
+        f.retry_at = ImGui::GetTime () + 2.0;
+        f.error = "waiting for the device to start pushing…";
+      } else {
+        app.connect_fail_gen++; // each new failure re-raises the alert bar
+      }
       // Free here rather than in the worker. Pulse tears its video sink down on
       // the main dispatch queue, and freeing a half-built instance off-thread
       // segfaults in _pex_avf_video_sink_set_layer — which is what made every
@@ -1206,7 +1442,28 @@ poll_connect_jobs (App & app)
 
     f.connected = true;
     f.connected_at = ImGui::GetTime ();
+    f.retry_at = 0.0;
   }
+
+  // Keep trying a receiver feed until its device shows up. Bounded only by the
+  // operator switching the feed off or stopping the receiver — "the phone is
+  // still being set up" can legitimately take minutes, and an attempt costs a
+  // TCP connect to a server on this machine.
+  for (Feed & f : app.feeds) {
+    if (f.retry_at <= 0.0 || f.connected || f.connecting)
+      continue;
+    if (!app.cfg.ingest) {
+      f.retry_at = 0.0; // receiver switched off, or it died — nothing to wait for
+      continue;
+    }
+    if (!app.ingest_ready)
+      continue; // still binding; keep the wait alive without hammering it
+    if (ImGui::GetTime () >= f.retry_at) {
+      f.retry_at = ImGui::GetTime () + 2.0;
+      start_feed (f); // self-gating: it probes before building anything
+    }
+  }
+
   reap_orphan_connects ();
 }
 
@@ -1414,6 +1671,19 @@ find_tool (const char * name)
   }
   return {};
 #else
+  // A bundled copy wins. It is the build the app was tested against, it is
+  // there precisely because the recipient may have no ffmpeg at all, and being
+  // an absolute path inside the bundle it cannot be shadowed by a writable
+  // PATH entry (docs/security-review-uavwall.md, finding 8).
+  {
+    const std::string tools = bundle_resource_dir ("tools");
+    if (!tools.empty ()) {
+      const std::string p = tools + "/" + name;
+      if (access (p.c_str (), X_OK) == 0)
+        return p;
+    }
+  }
+
   const std::string fixed[] = {std::string ("/opt/homebrew/bin/") + name, std::string ("/usr/local/bin/") + name,
                                std::string ("/usr/bin/") + name};
   for (const std::string & p : fixed)
@@ -1693,6 +1963,256 @@ reap_recorder (Recorder & r)
   }
 }
 
+// ---- RTMP/SRT ingest -----------------------------------------------------
+//
+// Pulse speaks RTSP and nothing else, but a wearable or a phone *pushes*: it
+// dials out to a server rather than serving a URL. So something has to accept
+// the push and republish it as RTSP for the wall to pull. That something is
+// mediamtx, bundled at Contents/Resources/tools and run as a child here, so a
+// non-technical operator never opens a terminal or edits a YAML file.
+
+// This machine's LAN address — what the operator types into the device.
+// 127.0.0.1 would be correct only for a stream originating on this Mac.
+static std::string
+lan_ipv4 ()
+{
+#if defined(_WIN32)
+  return "";
+#else
+  struct ifaddrs * ifa = nullptr;
+  if (getifaddrs (&ifa) != 0)
+    return "";
+  std::string best;
+  for (struct ifaddrs * p = ifa; p; p = p->ifa_next) {
+    if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET)
+      continue;
+    if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK))
+      continue;
+    char buf[INET_ADDRSTRLEN] = {0};
+    auto * sin = (struct sockaddr_in *) p->ifa_addr;
+    if (!inet_ntop (AF_INET, &sin->sin_addr, buf, sizeof (buf)))
+      continue;
+    // en0 is the built-in interface on a Mac; prefer it over the VPN and
+    // container bridges that otherwise win by enumeration order.
+    if (best.empty () || strcmp (p->ifa_name, "en0") == 0)
+      best = buf;
+    if (strcmp (p->ifa_name, "en0") == 0)
+      break;
+  }
+  freeifaddrs (ifa);
+  return best;
+#endif
+}
+
+// Is something answering on the port? The child being alive proves nothing —
+// mediamtx exits a moment later if a port is already taken, and the common
+// case for that is the operator's own mediamtx already running on 8554.
+static bool
+port_answers (int port)
+{
+#if defined(_WIN32)
+  (void) port;
+  return true;
+#else
+  int s = socket (AF_INET, SOCK_STREAM, 0);
+  if (s < 0)
+    return false;
+  struct sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_port = htons ((uint16_t) port);
+  a.sin_addr.s_addr = htonl (INADDR_LOOPBACK);
+  struct timeval tv{0, 200000};
+  setsockopt (s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof (tv));
+  const bool ok = connect (s, (struct sockaddr *) &a, sizeof (a)) == 0;
+  close (s);
+  return ok;
+#endif
+}
+
+static std::string
+ingest_dir ()
+{
+  std::string d = std::filesystem::path (config_path ()).parent_path ().string ();
+  if (d.empty ())
+    d = ".";
+  return d;
+}
+
+// A minimal config, written fresh each start so a stale one cannot survive a
+// port change. Everything not needed is off: HLS, WebRTC, the API and metrics
+// are all listeners we would be exposing for no reason, and MoQ additionally
+// generates a TLS key in the working directory — which, for a bundled app, is
+// "/".
+static bool
+write_ingest_config (App & app, const std::string & path)
+{
+  std::ofstream ofs (path, std::ios::trunc);
+  if (!ofs)
+    return false;
+  ofs << "# Written by UAV Wall on every start. Edits will be overwritten.\n";
+  ofs << "logLevel: info\n";
+  ofs << "rtspAddress: 0.0.0.0:" << app.cfg.ingest_rtsp_port << "\n";
+  // The RTP/RTCP pair is derived from the RTSP port so two instances on one
+  // machine — the app's and a hand-started one — do not collide on 8000/8001.
+  ofs << "rtpAddress: :" << (app.cfg.ingest_rtsp_port - 554 + 8000) << "\n";
+  ofs << "rtcpAddress: :" << (app.cfg.ingest_rtsp_port - 554 + 8001) << "\n";
+  ofs << "rtmp: yes\n";
+  ofs << "rtmpAddress: 0.0.0.0:" << app.cfg.ingest_rtmp_port << "\n";
+  ofs << "srt: yes\n";
+  ofs << "srtAddress: 0.0.0.0:" << app.cfg.ingest_srt_port << "\n";
+  ofs << "hls: no\n";
+  ofs << "webrtc: no\n";
+  ofs << "moq: no\n";
+  ofs << "api: no\n";
+  ofs << "metrics: no\n";
+  ofs << "pprof: no\n";
+  ofs << "playback: no\n";
+  ofs << "paths:\n";
+  ofs << "  all_others:\n";
+  return true;
+}
+
+static bool
+start_ingest (App & app)
+{
+  if (app.ingest.busy ())
+    return false;
+  app.ingest_error.clear ();
+  app.ingest_ready = false;
+
+  const std::string exe = find_tool ("mediamtx");
+  if (exe.empty ()) {
+    app.ingest_error = "mediamtx not found";
+    set_status (app, "Receiver needs mediamtx — install it with: brew install mediamtx");
+    return false;
+  }
+  const std::string cfg = ingest_dir () + "/mediamtx.yml";
+  if (!write_ingest_config (app, cfg)) {
+    app.ingest_error = "cannot write " + cfg;
+    set_status (app, app.ingest_error);
+    return false;
+  }
+  // spawn_recorder sends the child's output to <path>.log, which is where the
+  // bind error ends up when a port is taken.
+  app.ingest.path = ingest_dir () + "/mediamtx";
+  if (!spawn_recorder (app.ingest, {exe, cfg}, false)) {
+    app.ingest_error = "could not start mediamtx";
+    set_status (app, app.ingest_error);
+    return false;
+  }
+  app.ingest_next_probe = ImGui::GetTime () + 0.3;
+  set_status (app, "Receiver starting…");
+  return true;
+}
+
+static void
+stop_ingest (App & app)
+{
+  if (app.ingest.pid <= 0 || app.ingest.stopping)
+    return;
+  // mediamtx ignores stdin and has no quit command, so ask it politely with a
+  // signal; reap_recorder's timer escalates if it does not go.
+#if !defined(_WIN32)
+  kill (app.ingest.pid, SIGTERM);
+#endif
+  stop_recorder (app.ingest, false);
+  app.ingest_ready = false;
+}
+
+// Last few lines of the child's log, for reporting why it would not start.
+static std::string
+ingest_log_tail ()
+{
+  std::ifstream ifs (ingest_dir () + "/mediamtx.log");
+  if (!ifs)
+    return "";
+  std::string line, last;
+  while (std::getline (ifs, line))
+    if (line.find ("ERR") != std::string::npos || line.find ("error") != std::string::npos)
+      last = line;
+  // Keep the reason, drop the timestamp and level that precede it.
+  const std::size_t at = last.find ("ERR ");
+  return at == std::string::npos ? last : last.substr (at + 4);
+}
+
+// Several devices can push at once: mediamtx's `all_others` serves any path, so
+// each one just needs its own. These derive that path per feed rather than
+// keeping a parallel list of slots — the feed list *is* the list of devices.
+static bool
+is_ingest_feed (App & app, const Feed & f)
+{
+  char pre[64];
+  snprintf (pre, sizeof (pre), "rtsp://127.0.0.1:%d/", app.cfg.ingest_rtsp_port);
+  return f.url.compare (0, strlen (pre), pre) == 0;
+}
+
+static std::string
+ingest_path_of (App & app, const Feed & f)
+{
+  char pre[64];
+  snprintf (pre, sizeof (pre), "rtsp://127.0.0.1:%d/", app.cfg.ingest_rtsp_port);
+  return is_ingest_feed (app, f) ? f.url.substr (strlen (pre)) : std::string ();
+}
+
+// The next unused slot, so pressing + ADD twice gives two distinct devices.
+static std::string
+next_ingest_path (App & app)
+{
+  for (int n = 1; n < 100; n++) {
+    char p[96];
+    snprintf (p, sizeof (p), "live/%s-%02d", app.cfg.ingest_prefix.c_str (), n);
+    bool used = false;
+    for (const Feed & f : app.feeds)
+      used = used || ingest_path_of (app, f) == p;
+    if (!used)
+      return p;
+  }
+  return "live/" + app.cfg.ingest_prefix;
+}
+
+static std::string
+ingest_push_rtmp (App & app, const std::string & path)
+{
+  const std::string h = lan_ipv4 ();
+  char b[256];
+  snprintf (b, sizeof (b), "rtmp://%s:%d/%s", h.empty () ? "<this-mac>" : h.c_str (), app.cfg.ingest_rtmp_port,
+            path.c_str ());
+  return b;
+}
+
+static std::string
+ingest_push_srt (App & app, const std::string & path)
+{
+  const std::string h = lan_ipv4 ();
+  char b[256];
+  snprintf (b, sizeof (b), "srt://%s:%d?streamid=publish:%s", h.empty () ? "<this-mac>" : h.c_str (),
+            app.cfg.ingest_srt_port, path.c_str ());
+  return b;
+}
+
+static void
+poll_ingest (App & app)
+{
+  reap_recorder (app.ingest);
+
+  if (app.ingest.pid > 0 && !app.ingest.stopping && !app.ingest_ready
+      && ImGui::GetTime () > app.ingest_next_probe) {
+    app.ingest_next_probe = ImGui::GetTime () + 0.4;
+    if (port_answers (app.cfg.ingest_rtsp_port)) {
+      app.ingest_ready = true;
+      set_status (app, "Receiver listening");
+    }
+  }
+
+  // Died on its own — almost always a port already in use.
+  if (app.cfg.ingest && app.ingest.pid <= 0 && !app.ingest.stopping && app.ingest_error.empty ()) {
+    const std::string why = ingest_log_tail ();
+    app.ingest_error = why.empty () ? "receiver stopped" : why;
+    app.ingest_ready = false;
+    set_status (app, "Receiver stopped: " + app.ingest_error);
+    app.cfg.ingest = false;
+  }
+}
 
 // Record one feed by stream-copying it: ffmpeg opens the RTSP URL itself, so
 // this is independent of whether the feed is connected in the wall, and the
@@ -1950,7 +2470,7 @@ start_monitor (App & app, int idx)
   }
 #else
   if (g_ffmpeg.empty ()) {
-    set_status (app, "ffmpeg not found — cannot listen");
+    set_status (app, "ffmpeg not found — install it with: brew install ffmpeg");
     return;
   }
 #endif
@@ -2152,7 +2672,7 @@ start_air (App & app, int idx)
     return;
   stop_air (app);
   if (g_ffmpeg.empty ()) {
-    set_status (app, "ffmpeg not found — cannot send feed audio");
+    set_status (app, "ffmpeg not found — install it with: brew install ffmpeg");
     return;
   }
   Feed & f = app.feeds[(size_t) idx];
@@ -2295,7 +2815,8 @@ add_file_feed (App & app, const std::string & path)
     f.name = name;
     f.url = path;
     app.feeds.push_back (std::move (f));
-    set_status (app, "Added " + name + " unprepared — ffmpeg not found");
+    set_status (app, "Added " + name + " unprepared — it may look blocky. "
+                      "Install ffmpeg (brew install ffmpeg) and re-add it.");
   }
 }
 
@@ -3243,6 +3764,11 @@ ui_inspector (App & app, ImVec2 at, float w)
   dl->AddText (app.fonts.label, theme::fs (10.8f), ImVec2 (at.x + pad, y), theme::WhiteU32 (0.88f), f.name.c_str ());
   y += du (16.0f);
 
+  // Only offer hover affordances when this window is genuinely under the
+  // pointer — Settings is a separate window drawn over the rail, and a tooltip
+  // leaking through it would be nonsense.
+  const bool hover_ok = ImGui::IsWindowHovered (ImGuiHoveredFlags_ChildWindows);
+
   // Label/value rows: label left, value right-aligned, so the numbers form a
   // column the eye can run down.
   auto row = [&] (const char * k, const std::string & v, ImU32 vc) {
@@ -3274,10 +3800,43 @@ ui_inspector (App & app, ImVec2 at, float w)
     }
     dl->AddText (app.fonts.mono, theme::fs (9.2f), ImVec2 (p1.x - pad - mono_w (app, val.c_str (), 9.2f), y), vc,
                  val.c_str ());
+
+    // Elision keeps the card narrow, but the head of a URL — the host and port
+    // a device has to be pointed at — is exactly what gets cut. Hover restores
+    // it; clicking copies it, because a tooltip cannot be typed from.
+    const ImVec2 rmin (at.x + pad, y - du (1.0f));
+    const ImVec2 rmax (p1.x - pad, y + du (11.0f));
+    if (hover_ok && ImGui::IsMouseHoveringRect (rmin, rmax)) {
+      dl->AddRectFilled (rmin, rmax, theme::WhiteU32 (0.05f), du (3.0f));
+      ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+      ImGui::BeginTooltip ();
+      ImGui::PushFont (app.fonts.mono);
+      ImGui::TextUnformatted (v.c_str ());
+      ImGui::PopFont ();
+      ImGui::PushFont (app.fonts.body);
+      ImGui::TextColored (ImVec4 (1, 1, 1, 0.40f), "click to copy");
+      ImGui::PopFont ();
+      ImGui::EndTooltip ();
+      if (ImGui::IsMouseReleased (ImGuiMouseButton_Left)) {
+        ImGui::SetClipboardText (v.c_str ());
+        set_status (app, std::string (k) + " copied to the clipboard");
+      }
+    }
     y += du (12.0f);
   };
 
   row ("URL", f.url, theme::WhiteU32 (0.72f));
+
+  // A receiver-backed feed has a second address that matters more than its
+  // own: where the device has to push. With several devices there is no single
+  // right answer to show in Settings, so it belongs here, against the one feed
+  // it applies to.
+  if (is_ingest_feed (app, f)) {
+    const std::string path = ingest_path_of (app, f);
+    row ("PUSH RTMP", ingest_push_rtmp (app, path), theme::HexU32 (theme::AccentPrimary, 0.85f));
+    row ("PUSH SRT", ingest_push_srt (app, path), theme::HexU32 (theme::AccentPrimary, 0.85f));
+  }
+
   char tbuf[64];
   snprintf (tbuf, sizeof (tbuf), "%s · %dms", app.cfg.rtsp_tcp ? "TCP" : "UDP", app.cfg.rtsp_latency_ms);
   row ("TRANSPORT", tbuf, theme::WhiteU32 (0.72f));
@@ -4045,6 +4604,123 @@ ui_settings (App & app)
     if (toggle_switch (app, "autoconn", app.cfg.autoconnect, ImGui::GetCursorScreenPos (), 28.0f, 15.0f))
       app.cfg.autoconnect = !app.cfg.autoconnect;
     next_row (18.0f);
+
+    // ---- ingest -----------------------------------------------------------
+    // A camera serves RTSP and the wall pulls it. A wearable does the reverse:
+    // it pushes, so it needs something to push *to*. This runs that something.
+    row ("Receiver (RTMP/SRT)");
+    if (toggle_switch (app, "ingest", app.cfg.ingest, ImGui::GetCursorScreenPos (), 28.0f, 15.0f)) {
+      app.cfg.ingest = !app.cfg.ingest;
+      app.ingest_error.clear ();
+      if (app.cfg.ingest) {
+        if (!start_ingest (app))
+          app.cfg.ingest = false;
+      } else {
+        stop_ingest (app);
+        set_status (app, "Receiver stopped");
+      }
+    }
+    next_row ();
+
+    if (app.cfg.ingest || app.ingest.busy () || !app.ingest_error.empty ()) {
+      const char * state = !app.ingest_error.empty () ? "ERROR"
+                           : app.ingest_ready         ? "LISTENING"
+                           : app.ingest.busy ()       ? "STARTING…"
+                                                      : "STOPPED";
+      ImU32 sc = !app.ingest_error.empty () ? theme::HexU32 (theme::StatusError)
+                 : app.ingest_ready         ? theme::HexU32 (theme::StatusOnline)
+                                            : theme::HexU32 (theme::StatusWarn);
+      // The count of devices already provisioned: the reason this is a slot
+      // list rather than one fixed address.
+      int slots = 0;
+      for (const Feed & f : app.feeds)
+        slots += is_ingest_feed (app, f) ? 1 : 0;
+
+      ImVec2 s0 = ImGui::GetCursorScreenPos ();
+      dl->AddText (app.fonts.microCap, theme::fs (8.5f), s0, theme::WhiteU32 (0.30f), "STATE");
+      dl->AddText (app.fonts.mono, theme::fs (10.5f), ImVec2 (s0.x + du (72.0f), s0.y - du (1.0f)), sc, state);
+      if (slots > 0 && app.ingest_error.empty ()) {
+        char sb[64];
+        snprintf (sb, sizeof (sb), "%d device%s", slots, slots == 1 ? "" : "s");
+        dl->AddText (app.fonts.mono, theme::fs (10.5f), ImVec2 (s0.x + du (160.0f), s0.y - du (1.0f)),
+                     theme::WhiteU32 (0.45f), sb);
+      }
+      seek (s0.y + du (16.0f));
+
+      if (!app.ingest_error.empty ()) {
+        locked_callout (app, app.ingest_error.c_str (), panel_w);
+        next_row (30.0f);
+      } else {
+        // One device per slot. Show the address the *next* one would use, so
+        // the operator can set the device up and then press ADD; the addresses
+        // of slots already added live in each feed's inspector, which is where
+        // you look when you are working on that particular device.
+        //
+        // The RTMP path has two segments on purpose: Larix and several other
+        // encoders reject a single-segment path outright, while mediamtx
+        // accepts either — so testing with ffmpeg alone never shows it.
+        // What pushes in might be a wearable, a UAV, a drone or a phone, so
+        // the slot name is the operator's to choose rather than baked in.
+        row ("Name slots");
+        {
+          static char pbuf[48];
+          if (tab_entered || pbuf[0] == '\0')
+            snprintf (pbuf, sizeof (pbuf), "%s", app.cfg.ingest_prefix.c_str ());
+          if (panel_field (app, "##ingpfx", pbuf, sizeof (pbuf), du (120.0f), true)) {
+            std::string p;
+            for (char * c = pbuf; *c; ++c)
+              if (isalnum ((unsigned char) *c) || *c == '-' || *c == '_')
+                p += (char) tolower ((unsigned char) *c);
+            if (!p.empty ())
+              app.cfg.ingest_prefix = p;
+          }
+        }
+        next_row ();
+
+        const std::string path = next_ingest_path (app);
+        const std::string rtmp = ingest_push_rtmp (app, path);
+        const std::string srt = ingest_push_srt (app, path);
+        struct { const char * cap; const char * val; } lines[] = {
+          {"NEXT · RTMP", rtmp.c_str ()}, {"NEXT · SRT", srt.c_str ()}};
+        const bool panel_hov = ImGui::IsWindowHovered (ImGuiHoveredFlags_ChildWindows);
+        for (const auto & ln : lines) {
+          ImVec2 p = ImGui::GetCursorScreenPos ();
+          dl->AddText (app.fonts.microCap, theme::fs (8.5f), p, theme::WhiteU32 (0.30f), ln.cap);
+          dl->AddText (app.fonts.mono, theme::fs (10.0f), ImVec2 (p.x + du (72.0f), p.y - du (1.0f)),
+                       theme::WhiteU32 (0.70f), ln.val);
+          // These get transcribed into a phone by hand, so make them copyable.
+          const ImVec2 rmin (p.x, p.y - du (2.0f)), rmax (p.x + panel_w, p.y + du (12.0f));
+          if (panel_hov && ImGui::IsMouseHoveringRect (rmin, rmax)) {
+            dl->AddRectFilled (rmin, rmax, theme::WhiteU32 (0.05f), du (3.0f));
+            ImGui::SetMouseCursor (ImGuiMouseCursor_Hand);
+            ImGui::SetTooltip ("click to copy");
+            if (ImGui::IsMouseReleased (ImGuiMouseButton_Left)) {
+              ImGui::SetClipboardText (ln.val);
+              set_status (app, std::string (ln.cap) + " copied to the clipboard");
+            }
+          }
+          seek (p.y + du (15.0f));
+        }
+        gap (3.0f);
+        // deck_button moves ImGui's cursor but not row_y, and gap()/next_row()
+        // are defined against row_y — so the row must be closed explicitly or
+        // the next thing drawn lands on top of the button.
+        if (deck_button (app, "addingest", "+ ADD RECEIVER FEED", ImVec2 (du (140.0f), du (22.0f)),
+                         theme::AccentPrimary, Btn::Tinted)) {
+          Feed nf;
+          char nb[64], ub[256];
+          snprintf (nb, sizeof (nb), "%s", path.c_str () + 5); // "live/" prefix off
+          for (char * c = nb; *c; ++c)
+            *c = *c == '-' ? ' ' : (char) toupper ((unsigned char) *c);
+          snprintf (ub, sizeof (ub), "rtsp://127.0.0.1:%d/%s", app.cfg.ingest_rtsp_port, path.c_str ());
+          nf.name = nb;
+          nf.url = ub;
+          app.feeds.push_back (std::move (nf));
+          set_status (app, "Added " + std::string (nb) + " — point the device at " + rtmp);
+        }
+        next_row (22.0f);
+      }
+    }
     gap (4.0f);
 
     // ---- table ------------------------------------------------------------
@@ -4264,6 +4940,7 @@ ui_settings (App & app)
       save_config (app);
       g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
       g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
+      g_ingest_port = app.cfg.ingest ? app.cfg.ingest_rtsp_port : 0;
       set_status (app, "Saved to uavwall.conf");
       app.show_settings = false;
     }
@@ -5610,6 +6287,19 @@ main (int argc, char ** argv)
   // Resolved once, for both normal and bench starts.
   find_ffmpeg ();
 
+  // Playing feeds — files or RTSP — never touches ffmpeg; Pulse does that. But
+  // importing, recording and audio monitoring all shell out to it, and their
+  // controls simply sit disabled when it is absent. Say so once at startup,
+  // rather than leaving someone clicking a dead button.
+  if (g_ffmpeg.empty ())
+    set_status (app, "ffmpeg not found — import, recording and audio are off. "
+                     "Install it with: brew install ffmpeg");
+
+  // Bring the receiver up before the feeds connect, so an autoconnect against
+  // an ingest path finds something listening rather than failing once.
+  if (app.cfg.ingest)
+    start_ingest (app);
+
 #if defined(_WIN32)
   SetConsoleCtrlHandler (on_console_ctrl, TRUE);
 #else
@@ -5619,6 +6309,7 @@ main (int argc, char ** argv)
 
   g_cfg_rtsp_tcp = app.cfg.rtsp_tcp;
   g_cfg_rtsp_latency_ms = app.cfg.rtsp_latency_ms;
+  g_ingest_port = app.cfg.ingest ? app.cfg.ingest_rtsp_port : 0;
 
   // Created before any feed instance and freed last: this is both the
   // conference instance and the one that keeps Pulse's global state alive.
@@ -5696,14 +6387,24 @@ main (int argc, char ** argv)
   ImGui_ImplGlfw_InitForOpenGL (window, true);
   ImGui_ImplOpenGL3_Init ("#version 150");
 
+  // Connecting a receiver feed before its device has arrived is a guaranteed
+  // failure, and a failed connect costs a Pulse teardown that is not safe to
+  // repeat. Hand those to the retry loop instead, which probes the path first.
+  auto begin_feed = [&] (Feed & f) {
+    if (app.cfg.ingest && is_ingest_feed (app, f))
+      f.retry_at = 0.001; // due immediately, but via the probe
+    else
+      start_feed (f);
+  };
+
   if (app.cfg.autoconnect && !app.bench) {
     for (Feed & f : app.feeds)
-      start_feed (f);
+      begin_feed (f);
   }
 
   if (app.bench) {
     for (Feed & f : app.feeds)
-      start_feed (f);
+      begin_feed (f);
     if (app.bench_grid_c > 0)
       apply_grid (app, app.bench_grid_c, app.bench_grid_r);
     else
@@ -5770,6 +6471,7 @@ main (int argc, char ** argv)
     poll_prepares (app);
     reap_recorder (app.canvas_rec);
     reap_recorder (app.monitor);
+    poll_ingest (app);
     for (Feed & f : app.feeds)
       reap_recorder (f.rec);
 
@@ -5944,6 +6646,19 @@ main (int argc, char ** argv)
 
   stop_monitor (app);
   stop_air (app);
+  // The receiver is a server: it holds listening sockets, so leaving it behind
+  // would block the next run from binding the same ports.
+  stop_ingest (app);
+  for (int waited = 0; waited < 30 && app.ingest.busy (); waited++) {
+    std::this_thread::sleep_for (std::chrono::milliseconds (100));
+    reap_if_exited (app.ingest);
+  }
+  if (app.ingest.pid > 0) {
+#if !defined(_WIN32)
+    kill (app.ingest.pid, SIGKILL);
+#endif
+    reap_if_exited (app.ingest);
+  }
   conf_disconnect (app);
   for (Feed & f : app.feeds)
     stop_feed (f); // disowns any connect still in flight into the orphan list
